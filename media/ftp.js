@@ -250,6 +250,17 @@
               path: joinRemote(state.remotePath, entry.name),
             }),
         });
+        if (/\.py$/i.test(entry.name || "")) {
+          items.push({
+            label: "Run",
+            disabled: !state.connected,
+            action: () =>
+              vscode.postMessage({
+                type: "runRemote",
+                path: joinRemote(state.remotePath, entry.name),
+              }),
+          });
+        }
         items.push({
           label: "SHA-256",
           disabled: !state.connected,

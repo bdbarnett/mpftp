@@ -309,6 +309,31 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
         this.status(`Editing ${remote}`);
         break;
       }
+      case "runRemote": {
+        const remote = String(msg.path || "");
+        if (!remote) {
+          return;
+        }
+        if (!/\.py$/i.test(remote)) {
+          this.status("Run is only for .py files");
+          return;
+        }
+        this.status(`Running ${remote}…`, "active");
+        // Execute the board file in-place (same idea as mpremote run, but for :path).
+        const code = `exec(open(${JSON.stringify(remote)}).read())`;
+        const res = await this.bridge.request<{ output: string }>("exec", {
+          code,
+          follow: true,
+        });
+        const channel = vscode.window.createOutputChannel("mpftp");
+        channel.appendLine(`>>> run ${remote}`);
+        if (res.output) {
+          channel.appendLine(res.output);
+        }
+        channel.show(true);
+        this.status(`Ran ${remote}`, "done");
+        break;
+      }
       case "hashRemote": {
         const remote = String(msg.path || "");
         if (!remote) {
