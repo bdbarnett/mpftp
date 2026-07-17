@@ -1,6 +1,6 @@
 {
   "name": "mpftp",
-  "displayName": "mpftp — MicroPython Board",
+  "displayName": "mpftp - MicroPython Board",
   "description": "FTP-style file browser and ANSI REPL for MicroPython boards over USB serial (Linux, Windows, WSL via mpremote.exe).",
   "version": "0.1.0",
   "publisher": "bdbarnett",
@@ -37,14 +37,28 @@
         "icon": "$(debug-disconnect)"
       },
       {
+        "command": "mpftp.resume",
+        "title": "mpftp: Resume Last Device",
+        "icon": "$(debug-restart)"
+      },
+      {
         "command": "mpftp.openFtp",
         "title": "mpftp: Open File Browser",
         "icon": "$(folder-opened)"
       },
       {
+        "command": "mpftp.openFtpEditor",
+        "title": "mpftp: Open File Browser in Editor",
+        "icon": "$(window)"
+      },
+      {
         "command": "mpftp.openRepl",
         "title": "mpftp: Open REPL",
         "icon": "$(terminal)"
+      },
+      {
+        "command": "mpftp.editRemote",
+        "title": "mpftp: Edit Board File"
       },
       {
         "command": "mpftp.softReset",
@@ -87,8 +101,28 @@
         "title": "mpftp: Disk Free (df)"
       },
       {
+        "command": "mpftp.mount",
+        "title": "mpftp: Mount Local Folder (/remote)"
+      },
+      {
+        "command": "mpftp.umount",
+        "title": "mpftp: Unmount /remote"
+      },
+      {
+        "command": "mpftp.romfsQuery",
+        "title": "mpftp: ROMFS Query"
+      },
+      {
+        "command": "mpftp.hashRemote",
+        "title": "mpftp: Hash Board File"
+      },
+      {
         "command": "mpftp.refreshPorts",
         "title": "mpftp: Refresh Serial Ports"
+      },
+      {
+        "command": "mpftp.agentStatus",
+        "title": "mpftp: Agent Status (RPC / logs)"
       }
     ],
     "menus": {
@@ -120,7 +154,8 @@
         {
           "type": "webview",
           "id": "mpftp.ftpView",
-          "name": "Board Files"
+          "name": "Board Files",
+          "visibility": "visible"
         }
       ]
     },
@@ -146,6 +181,16 @@
           "type": "string",
           "default": "",
           "description": "Auto-connect device path (e.g. COM4 or /dev/ttyACM0). Empty disables auto-connect."
+        },
+        "mpftp.verifyTransfers": {
+          "type": "boolean",
+          "default": true,
+          "description": "After each file upload/download, verify with SHA-256 against the board."
+        },
+        "mpftp.autoReconnectAfterReset": {
+          "type": "boolean",
+          "default": true,
+          "description": "After hard reset, wait for the same COM port and reconnect automatically."
         }
       }
     },
@@ -160,6 +205,11 @@
         "command": "mpftp.openFtp",
         "key": "ctrl+alt+f",
         "mac": "cmd+alt+f"
+      },
+      {
+        "command": "mpftp.openFtpEditor",
+        "key": "ctrl+alt+shift+f",
+        "mac": "cmd+alt+shift+f"
       }
     ]
   },
@@ -167,11 +217,20 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "tsc -p ./ --noEmit"
+    "lint": "tsc -p ./ --noEmit",
+    "package": "npx --yes @vscode/vsce package --no-dependencies",
+    "test:python": "python3 -m unittest discover -s python/tests -v"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bdbarnett/mpftp.git"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@vscode/codicons": "^0.0.45"
   }
 }

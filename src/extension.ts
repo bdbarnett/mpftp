@@ -1,17 +1,25 @@
 import * as vscode from "vscode";
+import { ActivityLog } from "./activityLog";
+import { AgentRpcServer } from "./agent/AgentRpcServer";
 import { SidecarBridge, PortInfo } from "./bridge/SidecarBridge";
+import { openBoardFileInEditor, registerEditSaveHook } from "./editRemote";
 import { openRepl } from "./terminal/ReplTerminal";
 import { FtpViewProvider } from "./webview/FtpViewProvider";
 import { detectHost, getConfig, resolvePython } from "./platform";
 
 let bridge: SidecarBridge;
 let log: vscode.OutputChannel;
+let activity: ActivityLog;
+let agentRpc: AgentRpcServer;
 let ftpProvider: FtpViewProvider;
 let statusBar: vscode.StatusBarItem;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   log = vscode.window.createOutputChannel("mpftp");
-  bridge = new SidecarBridge(context.extensionPath, log);
+  activity = new ActivityLog();
+  bridge = new SidecarBridge(context.extensionPath, log, activity);
+  agentRpc = new AgentRpcServer(bridge, activity);
+  agentRpc.start();
 
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
   statusBar.command = "mpftp.connect";
@@ -41,7 +49,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await bridge.disconnect();
         updateStatus();
       } else if (choice?.id === "repl") {
-        openRepl(bridge);
+        openRepl(bridge, activity);
       } else if (choice?.id === "ftp") {
         await ftpProvider.reveal();
       }
@@ -99,7 +107,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void vscode.window.showWarningMessage("Connect to a board first");
         return;
       }
-      openRepl(bridge);
+      openRepl(bridge, activity);
     },
     connectCommand,
     async () => {
@@ -107,6 +115,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       updateStatus();
     }
   );
+
+  registerEditSaveHook(bridge, context, log);
 
   context.subscriptions.push(
     log,
@@ -118,12 +128,56 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await bridge.disconnect();
       updateStatus();
     }),
+    vscode.commands.registerCommand("mpftp.resume", async () => {
+      try {
+        await bridge.ensureStarted();
+        await bridge.resume();
+        updateStatus();
+        void vscode.window.showInformationMessage(`mpftp resumed: ${bridge.connectedDevice}`);
+        await ftpProvider.reveal();
+      } catch (e: any) {
+        void vscode.window.showErrorMessage(`mpftp resume failed: ${e.message || e}`);
+      }
+    }),
     vscode.commands.registerCommand("mpftp.openFtp", () => ftpProvider.reveal()),
+    vscode.commands.registerCommand("mpftp.openFtpEditor", () => ftpProvider.openInEditor()),
     vscode.commands.registerCommand("mpftp.openRepl", async () => {
       if (!(await ensureConnected())) {
         return;
       }
-      openRepl(bridge);
+      openRepl(bridge, activity);
+    }),
+    vscode.commands.registerCommand("mpftp.editRemote", async () => {
+      if (!(await ensureConnected())) {
+        return;
+      }
+      const remote = await vscode.window.showInputBox({
+        prompt: "Board file path to edit",
+        value: "/main.py",
+      });
+      if (!remote) {
+        return;
+      }
+      try {
+        await openBoardFileInEditor(bridge, remote, log);
+      } catch (e: any) {
+        void vscode.window.showErrorMessage(`mpftp edit failed: ${e.message || e}`);
+      }
+    }),
+    vscode.commands.registerCommand("mpftp.agentStatus", async () => {
+      await bridge.ensureStarted();
+      const info = {
+        connected: bridge.connected,
+        device: bridge.connectedDevice || null,
+        rpc: agentRpc.path,
+        activityLog: activity.activityPath,
+        replLog: activity.replPath,
+      };
+      log.appendLine(JSON.stringify(info, null, 2));
+      log.show(true);
+      void vscode.window.showInformationMessage(
+        `mpftp agent RPC: ${info.rpc}` + (info.connected ? ` · ${info.device}` : " · not connected")
+      );
     }),
     vscode.commands.registerCommand("mpftp.softReset", async () => {
       if (!(await ensureConnected())) {
@@ -136,18 +190,59 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!(await ensureConnected())) {
         return;
       }
-      await bridge.request("hard_reset");
-      await bridge.disconnect().catch(() => undefined);
-      updateStatus();
-      void vscode.window.showInformationMessage("Hard reset sent — reconnect when ready");
+      const device = bridge.connectedDevice;
+      try {
+        await Promise.race([
+          bridge.request("hard_reset"),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("hard_reset timeout")), 5000)),
+        ]);
+      } catch (e) {
+        log.appendLine(`hard_reset: ${e}`);
+      } finally {
+        await bridge.disconnect().catch(() => undefined);
+        updateStatus();
+      }
+      if (getConfig().autoReconnectAfterReset && device) {
+        void vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: `mpftp: waiting to reconnect ${device}…`,
+          },
+          async () => {
+            const ok = await bridge.reconnectAfterReset({ device });
+            updateStatus();
+            if (ok) {
+              void vscode.window.showInformationMessage(`mpftp reconnected: ${device}`);
+              await ftpProvider.reveal();
+            } else {
+              void vscode.window.showWarningMessage(
+                "Hard reset sent — board did not come back; use Resume or Connect"
+              );
+            }
+          }
+        );
+      } else {
+        void vscode.window.showInformationMessage("Hard reset sent — reconnect when ready");
+      }
     }),
     vscode.commands.registerCommand("mpftp.bootloader", async () => {
       if (!(await ensureConnected())) {
         return;
       }
-      await bridge.request("bootloader");
-      await bridge.disconnect().catch(() => undefined);
-      updateStatus();
+      try {
+        await Promise.race([
+          bridge.request("bootloader"),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("bootloader timeout")), 5000)),
+        ]);
+      } catch (e) {
+        log.appendLine(`bootloader: ${e}`);
+      } finally {
+        await bridge.disconnect().catch(() => undefined);
+        updateStatus();
+      }
+      void vscode.window.showInformationMessage(
+        "Entered bootloader — flash firmware, then Connect (auto-reconnect skipped)"
+      );
     }),
     vscode.commands.registerCommand("mpftp.runFile", async () => {
       if (!(await ensureConnected())) {
@@ -204,18 +299,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       const pkg = await vscode.window.showInputBox({
-        prompt: "Package to install via mip (board needs network)",
-        placeHolder: "github:org/repo",
+        prompt: "Package to install via mip (host downloads, writes to board)",
+        placeHolder: "github:org/repo or micropython-lib name",
       });
       if (!pkg) {
         return;
       }
-      const res = await bridge.request<{ output: string }>("mip_install", {
+      const res = await bridge.request<{ output: string; target?: string }>("mip_install", {
         packages: [pkg],
         mpy: true,
       });
       log.appendLine(res.output || "");
+      if (res.target) {
+        log.appendLine(`target: ${res.target}`);
+      }
       log.show(true);
+      void vscode.window.showInformationMessage(`mip installed ${pkg}`);
     }),
     vscode.commands.registerCommand("mpftp.df", async () => {
       if (!(await ensureConnected())) {
@@ -224,6 +323,57 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const res = await bridge.request<{ mounts: any[] }>("df");
       log.appendLine(JSON.stringify(res.mounts, null, 2));
       log.show(true);
+    }),
+    vscode.commands.registerCommand("mpftp.mount", async () => {
+      if (!(await ensureConnected())) {
+        return;
+      }
+      const uris = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        openLabel: "Mount on board as /remote",
+      });
+      if (!uris?.[0]) {
+        return;
+      }
+      const res = await bridge.request<{ path: string; mount: string }>("mount", {
+        path: uris[0].fsPath,
+      });
+      void vscode.window.showInformationMessage(`Mounted ${res.path} at ${res.mount}`);
+    }),
+    vscode.commands.registerCommand("mpftp.umount", async () => {
+      if (!(await ensureConnected())) {
+        return;
+      }
+      await bridge.request("umount");
+      void vscode.window.showInformationMessage("Unmounted /remote");
+    }),
+    vscode.commands.registerCommand("mpftp.romfsQuery", async () => {
+      if (!(await ensureConnected())) {
+        return;
+      }
+      const res = await bridge.request<{ output: string }>("romfs_query");
+      log.appendLine(res.output || "(no output)");
+      log.show(true);
+    }),
+    vscode.commands.registerCommand("mpftp.hashRemote", async () => {
+      if (!(await ensureConnected())) {
+        return;
+      }
+      const remote = await vscode.window.showInputBox({
+        prompt: "Board file to hash",
+        value: "/main.py",
+      });
+      if (!remote) {
+        return;
+      }
+      const res = await bridge.request<{ hash: string; algo: string }>("fs_hash", {
+        path: remote,
+        algo: "sha256",
+      });
+      void vscode.window.showInformationMessage(`${res.algo}: ${res.hash}`);
+      log.appendLine(`${remote}: ${res.hash}`);
     }),
     vscode.commands.registerCommand("mpftp.refreshPorts", async () => {
       await bridge.ensureStarted();
@@ -239,7 +389,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const host = detectHost();
   const py = resolvePython(context.extensionPath, getConfig().pythonPath);
   log.appendLine(`[mpftp] host=${host} python=${py}`);
+  log.appendLine(`[mpftp] agent RPC: ${agentRpc.path}`);
+  log.appendLine(`[mpftp] activity log: ${activity.activityPath}`);
+  log.appendLine(`[mpftp] repl log: ${activity.replPath}`);
+  activity.event("activate", {
+    message: "extension activated",
+    data: { host, python: py, rpc: agentRpc.path },
+  });
   updateStatus();
+
+  context.subscriptions.push({
+    dispose: () => {
+      agentRpc.dispose();
+      activity.event("deactivate", { message: "extension deactivated" });
+    },
+  });
 
   if (getConfig().autoConnectDevice) {
     void connectCommand();
@@ -270,5 +434,6 @@ function updateStatus(): void {
 }
 
 export function deactivate(): void {
+  agentRpc?.dispose();
   bridge?.dispose();
 }

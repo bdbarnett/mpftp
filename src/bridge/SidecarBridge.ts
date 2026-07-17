@@ -2,6 +2,7 @@ import { ChildProcessWithoutNullStreams, spawn } from "child_process";
 import * as path from "path";
 import { EventEmitter } from "events";
 import * as vscode from "vscode";
+import { ActivityLog, summarizeParams } from "../activityLog";
 import { getConfig, pathForPythonProcess, resolvePython } from "../platform";
 
 export type PortInfo = {
@@ -36,13 +37,22 @@ export class SidecarBridge extends EventEmitter {
   private pending = new Map<number, Pending>();
   private starting: Promise<void> | undefined;
   private _connectedDevice: string | undefined;
+  private _lastDevice: string | undefined;
 
-  constructor(private readonly extensionPath: string, private readonly log: vscode.OutputChannel) {
+  constructor(
+    private readonly extensionPath: string,
+    private readonly log: vscode.OutputChannel,
+    private readonly activity?: ActivityLog
+  ) {
     super();
   }
 
   get connectedDevice(): string | undefined {
     return this._connectedDevice;
+  }
+
+  get lastDevice(): string | undefined {
+    return this._lastDevice || this._connectedDevice;
   }
 
   get connected(): boolean {
@@ -68,6 +78,10 @@ export class SidecarBridge extends EventEmitter {
     const scriptLinux = path.join(this.extensionPath, "python", "sidecar.py");
     const script = pathForPythonProcess(python, scriptLinux);
     this.log.appendLine(`[mpftp] starting sidecar: ${python} ${script}`);
+    this.activity?.event("sidecar_start", {
+      message: `${python} ${script}`,
+      data: { python, script },
+    });
 
     this.proc = spawn(python, [script], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -81,9 +95,17 @@ export class SidecarBridge extends EventEmitter {
     this.proc.stdout.on("data", (chunk: string) => this.onStdout(chunk));
     this.proc.stderr.on("data", (chunk: string) => {
       this.log.appendLine(`[sidecar:err] ${chunk.trimEnd()}`);
+      this.activity?.event("sidecar_stderr", {
+        source: "sidecar",
+        message: chunk.trimEnd(),
+      });
     });
     this.proc.on("exit", (code, signal) => {
       this.log.appendLine(`[mpftp] sidecar exited code=${code} signal=${signal}`);
+      this.activity?.event("sidecar_exit", {
+        message: `code=${code} signal=${signal}`,
+        data: { code, signal },
+      });
       this.proc = undefined;
       this._connectedDevice = undefined;
       for (const [, p] of this.pending) {
@@ -94,7 +116,6 @@ export class SidecarBridge extends EventEmitter {
       void vscode.commands.executeCommand("setContext", "mpftp.connected", false);
     });
 
-    // Wait for ready notify (with timeout)
     await new Promise<void>((resolve, reject) => {
       const t = setTimeout(() => reject(new Error("sidecar ready timeout")), 20000);
       const onReady = () => {
@@ -105,8 +126,8 @@ export class SidecarBridge extends EventEmitter {
       this.on("ready", onReady);
     });
 
-    // Sanity ping
     await this.request("ping");
+    this.activity?.event("sidecar_ready", { message: "sidecar ready" });
   }
 
   private onStdout(chunk: string): void {
@@ -132,6 +153,10 @@ export class SidecarBridge extends EventEmitter {
           this.emit("repl_data", msg.params);
         } else if (msg.method === "repl_error") {
           this.emit("repl_error", msg.params);
+          this.activity?.event("repl_error", {
+            source: "repl",
+            message: msg.params?.message,
+          });
         }
         continue;
       }
@@ -161,10 +186,23 @@ export class SidecarBridge extends EventEmitter {
     }
     const id = this.nextId++;
     const payload = JSON.stringify({ id, method, params }) + "\n";
+    this.activity?.event("rpc", {
+      message: method,
+      data: summarizeParams(method, params),
+    });
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, {
-        resolve: (v) => resolve(v as T),
-        reject,
+        resolve: (v) => {
+          this.activity?.event("rpc_ok", { message: method, data: { method } });
+          resolve(v as T);
+        },
+        reject: (e) => {
+          this.activity?.event("rpc_err", {
+            message: `${method}: ${e.message}`,
+            data: { method, error: e.message },
+          });
+          reject(e);
+        },
       });
       this.proc!.stdin.write(payload, (err) => {
         if (err) {
@@ -183,17 +221,81 @@ export class SidecarBridge extends EventEmitter {
     const cfg = getConfig();
     await this.request("connect", { device, baud: baud ?? cfg.defaultBaud });
     this._connectedDevice = device;
+    this._lastDevice = device;
     await vscode.commands.executeCommand("setContext", "mpftp.connected", true);
+    this.activity?.event("connected", { message: device, data: { device } });
     this.emit("connected", device);
   }
 
+  /** Reconnect to the last device (after hard-reset / port flicker). */
+  async resume(baud?: number): Promise<void> {
+    const cfg = getConfig();
+    const res = await this.request<{ device: string }>("resume", {
+      baud: baud ?? cfg.defaultBaud,
+    });
+    const device = res.device || this._lastDevice;
+    if (!device) {
+      throw new Error("resume: no device");
+    }
+    this._connectedDevice = device;
+    this._lastDevice = device;
+    await vscode.commands.executeCommand("setContext", "mpftp.connected", true);
+    this.activity?.event("connected", { message: `resume ${device}`, data: { device } });
+    this.emit("connected", device);
+  }
+
+  /**
+   * After hard-reset / disconnect, wait for the previous COM port and reconnect.
+   */
+  async reconnectAfterReset(
+    opts: { attempts?: number; delayMs?: number; device?: string } = {}
+  ): Promise<boolean> {
+    const device = opts.device || this._lastDevice;
+    if (!device) {
+      return false;
+    }
+    const attempts = opts.attempts ?? 20;
+    const delayMs = opts.delayMs ?? 1000;
+    await this.disconnect().catch(() => undefined);
+    for (let i = 0; i < attempts; i++) {
+      await new Promise((r) => setTimeout(r, delayMs));
+      try {
+        const ports = await this.listPorts();
+        if (!ports.some((p) => p.device === device)) {
+          continue;
+        }
+        await this.connect(device);
+        return true;
+      } catch (e) {
+        this.log.appendLine(`reconnect attempt ${i + 1}/${attempts}: ${e}`);
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Drop the logical connection immediately (UI / status), then best-effort
+   * tell the sidecar. Order matters: after bootloader/hard-reset the serial
+   * port is often gone and a blocking disconnect RPC would leave the UI stuck
+   * "connected".
+   */
   async disconnect(): Promise<void> {
-    try {
-      await this.request("disconnect");
-    } finally {
-      this._connectedDevice = undefined;
-      await vscode.commands.executeCommand("setContext", "mpftp.connected", false);
+    const wasConnected = !!this._connectedDevice;
+    this._connectedDevice = undefined;
+    await vscode.commands.executeCommand("setContext", "mpftp.connected", false);
+    if (wasConnected) {
+      this.activity?.event("disconnected", { message: "disconnected" });
       this.emit("disconnected");
+    }
+    try {
+      await Promise.race([
+        this.request("disconnect"),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("disconnect timeout")), 2000)
+        ),
+      ]);
+    } catch {
+      /* board/port may already be gone */
     }
   }
 

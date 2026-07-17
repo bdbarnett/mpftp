@@ -1,7 +1,10 @@
 node_modules/
 out/
 .venv/
+.mpftp/
 *.vsix
 .DS_Store
 *.log
 .vscode-test/
+__pycache__/
+*.pyc

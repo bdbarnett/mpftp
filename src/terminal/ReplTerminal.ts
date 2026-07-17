@@ -1,10 +1,11 @@
 import * as vscode from "vscode";
+import { ActivityLog } from "../activityLog";
 import { SidecarBridge } from "../bridge/SidecarBridge";
 
 /**
  * VS Code Pseudoterminal backed by the mpremote sidecar.
  * Bytes from the board are written as-is so ANSI/VT color sequences render
- * in the integrated terminal (xterm.js).
+ * in the integrated terminal (xterm.js). Also mirrored to ~/.mpftp/repl.log.
  */
 export class ReplTerminal implements vscode.Pseudoterminal {
   private readonly writeEmitter = new vscode.EventEmitter<string>();
@@ -16,22 +17,33 @@ export class ReplTerminal implements vscode.Pseudoterminal {
   private onErr?: (params: { message: string }) => void;
   private onExit?: () => void;
 
-  constructor(private readonly bridge: SidecarBridge) {}
+  constructor(
+    private readonly bridge: SidecarBridge,
+    private readonly activity?: ActivityLog
+  ) {}
 
   open(): void {
     const device = this.bridge.connectedDevice || "board";
-    this.writeEmitter.fire(`\x1b[90mmpftp REPL — ${device} (Ctrl+] to close)\x1b[0m\r\n`);
+    const banner = `mpftp REPL — ${device} (Ctrl+] to close)\r\n`;
+    this.writeEmitter.fire(`\x1b[90m${banner}\x1b[0m`);
+    this.activity?.event("repl_open", { source: "repl", message: device });
+    this.activity?.appendRepl(`\n----- REPL open ${device} ${new Date().toISOString()} -----\n`);
 
     this.onData = (params) => {
       const buf = Buffer.from(params.data_b64, "base64");
       // Pseudoterminal expects string; pass through Latin1 to preserve all bytes including ESC.
-      this.writeEmitter.fire(buf.toString("latin1"));
+      const text = buf.toString("latin1");
+      this.writeEmitter.fire(text);
+      this.activity?.appendRepl(buf.toString("utf8"));
     };
     this.onErr = (params) => {
       this.writeEmitter.fire(`\r\n\x1b[31m[repl error] ${params.message}\x1b[0m\r\n`);
+      this.activity?.event("repl_error", { source: "repl", message: params.message });
     };
     this.onExit = () => {
       this.writeEmitter.fire("\r\n\x1b[90m[disconnected]\x1b[0m\r\n");
+      this.activity?.event("repl_close", { source: "repl", message: "closed" });
+      this.activity?.appendRepl(`\n----- REPL close ${new Date().toISOString()} -----\n`);
       this.closeEmitter.fire(0);
     };
 
@@ -65,6 +77,16 @@ export class ReplTerminal implements vscode.Pseudoterminal {
       this.closeEmitter.fire(0);
       return;
     }
+    // Cursor/Python extension auto-runs `source …/.venv/bin/activate` on new
+    // terminals via sendText — that must not reach MicroPython.
+    if (isIdeShellInjection(data)) {
+      this.activity?.event("repl_ignore_injection", {
+        source: "repl",
+        message: data.trim().slice(0, 120),
+      });
+      return;
+    }
+    this.activity?.appendRepl(data);
     const b64 = Buffer.from(data, "latin1").toString("base64");
     void this.bridge.request("repl_write", { data_b64: b64 }).catch((e) => {
       this.writeEmitter.fire(`\r\n\x1b[31mwrite failed: ${e}\x1b[0m\r\n`);
@@ -72,11 +94,37 @@ export class ReplTerminal implements vscode.Pseudoterminal {
   }
 }
 
-export function openRepl(bridge: SidecarBridge): vscode.Terminal {
-  const pty = new ReplTerminal(bridge);
+/** Detect shell env-activation text injected by the IDE into new terminals. */
+function isIdeShellInjection(data: string): boolean {
+  const cleaned = data.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  if (!cleaned) {
+    return false;
+  }
+  if (/^source\s+\S*activate\S*/m.test(cleaned)) {
+    return true;
+  }
+  if (/^\.\s+\S*activate\S*/m.test(cleaned)) {
+    return true;
+  }
+  if (/^conda\s+activate\b/m.test(cleaned)) {
+    return true;
+  }
+  if (/activate\.(ps1|bat|fish)\b/i.test(cleaned) && /(venv|virtualenv|\.venv)/i.test(cleaned)) {
+    return true;
+  }
+  if (/\.venv[/\\](?:bin|Scripts)[/\\]activate/.test(cleaned)) {
+    return true;
+  }
+  return false;
+}
+
+export function openRepl(bridge: SidecarBridge, activity?: ActivityLog): vscode.Terminal {
+  const pty = new ReplTerminal(bridge, activity);
   const term = vscode.window.createTerminal({
     name: `mpftp: ${bridge.connectedDevice || "REPL"}`,
     pty,
+    // Avoid treating this PTY like a host shell (reduces shell-integration hooks).
+    isTransient: true,
   });
   term.show();
   return term;

@@ -207,5 +207,7 @@ export function getConfig() {
     mpremotePath: cfg.get<string>("mpremotePath") || "",
     defaultBaud: cfg.get<number>("defaultBaud") || 115200,
     autoConnectDevice: cfg.get<string>("autoConnectDevice") || "",
+    verifyTransfers: cfg.get<boolean>("verifyTransfers") !== false,
+    autoReconnectAfterReset: cfg.get<boolean>("autoReconnectAfterReset") !== false,
   };
 }

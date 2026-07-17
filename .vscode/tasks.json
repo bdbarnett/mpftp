@@ -2,8 +2,16 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "type": "npm",
-      "script": "compile",
+      "label": "compile",
+      "type": "shell",
+      "command": "export NVM_DIR=\"$HOME/.nvm\" && [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"; npm run compile",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/bin/bash",
+          "args": ["-c"]
+        }
+      },
       "group": {
         "kind": "build",
         "isDefault": true
@@ -11,8 +19,16 @@
       "problemMatcher": ["$tsc"]
     },
     {
-      "type": "npm",
-      "script": "watch",
+      "label": "watch",
+      "type": "shell",
+      "command": "export NVM_DIR=\"$HOME/.nvm\" && [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"; npm run watch",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/bin/bash",
+          "args": ["-c"]
+        }
+      },
       "isBackground": true,
       "problemMatcher": ["$tsc-watch"],
       "group": "build"

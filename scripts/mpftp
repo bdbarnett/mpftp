@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Agent-friendly mpftp CLI wrapper.
+# Uses Linux python3 for TCP RPC to the extension (stdlib only).
+# Falls back to Windows python.exe + mpremote when spawning a private sidecar.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CLI="$ROOT/python/mpftp_cli.py"
+
+if [[ -n "${MPFTP_PYTHON:-}" ]]; then
+  exec "$MPFTP_PYTHON" "$CLI" "$@"
+fi
+
+# Prefer Linux python for the CLI client (talks TCP to the extension).
+for py in "$ROOT/.venv/bin/python" python3 python; do
+  if [[ -x "$py" ]] || command -v "$py" >/dev/null 2>&1; then
+    exec "$py" "$CLI" "$@"
+  fi
+done
+
+echo "mpftp: no python3 found for CLI." >&2
+exit 1

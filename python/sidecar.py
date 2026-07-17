@@ -8,13 +8,29 @@ Uses the official mpremote package (same backend as mpremote.exe).
 
 from __future__ import annotations
 
+import argparse
 import base64
+import contextlib
+import hashlib
+import io
 import json
 import os
 import sys
 import threading
 import traceback
+from pathlib import Path
 from typing import Any, Optional
+
+
+def split_fs_path(path: str) -> tuple[bool, str]:
+    """Return (is_remote, path). Board paths use mpremote ':' prefix."""
+    if path.startswith(":"):
+        return True, path[1:]
+    return False, path
+
+
+def host_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 # Ensure UTF-8 stdio on Windows
 if hasattr(sys.stdout, "reconfigure"):
@@ -47,11 +63,13 @@ class Session:
     def __init__(self) -> None:
         self.transport = None
         self.device: Optional[str] = None
+        self.last_device: Optional[str] = None
         self.baud = 115200
         self._lock = threading.RLock()
         self._repl_mode = False
         self._repl_stop = threading.Event()
         self._repl_thread: Optional[threading.Thread] = None
+        self._mounted_path: Optional[str] = None
 
     def list_ports(self) -> list[dict[str, Any]]:
         import serial.tools.list_ports
@@ -84,8 +102,96 @@ class Session:
                 raise RuntimeError(str(e.args[0] if e.args else e)) from e
             except OSError as e:
                 raise RuntimeError(f"failed to access {device}: {e}") from e
+            # Opening the COM port succeeds in UF2/bootloader mode too — require a
+            # MicroPython raw-REPL handshake before we report connected.
+            try:
+                rtc = self._probe_micropython(self.transport)
+            except Exception as e:
+                try:
+                    self.transport.close()
+                except Exception:
+                    pass
+                self.transport = None
+                self.device = None
+                raise RuntimeError(
+                    f"{device} is not responding as MicroPython "
+                    f"(likely bootloader/UF2 mode, wrong port, or busy REPL): {e}"
+                ) from e
             self.device = device
-            return {"device": device, "baud": baud}
+            self.last_device = device
+            result: dict[str, Any] = {"device": device, "baud": baud, "micropython": True}
+            if rtc is not None:
+                result["rtc"] = rtc
+            return result
+
+    def resume(self, baud: Optional[int] = None) -> dict[str, Any]:
+        """Reconnect to the last device without requiring the caller to re-pick a port."""
+        device = self.device or self.last_device
+        if not device:
+            raise RuntimeError("no previous device to resume")
+        if self.transport and self.device == device:
+            # Already connected — re-probe / refresh RTC like a fresh connect would.
+            with self._lock:
+                try:
+                    rtc = self._probe_micropython(self.transport)
+                except Exception as e:
+                    raise RuntimeError(f"resume failed (still connected but not MicroPython): {e}") from e
+                result: dict[str, Any] = {
+                    "device": device,
+                    "baud": self.baud,
+                    "micropython": True,
+                    "resumed": True,
+                }
+                if rtc is not None:
+                    result["rtc"] = rtc
+                return result
+        return self.connect(device, baud if baud is not None else self.baud)
+
+    def _host_rtc_tuple(self) -> tuple[int, ...]:
+        import time
+
+        tnow = time.localtime()
+        # MicroPython RTC: (year, month, day, weekday, hour, minute, second, subsecond)
+        # weekday: Monday=0 (matches time.struct_time.tm_wday)
+        return (
+            tnow.tm_year,
+            tnow.tm_mon,
+            tnow.tm_mday,
+            tnow.tm_wday,
+            tnow.tm_hour,
+            tnow.tm_min,
+            tnow.tm_sec,
+            0,
+        )
+
+    def _apply_rtc(self, t: Any) -> list[int]:
+        tup = self._host_rtc_tuple()
+        t.exec(f"import machine; machine.RTC().datetime({tup})")
+        return list(tup)
+
+    def _probe_micropython(self, t: Any) -> Optional[list[int]]:
+        """Prove MicroPython via raw REPL, set RTC from the host, then leave raw REPL."""
+        from mpremote.transport import TransportError
+
+        try:
+            # soft_reset=False: don't reboot; still requires the raw-REPL banner.
+            t.enter_raw_repl(soft_reset=False, timeout_overall=5)
+        except TransportError as e:
+            raise RuntimeError(str(e.args[0] if e.args else e)) from e
+        except Exception as e:
+            raise RuntimeError(str(e)) from e
+        rtc: Optional[list[int]] = None
+        try:
+            rtc = self._apply_rtc(t)
+        except Exception:
+            # Some ports lack machine.RTC; don't fail the connection for that.
+            pass
+        try:
+            if t.in_raw_repl:
+                t.exit_raw_repl()
+        except Exception:
+            pass
+        return rtc
 
     def disconnect(self) -> None:
         with self._lock:
@@ -248,6 +354,14 @@ class Session:
 
         return self.with_raw(op)
 
+    def fs_rename(self, src: str, dest: str) -> dict[str, Any]:
+        def op(t):
+            # mpremote Transport has no fs_rename; use device os.rename.
+            t.exec(f"import os\nos.rename({src!r}, {dest!r})")
+            return {"src": src, "dest": dest}
+
+        return self.with_raw(op)
+
     def fs_hash(self, path: str, algo: str = "sha256") -> dict[str, Any]:
         def op(t):
             digest = t.fs_hashfile(path, algo)
@@ -361,42 +475,27 @@ class Session:
 
     def rtc_get(self) -> dict[str, Any]:
         def op(t):
-            out = t.eval("import machine; machine.RTC().datetime()")
-            return {"datetime": repr(out)}
+            t.exec("import machine")
+            out = t.eval("machine.RTC().datetime()")
+            return {"datetime": list(out) if isinstance(out, (tuple, list)) else repr(out)}
 
         return self.with_raw(op)
 
     def rtc_set(self) -> dict[str, Any]:
-        import time
-
-        tnow = time.localtime()
-        # MicroPython RTC: (year, month, day, weekday, hour, minute, second, subsecond)
-        # weekday: Monday=0 in MP for some ports; use time.struct_time tm_wday (Mon=0)
-        tup = (
-            tnow.tm_year,
-            tnow.tm_mon,
-            tnow.tm_mday,
-            tnow.tm_wday,
-            tnow.tm_hour,
-            tnow.tm_min,
-            tnow.tm_sec,
-            0,
-        )
-        code = f"import machine; machine.RTC().datetime({tup})"
-
         def op(t):
-            t.exec(code)
-            return {"datetime": list(tup)}
+            return {"datetime": self._apply_rtc(t)}
 
         return self.with_raw(op)
 
-    def mip_install(self, packages: list[str], target: Optional[str] = None, mpy: bool = True) -> dict[str, Any]:
-        # Reuse mpremote mip by exec'ing mip on device after ensuring connectivity.
-        # Prefer calling into mpremote.mip if available.
-        try:
-            from mpremote import mip as mp_mip
-        except Exception:
-            mp_mip = None
+    def mip_install(
+        self,
+        packages: list[str],
+        target: Optional[str] = None,
+        mpy: bool = True,
+        index: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Host-side mip install via mpremote (downloads on host, writes to board)."""
+        from mpremote import mip as mp_mip
 
         with self._lock:
             t = self._require()
@@ -404,21 +503,44 @@ class Session:
             if not t.in_raw_repl:
                 t.enter_raw_repl(soft_reset=False)
             try:
-                if mp_mip is not None and hasattr(mp_mip, "install"):
-                    # mpremote.mip.do_mip expects state; fall back to device-side mip
-                    pass
-                # Device-side mip (works when network available on board)
-                pkgs = ", ".join(repr(p) for p in packages)
-                tgt = f", target={target!r}" if target else ""
-                mpy_flag = "True" if mpy else "False"
-                code = (
-                    "import mip\n"
-                    f"for _p in [{pkgs}]:\n"
-                    f" mip.install(_p, mpy={mpy_flag}{tgt})\n"
-                )
-                out = t.exec(code)
-                text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
-                return {"output": text, "packages": packages}
+                pkg_index = (index or mp_mip._PACKAGE_INDEX).rstrip("/")
+                resolved_target = target
+                if resolved_target is None:
+                    t.exec("import sys")
+                    lib_paths = [
+                        p
+                        for p in t.eval("sys.path")
+                        if isinstance(p, str) and not p.startswith("/rom") and p.endswith("/lib")
+                    ]
+                    if not lib_paths or not lib_paths[0]:
+                        raise RuntimeError(
+                            "Unable to find lib dir in sys.path; pass target= (e.g. /lib)"
+                        )
+                    resolved_target = lib_paths[0]
+
+                logs: list[str] = []
+                installed: list[str] = []
+                for package in packages:
+                    version = None
+                    pkg = package
+                    if "@" in pkg:
+                        pkg, version = pkg.split("@", 1)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        print(f"Install {package}")
+                        mp_mip._install_package(
+                            t, pkg, pkg_index, resolved_target, version, mpy
+                        )
+                        print("Done")
+                    logs.append(buf.getvalue().strip())
+                    installed.append(package)
+                return {
+                    "output": "\n".join(logs),
+                    "packages": installed,
+                    "target": resolved_target,
+                    "index": pkg_index,
+                    "mpy": mpy,
+                }
             finally:
                 if self._repl_mode:
                     try:
@@ -471,6 +593,7 @@ print(repr(rows))
             if not t.in_raw_repl:
                 t.enter_raw_repl(soft_reset=False)
             t.mount_local(path, unsafe_links=unsafe_links)
+            self._mounted_path = path
             return {"path": path, "mount": getattr(t, "fs_hook_mount", "/remote")}
 
     def umount(self) -> dict[str, Any]:
@@ -480,10 +603,281 @@ print(repr(rows))
             if not t.in_raw_repl:
                 t.enter_raw_repl(soft_reset=False)
             t.umount_local()
+            self._mounted_path = None
             if self._repl_mode:
                 t.exit_raw_repl()
                 self._start_repl_reader()
             return {"ok": True}
+
+    def _mp_state(self):
+        """Minimal mpremote State shim for romfs helpers."""
+        t = self._require()
+
+        class _State:
+            def __init__(self, transport):
+                self.transport = transport
+
+            def ensure_raw_repl(self):
+                if not self.transport.in_raw_repl:
+                    self.transport.enter_raw_repl(soft_reset=False)
+
+            def did_action(self):
+                pass
+
+        return _State(t)
+
+    def romfs_query(self) -> dict[str, Any]:
+        from mpremote import commands as mp_cmd
+
+        with self._lock:
+            self._stop_repl_reader()
+            state = self._mp_state()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                mp_cmd._do_romfs_query(state, argparse.Namespace())
+            if self._repl_mode:
+                try:
+                    if self.transport and self.transport.in_raw_repl:
+                        self.transport.exit_raw_repl()
+                except Exception:
+                    pass
+                self._start_repl_reader()
+            return {"output": buf.getvalue().strip()}
+
+    def romfs_build(
+        self, path: str, output: Optional[str] = None, mpy: bool = True
+    ) -> dict[str, Any]:
+        from mpremote import commands as mp_cmd
+
+        args = argparse.Namespace(path=path, output=output, mpy=mpy)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mp_cmd._do_romfs_build(None, args)
+        out_file = output or (path + ".romfs")
+        size = Path(out_file).stat().st_size if Path(out_file).is_file() else 0
+        return {"output": buf.getvalue().strip(), "output_file": out_file, "size": size}
+
+    def romfs_deploy(
+        self, path: str, partition: int = 0, mpy: bool = True
+    ) -> dict[str, Any]:
+        from mpremote import commands as mp_cmd
+
+        with self._lock:
+            self._stop_repl_reader()
+            state = self._mp_state()
+            args = argparse.Namespace(path=path, partition=partition, mpy=mpy)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                mp_cmd._do_romfs_deploy(state, args)
+            if self._repl_mode:
+                try:
+                    if self.transport and self.transport.in_raw_repl:
+                        self.transport.exit_raw_repl()
+                except Exception:
+                    pass
+                self._start_repl_reader()
+            return {"output": buf.getvalue().strip(), "path": path, "partition": partition}
+
+    def fs_cp(self, src: str, dest: str, verify: bool = False) -> dict[str, Any]:
+        """
+        Recursive copy using mpremote ':' prefix for board paths.
+        Examples: local→board  ./a.py :/a.py
+                  board→local  :/a.py ./a.py
+                  board→board  :/a.py :/b.py
+        """
+        src_remote, src_path = split_fs_path(src)
+        dest_remote, dest_path = split_fs_path(dest)
+        copied: list[str] = []
+        verified: list[str] = []
+
+        def op(t):
+            nonlocal copied, verified
+            if src_remote and dest_remote:
+                self._cp_remote_to_remote(t, src_path, dest_path, verify, copied, verified)
+            elif not src_remote and dest_remote:
+                self._cp_local_to_remote(t, src_path, dest_path, verify, copied, verified)
+            elif src_remote and not dest_remote:
+                self._cp_remote_to_local(t, src_path, dest_path, verify, copied, verified)
+            else:
+                raise RuntimeError("fs_cp: at least one path must be a board path (prefix with :)")
+            return {
+                "src": src,
+                "dest": dest,
+                "files": len(copied),
+                "copied": copied,
+                "verified": verified if verify else None,
+            }
+
+        return self.with_raw(op)
+
+    def _remote_isdir(self, t, path: str) -> bool:
+        try:
+            st = t.fs_stat(path)
+            return bool(st.st_mode & 0x4000)
+        except Exception:
+            return False
+
+    def _cp_local_to_remote(
+        self, t, src: str, dest: str, verify: bool, copied: list[str], verified: list[str]
+    ) -> None:
+        src_p = Path(src)
+        if not src_p.exists():
+            raise RuntimeError(f"local path not found: {src}")
+        if src_p.is_dir():
+            # If dest exists as dir, copy into it as basename; else create dest as the tree root.
+            dest_exists = False
+            try:
+                dest_exists = self._remote_isdir(t, dest)
+            except Exception:
+                dest_exists = False
+            root = (dest.rstrip("/") + "/" + src_p.name) if dest_exists else dest
+            try:
+                t.fs_mkdir(root)
+            except Exception:
+                pass
+            for dirpath, dirnames, filenames in os.walk(src):
+                rel = os.path.relpath(dirpath, src)
+                remote_dir = root if rel == "." else root.rstrip("/") + "/" + rel.replace("\\", "/")
+                if rel != ".":
+                    try:
+                        t.fs_mkdir(remote_dir)
+                    except Exception:
+                        pass
+                for name in dirnames:
+                    try:
+                        t.fs_mkdir(remote_dir.rstrip("/") + "/" + name)
+                    except Exception:
+                        pass
+                for name in filenames:
+                    if name.startswith(".") or name in ("__pycache__",) or name.endswith((".pyc", ".pyo")):
+                        continue
+                    local_file = Path(dirpath) / name
+                    remote_file = remote_dir.rstrip("/") + "/" + name
+                    data = local_file.read_bytes()
+                    t.fs_writefile(remote_file, data)
+                    copied.append(remote_file)
+                    if verify:
+                        digest = t.fs_hashfile(remote_file, "sha256")
+                        hx = digest.hex() if isinstance(digest, bytes) else str(digest)
+                        if hx != host_sha256(data):
+                            raise RuntimeError(f"hash mismatch after upload: {remote_file}")
+                        verified.append(remote_file)
+        else:
+            # File copy: if dest is/exists as directory, place basename inside.
+            final = dest
+            if dest.endswith("/") or self._remote_isdir(t, dest):
+                final = dest.rstrip("/") + "/" + src_p.name
+            data = src_p.read_bytes()
+            t.fs_writefile(final, data)
+            copied.append(final)
+            if verify:
+                digest = t.fs_hashfile(final, "sha256")
+                hx = digest.hex() if isinstance(digest, bytes) else str(digest)
+                if hx != host_sha256(data):
+                    raise RuntimeError(f"hash mismatch after upload: {final}")
+                verified.append(final)
+
+    def _cp_remote_to_local(
+        self, t, src: str, dest: str, verify: bool, copied: list[str], verified: list[str]
+    ) -> None:
+        dest_p = Path(dest)
+        if self._remote_isdir(t, src):
+            root = dest_p / Path(src).name if dest_p.exists() and dest_p.is_dir() else dest_p
+            root.mkdir(parents=True, exist_ok=True)
+
+            def walk(remote: str, local: Path) -> None:
+                for e in t.fs_listdir(remote if remote != "/" else ""):
+                    name = e.name
+                    if name.startswith(".") or name == "__pycache__" or name.endswith((".pyc", ".pyo")):
+                        continue
+                    rpath = (remote.rstrip("/") + "/" + name) if remote != "/" else "/" + name
+                    lpath = local / name
+                    if e.st_mode & 0x4000:
+                        lpath.mkdir(parents=True, exist_ok=True)
+                        walk(rpath, lpath)
+                    else:
+                        data = t.fs_readfile(rpath)
+                        lpath.write_bytes(data)
+                        copied.append(str(lpath))
+                        if verify:
+                            digest = t.fs_hashfile(rpath, "sha256")
+                            hx = digest.hex() if isinstance(digest, bytes) else str(digest)
+                            if hx != host_sha256(data):
+                                raise RuntimeError(f"hash mismatch after download: {rpath}")
+                            verified.append(str(lpath))
+
+            walk(src, root)
+        else:
+            data = t.fs_readfile(src)
+            if dest_p.exists() and dest_p.is_dir() or str(dest).endswith(("/", "\\")):
+                dest_p = dest_p / Path(src).name
+            dest_p.parent.mkdir(parents=True, exist_ok=True)
+            dest_p.write_bytes(data)
+            copied.append(str(dest_p))
+            if verify:
+                digest = t.fs_hashfile(src, "sha256")
+                hx = digest.hex() if isinstance(digest, bytes) else str(digest)
+                if hx != host_sha256(data):
+                    raise RuntimeError(f"hash mismatch after download: {src}")
+                verified.append(str(dest_p))
+
+    def _cp_remote_to_remote(
+        self, t, src: str, dest: str, verify: bool, copied: list[str], verified: list[str]
+    ) -> None:
+        if self._remote_isdir(t, src):
+            root = dest.rstrip("/") + "/" + Path(src).name if self._remote_isdir(t, dest) else dest
+            try:
+                t.fs_mkdir(root)
+            except Exception:
+                pass
+
+            def walk(remote: str, dest_dir: str) -> None:
+                for e in t.fs_listdir(remote if remote != "/" else ""):
+                    name = e.name
+                    rpath = (remote.rstrip("/") + "/" + name) if remote != "/" else "/" + name
+                    dpath = dest_dir.rstrip("/") + "/" + name
+                    if e.st_mode & 0x4000:
+                        try:
+                            t.fs_mkdir(dpath)
+                        except Exception:
+                            pass
+                        walk(rpath, dpath)
+                    else:
+                        data = t.fs_readfile(rpath)
+                        t.fs_writefile(dpath, data)
+                        copied.append(dpath)
+                        if verify:
+                            d1 = t.fs_hashfile(rpath, "sha256")
+                            d2 = t.fs_hashfile(dpath, "sha256")
+                            h1 = d1.hex() if isinstance(d1, bytes) else str(d1)
+                            h2 = d2.hex() if isinstance(d2, bytes) else str(d2)
+                            if h1 != h2:
+                                raise RuntimeError(f"hash mismatch after copy: {dpath}")
+                            verified.append(dpath)
+
+            walk(src, root)
+        else:
+            final = dest
+            if dest.endswith("/") or self._remote_isdir(t, dest):
+                final = dest.rstrip("/") + "/" + Path(src).name
+            data = t.fs_readfile(src)
+            t.fs_writefile(final, data)
+            copied.append(final)
+            if verify:
+                d1 = t.fs_hashfile(src, "sha256")
+                d2 = t.fs_hashfile(final, "sha256")
+                h1 = d1.hex() if isinstance(d1, bytes) else str(d1)
+                h2 = d2.hex() if isinstance(d2, bytes) else str(d2)
+                if h1 != h2:
+                    raise RuntimeError(f"hash mismatch after copy: {final}")
+                verified.append(final)
+
+    def edit_pull(self, path: str) -> dict[str, Any]:
+        """Read a board file for host-side editing (extension / CLI)."""
+        return self.fs_read(path)
+
+    def edit_push(self, path: str, data_b64: str) -> dict[str, Any]:
+        return self.fs_write(path, data_b64)
 
     # --- REPL ---
 
@@ -564,6 +958,7 @@ METHODS = {
     "list_ports": lambda _p: SESSION.list_ports(),
     "connect": lambda p: SESSION.connect(p["device"], int(p.get("baud", 115200))),
     "disconnect": lambda _p: (SESSION.disconnect() or {"ok": True}),
+    "resume": lambda p: SESSION.resume(p.get("baud")),
     "fs_listdir": lambda p: SESSION.fs_listdir(p.get("path", "/")),
     "fs_stat": lambda p: SESSION.fs_stat(p["path"]),
     "fs_read": lambda p: SESSION.fs_read(p["path"]),
@@ -573,8 +968,10 @@ METHODS = {
     "fs_rmdir": lambda p: SESSION.fs_rmdir(p["path"]),
     "fs_rm_rf": lambda p: SESSION.fs_rm_rf(p["path"]),
     "fs_touch": lambda p: SESSION.fs_touch(p["path"]),
+    "fs_rename": lambda p: SESSION.fs_rename(p["src"], p["dest"]),
     "fs_hash": lambda p: SESSION.fs_hash(p["path"], p.get("algo", "sha256")),
     "fs_tree": lambda p: SESSION.fs_tree(p.get("path", "/")),
+    "fs_cp": lambda p: SESSION.fs_cp(p["src"], p["dest"], bool(p.get("verify", False))),
     "exec": lambda p: SESSION.exec(p["code"], bool(p.get("follow", True))),
     "eval": lambda p: SESSION.eval(p["expr"]),
     "run_script": lambda p: SESSION.run_script(p["source"], bool(p.get("follow", True))),
@@ -584,11 +981,23 @@ METHODS = {
     "rtc_get": lambda _p: SESSION.rtc_get(),
     "rtc_set": lambda _p: SESSION.rtc_set(),
     "mip_install": lambda p: SESSION.mip_install(
-        list(p.get("packages") or []), p.get("target"), bool(p.get("mpy", True))
+        list(p.get("packages") or []),
+        p.get("target"),
+        bool(p.get("mpy", True)),
+        p.get("index"),
     ),
     "df": lambda _p: SESSION.df(),
     "mount": lambda p: SESSION.mount(p["path"], bool(p.get("unsafe_links", False))),
     "umount": lambda _p: SESSION.umount(),
+    "romfs_query": lambda _p: SESSION.romfs_query(),
+    "romfs_build": lambda p: SESSION.romfs_build(
+        p["path"], p.get("output"), bool(p.get("mpy", True))
+    ),
+    "romfs_deploy": lambda p: SESSION.romfs_deploy(
+        p["path"], int(p.get("partition", 0)), bool(p.get("mpy", True))
+    ),
+    "edit_pull": lambda p: SESSION.edit_pull(p["path"]),
+    "edit_push": lambda p: SESSION.edit_push(p["path"], p["data_b64"]),
     "repl_start": lambda _p: SESSION.repl_start(),
     "repl_stop": lambda _p: SESSION.repl_stop(),
     "repl_write": lambda p: SESSION.repl_write(p["data_b64"]),
