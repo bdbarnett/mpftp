@@ -149,6 +149,39 @@ function canImportMpremote(python: string): boolean {
   }
 }
 
+/** True when `python` is a Windows interpreter (needs Windows-style paths on WSL). */
+export function isWindowsPython(python: string): boolean {
+  const p = python.toLowerCase();
+  return p.endsWith(".exe") || p.includes("/mnt/c/") || /^[a-z]:\\/.test(python);
+}
+
+/**
+ * Convert a WSL/Linux path into a form Windows python.exe can open.
+ * Without this, Node spawn often passes `/home/...` and Windows Python
+ * mis-resolves it as `C:\home\...` (ENOENT).
+ */
+export function pathForPythonProcess(python: string, filePath: string): string {
+  if (detectHost() !== "wsl" || !isWindowsPython(python)) {
+    return filePath;
+  }
+  if (/^[a-zA-Z]:[\\/]/.test(filePath) || filePath.startsWith("\\\\")) {
+    return filePath;
+  }
+  try {
+    const win = execFileSync("wslpath", ["-w", filePath], {
+      encoding: "utf8",
+      timeout: 3000,
+    }).trim();
+    if (win) {
+      return win;
+    }
+  } catch {
+    /* fall through */
+  }
+  const distro = process.env.WSL_DISTRO_NAME || "Ubuntu";
+  return `\\\\wsl.localhost\\${distro}${filePath.replace(/\//g, "\\")}`;
+}
+
 export function resolveMpremoteCli(configured?: string): string | undefined {
   if (configured && configured.trim()) {
     return configured.trim();

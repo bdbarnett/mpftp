@@ -2,7 +2,7 @@ import { ChildProcessWithoutNullStreams, spawn } from "child_process";
 import * as path from "path";
 import { EventEmitter } from "events";
 import * as vscode from "vscode";
-import { getConfig, resolvePython } from "../platform";
+import { getConfig, pathForPythonProcess, resolvePython } from "../platform";
 
 export type PortInfo = {
   device: string;
@@ -65,7 +65,8 @@ export class SidecarBridge extends EventEmitter {
   private async start(): Promise<void> {
     const cfg = getConfig();
     const python = resolvePython(this.extensionPath, cfg.pythonPath);
-    const script = path.join(this.extensionPath, "python", "sidecar.py");
+    const scriptLinux = path.join(this.extensionPath, "python", "sidecar.py");
+    const script = pathForPythonProcess(python, scriptLinux);
     this.log.appendLine(`[mpftp] starting sidecar: ${python} ${script}`);
 
     this.proc = spawn(python, [script], {
