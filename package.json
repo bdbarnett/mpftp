@@ -1,0 +1,177 @@
+{
+  "name": "mpftp",
+  "displayName": "mpftp — MicroPython Board",
+  "description": "FTP-style file browser and ANSI REPL for MicroPython boards over USB serial (Linux, Windows, WSL via mpremote.exe).",
+  "version": "0.1.0",
+  "publisher": "bdbarnett",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Debuggers"
+  ],
+  "keywords": [
+    "micropython",
+    "mpremote",
+    "repl",
+    "serial",
+    "ftp",
+    "embedded"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "mpftp.connect",
+        "title": "mpftp: Connect to Board",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "mpftp.disconnect",
+        "title": "mpftp: Disconnect",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "mpftp.openFtp",
+        "title": "mpftp: Open File Browser",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "mpftp.openRepl",
+        "title": "mpftp: Open REPL",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "mpftp.softReset",
+        "title": "mpftp: Soft Reset"
+      },
+      {
+        "command": "mpftp.hardReset",
+        "title": "mpftp: Hard Reset"
+      },
+      {
+        "command": "mpftp.bootloader",
+        "title": "mpftp: Enter Bootloader"
+      },
+      {
+        "command": "mpftp.runFile",
+        "title": "mpftp: Run Current File on Board"
+      },
+      {
+        "command": "mpftp.eval",
+        "title": "mpftp: Eval Expression"
+      },
+      {
+        "command": "mpftp.exec",
+        "title": "mpftp: Exec Code"
+      },
+      {
+        "command": "mpftp.rtcGet",
+        "title": "mpftp: Get RTC"
+      },
+      {
+        "command": "mpftp.rtcSet",
+        "title": "mpftp: Set RTC from Host"
+      },
+      {
+        "command": "mpftp.mipInstall",
+        "title": "mpftp: mip Install Package"
+      },
+      {
+        "command": "mpftp.df",
+        "title": "mpftp: Disk Free (df)"
+      },
+      {
+        "command": "mpftp.refreshPorts",
+        "title": "mpftp: Refresh Serial Ports"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "mpftp.runFile",
+          "when": "resourceExtname == .py && mpftp.connected",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "mpftp.disconnect",
+          "when": "mpftp.connected"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "mpftp",
+          "title": "mpftp",
+          "icon": "resources/mpftp.svg"
+        }
+      ]
+    },
+    "views": {
+      "mpftp": [
+        {
+          "type": "webview",
+          "id": "mpftp.ftpView",
+          "name": "Board Files"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "mpftp",
+      "properties": {
+        "mpftp.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python interpreter that has mpremote installed. On WSL, leave empty to auto-use Windows python.exe so COM ports work."
+        },
+        "mpftp.mpremotePath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to mpremote / mpremote.exe (used for port listing fallback and diagnostics)."
+        },
+        "mpftp.defaultBaud": {
+          "type": "number",
+          "default": 115200,
+          "description": "Serial baud rate."
+        },
+        "mpftp.autoConnectDevice": {
+          "type": "string",
+          "default": "",
+          "description": "Auto-connect device path (e.g. COM4 or /dev/ttyACM0). Empty disables auto-connect."
+        }
+      }
+    },
+    "colors": [],
+    "keybindings": [
+      {
+        "command": "mpftp.openRepl",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r"
+      },
+      {
+        "command": "mpftp.openFtp",
+        "key": "ctrl+alt+f",
+        "mac": "cmd+alt+f"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "tsc -p ./ --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
