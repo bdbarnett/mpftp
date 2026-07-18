@@ -278,12 +278,19 @@ export class FirmwarePanel {
     if (this.busy) {
       return;
     }
-    const device = this.prefs.device || this.bridge.connectedDevice || "";
+    // The connected board is the source of truth; only fall back to the saved
+    // device (e.g. a bare board that was never connected).
+    const connected = this.bridge.connectedDevice || "";
+    const device = connected || this.prefs.device || "";
     if (!device) {
       void vscode.window.showWarningMessage(
         "Select a device (serial port) to detect."
       );
       return;
+    }
+    if (device !== this.prefs.device) {
+      this.prefs.device = device;
+      this.savePrefs();
     }
 
     this.busy = true;
@@ -291,10 +298,10 @@ export class FirmwarePanel {
     this.post({ type: "clearLog" });
     this.log(`[mpftp] detecting ${device}…`);
 
-    // Enrichment only: gather MicroPython hints while still connected.
+    // Enrichment only: gather MicroPython hints while still connected, then
+    // release the port so esptool can open it.
     let mpHints: Record<string, unknown> = {};
-    const wasConnected =
-      !!this.bridge.connectedDevice && this.bridge.connectedDevice === device;
+    const wasConnected = !!connected;
     if (wasConnected) {
       mpHints = await this.gatherMpHints();
       try {
@@ -303,6 +310,8 @@ export class FirmwarePanel {
       } catch {
         /* ignore */
       }
+      // Let the OS release the serial handle before esptool grabs it.
+      await new Promise((r) => setTimeout(r, 800));
     }
 
     let res: Record<string, unknown> | undefined;
