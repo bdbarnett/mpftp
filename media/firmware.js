@@ -195,16 +195,20 @@
     const mp = d.mp || {};
     const hasMp = !!(mp.platform || mp.machine);
     const grid = el("div", "info-grid");
+    // infoGroup returns null when every row is empty; never appendChild(null).
+    const addGroup = (g) => {
+      if (g) grid.appendChild(g);
+    };
 
     if (d.espressif === false) {
-      grid.appendChild(
+      addGroup(
         infoGroup("Identity", [
           infoRow("Board", mpMachine(d)),
           infoRow("Platform", mp.platform),
           infoRow("Firmware port", (d.match && d.match.port) || d.suggestedPort),
         ])
       );
-      grid.appendChild(
+      addGroup(
         infoGroup("Runtime", [
           infoRow("MicroPython", hasMp ? mp.impl || "yes" : null),
           infoRow("Frequency", mp.freq ? fmtFreq(mp.freq) : null),
@@ -224,21 +228,21 @@
       return card;
     }
 
-    grid.appendChild(
+    addGroup(
       infoGroup("Identity", [
         infoRow("Chip", d.chip),
         infoRow("Revision", d.revision),
         infoRow("MAC", d.mac),
       ])
     );
-    grid.appendChild(
+    addGroup(
       infoGroup("Performance", [
         infoRow("Cores", (d.cores || "") + (d.lpCore ? " + LP" : "")),
         infoRow("Max clock", d.maxMhz ? d.maxMhz + " MHz" : null),
         infoRow("Current", hasMp && mp.freq ? fmtFreq(mp.freq) : null),
       ])
     );
-    grid.appendChild(
+    addGroup(
       infoGroup("Memory", [
         infoRow("SRAM", d.sramKb ? d.sramKb + " KB" : null),
         infoRow("Flash", d.flashMb ? d.flashMb + " MB" : null),
@@ -247,14 +251,14 @@
       ])
     );
     const m = d.match || {};
-    grid.appendChild(
+    addGroup(
       infoGroup("Build target", [
         infoRow("Board", m.board),
         infoRow("Variant", m.variant || "default"),
         infoRow("Flash size", m.flashSize),
       ])
     );
-    grid.appendChild(
+    addGroup(
       infoGroup("Security", [
         infoRow(
           "Flash encryption",
