@@ -785,6 +785,18 @@ def cmd_firmware(ns: argparse.Namespace) -> None:
         if not res.get("ok"):
             raise SystemExit(1)
         return
+    if sub == "detect":
+        extra = []
+        mp = _resolve_mp(ns)
+        if mp:
+            extra += ["--mp", mp]
+        extra += ["--device", ns.device]
+        if getattr(ns, "baud", None):
+            extra += ["--baud", str(ns.baud)]
+        if getattr(ns, "mp_hints", None):
+            extra += ["--mp-hints", ns.mp_hints]
+        out(_engine_json("detect", extra))
+        return
     if sub == "partitions":
         extra = [ns.part_action]
         mp = _resolve_mp(ns)
@@ -801,6 +813,13 @@ def cmd_firmware(ns: argparse.Namespace) -> None:
                 extra += ["--rows", ns.rows]
             else:
                 _die("partitions set requires --csv-file or --rows")
+        elif ns.part_action == "split":
+            if getattr(ns, "storage_bytes", None):
+                extra += ["--storage-bytes", str(ns.storage_bytes)]
+            if getattr(ns, "flash_bytes", None):
+                extra += ["--flash-bytes", str(ns.flash_bytes)]
+            if getattr(ns, "flash_mb", None):
+                extra += ["--flash-mb", str(ns.flash_mb)]
         out(_engine_json("partitions", extra))
         return
     _die(f"unknown firmware command: {sub}")
@@ -994,10 +1013,22 @@ def build_parser() -> argparse.ArgumentParser:
     fwf.add_argument("--erase", action="store_true", help="esp32: erase flash first")
     fwf.set_defaults(func=cmd_firmware)
 
+    fwd = fwsub.add_parser("detect", parents=[fw_sel, device_opts],
+                           help="esptool-first chip/flash/security probe")
+    fwd.add_argument("--mp-hints", dest="mp_hints",
+                     help="JSON of MicroPython runtime hints (optional)")
+    fwd.set_defaults(func=cmd_firmware)
+
     fwp = fwsub.add_parser("partitions", parents=[fw_sel], help="esp32 partition override")
-    fwp.add_argument("part_action", choices=["get", "set", "reset"])
+    fwp.add_argument("part_action", choices=["get", "set", "reset", "candidates", "split"])
     fwp.add_argument("--rows", help="JSON array of partition rows (set)")
     fwp.add_argument("--csv-file", dest="csv_file", help="CSV file to import (set)")
+    fwp.add_argument("--storage-bytes", dest="storage_bytes", type=int,
+                     help="storage partition size in bytes (split)")
+    fwp.add_argument("--flash-bytes", dest="flash_bytes", type=int,
+                     help="total flash in bytes (split)")
+    fwp.add_argument("--flash-mb", dest="flash_mb", type=int,
+                     help="flash size in MB for the sdkconfig fragment (split)")
     fwp.set_defaults(func=cmd_firmware)
 
     w = sub.add_parser("watch", help="Tail activity or REPL log")

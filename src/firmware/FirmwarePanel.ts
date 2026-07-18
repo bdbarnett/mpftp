@@ -38,6 +38,7 @@ export class FirmwarePanel {
   private activeStream: StreamHandle | undefined;
   private busy = false;
   private partitions: PartitionsPanel | undefined;
+  private lastDetect: Record<string, unknown> | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -192,6 +193,9 @@ export class FirmwarePanel {
       case "flash":
         await this.doFlash();
         break;
+      case "detect":
+        await this.detectDevice();
+        break;
       case "cancel":
         this.activeStream?.cancel();
         this.log("[mpftp] cancel requested");
@@ -212,6 +216,12 @@ export class FirmwarePanel {
         break;
       case "openPartitions":
         this.openPartitions();
+        break;
+      case "loadPartitions":
+        await this.loadPartitions();
+        break;
+      case "applySplit":
+        await this.applySplit(Number(msg.storageMb) || 0);
         break;
       default:
         break;
@@ -254,6 +264,164 @@ export class FirmwarePanel {
     this.pushState();
     await this.refreshArtifact();
     await this.pushDevices();
+  }
+
+  // ---------------------------------------------------------------------- //
+  // Detect (esptool-first chip / flash / security probe)
+  // ---------------------------------------------------------------------- //
+
+  /**
+   * One-click device probe. esptool-first (works on a bare board), with
+   * optional MicroPython enrichment only if a session was already active.
+   */
+  private async detectDevice(): Promise<void> {
+    if (this.busy) {
+      return;
+    }
+    const device = this.prefs.device || this.bridge.connectedDevice || "";
+    if (!device) {
+      void vscode.window.showWarningMessage(
+        "Select a device (serial port) to detect."
+      );
+      return;
+    }
+
+    this.busy = true;
+    this.phase("detecting", "Detecting…");
+    this.post({ type: "clearLog" });
+    this.log(`[mpftp] detecting ${device}…`);
+
+    // Enrichment only: gather MicroPython hints while still connected.
+    let mpHints: Record<string, unknown> = {};
+    const wasConnected =
+      !!this.bridge.connectedDevice && this.bridge.connectedDevice === device;
+    if (wasConnected) {
+      mpHints = await this.gatherMpHints();
+      try {
+        await this.bridge.disconnect();
+        this.log(`[mpftp] released ${device} for esptool`);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    let res: Record<string, unknown> | undefined;
+    try {
+      res = await this.engine.run("detect", {
+        ...this.pathArgs(),
+        device,
+        esptool: this.engine.esptoolCommand() || undefined,
+        mpHints: Object.keys(mpHints).length ? JSON.stringify(mpHints) : undefined,
+      });
+    } catch (e: any) {
+      this.log(`[mpftp] detect failed: ${e?.message || e}`);
+    }
+
+    this.busy = false;
+
+    if (res && res.ok !== false) {
+      this.lastDetect = res;
+      this.applyDetect(res);
+      const chip = String((res as any).chip || "");
+      const board = String(((res as any).match || {}).board || "");
+      this.phase(
+        "ready",
+        res.espressif === false
+          ? "Detected — not an Espressif chip"
+          : `Detected ${chip}${board ? " · " + board : ""}`
+      );
+      this.activity.event("firmware_detect", {
+        message: chip || "detect",
+        data: { device, board },
+      });
+    } else {
+      this.phase("failed", "Detect failed");
+    }
+
+    if (wasConnected) {
+      try {
+        await this.bridge.connect(device);
+        this.log(`[mpftp] reconnected ${device}`);
+        if (res && res.ok !== false && !Object.keys(mpHints).length) {
+          const fresh = await this.gatherMpHints();
+          if (Object.keys(fresh).length && this.lastDetect) {
+            (this.lastDetect as any).mp = fresh;
+          }
+        }
+      } catch (e: any) {
+        this.log(`[mpftp] reconnect failed (no MicroPython?): ${e?.message || e}`);
+      }
+    }
+
+    this.post({ type: "detect", detect: this.lastDetect || null });
+    this.pushState();
+    await this.refreshArtifact();
+    await this.pushDevices();
+  }
+
+  /** Best-effort MicroPython/CircuitPython runtime hints (enrichment only). */
+  private async gatherMpHints(): Promise<Record<string, unknown>> {
+    const code = [
+      "import json as _j",
+      "_d = {}",
+      "try:\n import sys\n _d['platform']=sys.platform\n _d['impl']=sys.implementation.name\n _d['build']=getattr(sys.implementation,'_build','')\nexcept Exception: pass",
+      "try:\n import os as _os\n _d['machine']=_os.uname().machine\nexcept Exception: pass",
+      "try:\n import machine as _m\n _d['freq']=_m.freq()\nexcept Exception: pass",
+      "try:\n import gc as _g\n _d['memfree']=_g.mem_free()\nexcept Exception: pass",
+      "try:\n import esp as _e\n _d['flash']=_e.flash_size()\nexcept Exception: pass",
+      "print('MPHINTS:'+_j.dumps(_d))",
+    ].join("\n");
+    try {
+      const res = await this.bridge.request<{ output?: string }>("exec", {
+        code,
+        follow: true,
+      });
+      const out = String((res as any)?.output ?? "");
+      const line = out.split(/\r?\n/).find((l) => l.startsWith("MPHINTS:"));
+      if (line) {
+        return JSON.parse(line.slice("MPHINTS:".length)) as Record<string, unknown>;
+      }
+    } catch {
+      /* board busy / not MicroPython */
+    }
+    return {};
+  }
+
+  /** Apply Detect's suggested port/board/variant when confidence allows. */
+  private applyDetect(res: Record<string, unknown>): void {
+    const m = (res.match || {}) as Record<string, unknown>;
+    const conf = String(m.confidence || "");
+    const port = String(m.port || "");
+    if (!port) {
+      return;
+    }
+    if (res.espressif === false) {
+      // Non-Espressif: only select the firmware port, never force an ESP board.
+      if (conf === "family-only") {
+        this.selectPort(port);
+      }
+      return;
+    }
+    if (conf === "matched" || conf === "family-only") {
+      this.selection = {
+        port,
+        board: String(m.board || ""),
+        variant: String(m.variant || ""),
+      };
+      this.savePrefs();
+    }
+  }
+
+  /** Select a port node, picking a GENERIC board when the board is unknown. */
+  private selectPort(port: string, board = "", variant = ""): void {
+    let b = board;
+    const node = this.tree.find((p: any) => p.port === port);
+    if (!b && node?.boards?.length) {
+      const generic = node.boards.find((x: any) => /GENERIC/.test(x.board));
+      b = (generic || node.boards[0]).board;
+    }
+    this.selection = { port, board: b, variant };
+    this.savePrefs();
   }
 
   private async autoSelectFromDevice(): Promise<void> {
@@ -351,6 +519,7 @@ export class FirmwarePanel {
       selection: this.selection,
       prefs: this.prefs,
       connectedDevice: this.bridge.connectedDevice || "",
+      detect: this.lastDetect || null,
       busy: this.busy,
     });
   }
@@ -486,6 +655,10 @@ export class FirmwarePanel {
       return;
     }
 
+    if (!(await this.securityGuard(port, device))) {
+      return;
+    }
+
     this.busy = true;
     this.phase("flashing", "Flashing…");
     this.post({ type: "clearLog" });
@@ -554,6 +727,36 @@ export class FirmwarePanel {
     await this.refreshArtifact();
   }
 
+  /**
+   * Block esp32 flashing when the last Detect reported flash encryption or
+   * secure boot enabled — writing a fresh image can brick or fail to boot.
+   * Returns false to abort the flash.
+   */
+  private async securityGuard(port: string, device: string): Promise<boolean> {
+    if (port !== "esp32" || !this.lastDetect) {
+      return true;
+    }
+    const det = this.lastDetect as any;
+    if (det.device !== device || !det.security) {
+      return true;
+    }
+    const enc = /enable/i.test(String(det.security.flashEncryption || ""));
+    const sb = /enable/i.test(String(det.security.secureBoot || ""));
+    if (!enc && !sb) {
+      return true;
+    }
+    const what = [enc ? "flash encryption" : "", sb ? "secure boot" : ""]
+      .filter(Boolean)
+      .join(" and ");
+    const pick = await vscode.window.showWarningMessage(
+      `This device reports ${what} enabled. Flashing a new image may brick it ` +
+        `or fail to boot. Continue anyway?`,
+      { modal: true },
+      "Flash anyway"
+    );
+    return pick === "Flash anyway";
+  }
+
   private async changeDevice(): Promise<void> {
     const port = this.selection.port;
     if (port === "rp2" || port === "samd") {
@@ -603,6 +806,57 @@ export class FirmwarePanel {
   // ---------------------------------------------------------------------- //
   // Partitions
   // ---------------------------------------------------------------------- //
+
+  private partArgs(): Record<string, string> {
+    return {
+      ...this.pathArgs(),
+      board: this.selection.board,
+      variant: this.selection.variant,
+    };
+  }
+
+  /** Enumerate stock/override partition tables for the firmware/storage split. */
+  private async loadPartitions(): Promise<void> {
+    if (this.selection.port !== "esp32") {
+      this.post({ type: "partitions", partitions: null, flashMb: 0 });
+      return;
+    }
+    try {
+      const res = await this.engine.run("partitions", this.partArgs(), ["candidates"]);
+      const flashMb = Number((this.lastDetect as any)?.flashMb || 0);
+      this.post({ type: "partitions", partitions: res, flashMb });
+    } catch (e: any) {
+      this.log(`[mpftp] partitions load failed: ${e?.message || e}`);
+      this.post({ type: "partitions", partitions: null, flashMb: 0 });
+    }
+  }
+
+  /** Save a firmware/storage split by resizing (or adding) the storage partition. */
+  private async applySplit(storageMb: number): Promise<void> {
+    if (this.selection.port !== "esp32") {
+      return;
+    }
+    const flashMb = Number((this.lastDetect as any)?.flashMb || 0);
+    const args: Record<string, string | number> = {
+      ...this.partArgs(),
+      storageBytes: Math.round(storageMb * 1024 * 1024),
+    };
+    if (flashMb) {
+      args.flashBytes = flashMb * 1024 * 1024;
+      args.flashMb = flashMb;
+    }
+    try {
+      const res = await this.engine.run("partitions", args, ["split"]);
+      this.activity.event("firmware_partitions_split", {
+        data: { ...this.selection, storageMb },
+      });
+      this.post({ type: "splitApplied", ...(res as Record<string, unknown>) });
+      await this.loadPartitions();
+      await this.refreshArtifact();
+    } catch (e: any) {
+      this.log(`[mpftp] split failed: ${e?.message || e}`);
+    }
+  }
 
   private openPartitions(): void {
     if (this.selection.port !== "esp32") {

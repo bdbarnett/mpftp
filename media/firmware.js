@@ -15,12 +15,17 @@
     prefs: { reconnectAfterFlash: false, alsoFlashAfterBuild: false, device: "" },
     connectedDevice: "",
     devices: [],
+    detect: null,
+    partitions: null,
+    partitionsFlashMb: 0,
     artifact: { ready: false },
     phase: "idle",
     phaseText: "Idle",
     filter: "",
     busy: false,
   };
+
+  let splitRequested = false;
 
   const $ = (sel, root) => (root || document).querySelector(sel);
   const el = (tag, cls, txt) => {
@@ -59,6 +64,8 @@
       app.appendChild(renderLog());
       return;
     }
+
+    app.appendChild(renderDeviceInfo());
 
     const grid = el("div", "grid");
     grid.appendChild(renderTarget());
@@ -120,6 +127,175 @@
     b.onclick = () => vscode.postMessage({ type: "changePath" });
     c.appendChild(b);
     return c;
+  }
+
+  // Device Info — esptool-first Detect
+  function mpMachine(d) {
+    const mp = (d && d.mp) || {};
+    return mp.machine || mp.platform || "";
+  }
+
+  function chipTitle(d) {
+    if (d.espressif === false) {
+      const port = (d.match && d.match.port) || d.suggestedPort || "";
+      const name = mpMachine(d) || "Non-Espressif device";
+      return name + (port ? " · firmware port: " + port : "");
+    }
+    const parts = [];
+    let head = d.chip || "ESP32";
+    if (d.revision) head += " (rev " + d.revision + ")";
+    parts.push(head);
+    parts.push((d.cores === 1 ? "single" : "dual") + (d.lpCore ? " + LP" : ""));
+    if (d.maxMhz) parts.push(d.maxMhz + " MHz");
+    if (d.flashMb) parts.push(d.flashMb + " MB flash");
+    if (d.psram && d.psram.present) parts.push(d.psram.octal ? "Octal PSRAM" : "PSRAM");
+    const m = d.match || {};
+    if (m.board) parts.push(m.board + (m.variant ? " / " + m.variant : ""));
+    return parts.join(" · ");
+  }
+
+  function infoRow(label, value) {
+    if (value == null || value === "") return null;
+    const row = el("div", "info-row");
+    row.appendChild(el("span", "info-label", label));
+    row.appendChild(el("span", "info-value", String(value)));
+    return row;
+  }
+
+  function infoGroup(title, rows) {
+    const kept = rows.filter(Boolean);
+    if (!kept.length) return null;
+    const g = el("div", "info-group");
+    g.appendChild(el("div", "info-group-title", title));
+    for (const r of kept) g.appendChild(r);
+    return g;
+  }
+
+  function renderDeviceInfo() {
+    const card = el("section", "card device-info");
+    const head = el("div", "info-head");
+    head.appendChild(el("span", "step-title", "Device Info"));
+    const btn = el("button", "btn accent sm", model.busy ? "Detecting…" : "Detect");
+    btn.disabled = model.busy;
+    btn.title = "Probe the selected device with esptool (bare board OK)";
+    btn.onclick = () => vscode.postMessage({ type: "detect" });
+    head.appendChild(btn);
+    card.appendChild(head);
+
+    const d = model.detect;
+    if (!d) {
+      card.appendChild(
+        el("p", "muted", "No device selected — click Detect to inspect.")
+      );
+      return card;
+    }
+
+    card.appendChild(el("div", "chip-title", chipTitle(d)));
+
+    const mp = d.mp || {};
+    const hasMp = !!(mp.platform || mp.machine);
+    const grid = el("div", "info-grid");
+
+    if (d.espressif === false) {
+      grid.appendChild(
+        infoGroup("Identity", [
+          infoRow("Board", mpMachine(d)),
+          infoRow("Platform", mp.platform),
+          infoRow("Firmware port", (d.match && d.match.port) || d.suggestedPort),
+        ])
+      );
+      grid.appendChild(
+        infoGroup("Runtime", [
+          infoRow("MicroPython", hasMp ? mp.impl || "yes" : null),
+          infoRow("Frequency", mp.freq ? fmtFreq(mp.freq) : null),
+          infoRow("Free heap", mp.memfree ? humanSize(mp.memfree) : null),
+        ])
+      );
+      card.appendChild(grid);
+      card.appendChild(
+        el(
+          "p",
+          "muted sm",
+          "Not an Espressif chip — " +
+            (d.reason || "esptool did not detect an ESP") +
+            ". Build/flash uses the suggested port."
+        )
+      );
+      return card;
+    }
+
+    grid.appendChild(
+      infoGroup("Identity", [
+        infoRow("Chip", d.chip),
+        infoRow("Revision", d.revision),
+        infoRow("MAC", d.mac),
+      ])
+    );
+    grid.appendChild(
+      infoGroup("Performance", [
+        infoRow("Cores", (d.cores || "") + (d.lpCore ? " + LP" : "")),
+        infoRow("Max clock", d.maxMhz ? d.maxMhz + " MHz" : null),
+        infoRow("Current", hasMp && mp.freq ? fmtFreq(mp.freq) : null),
+      ])
+    );
+    grid.appendChild(
+      infoGroup("Memory", [
+        infoRow("SRAM", d.sramKb ? d.sramKb + " KB" : null),
+        infoRow("Flash", d.flashMb ? d.flashMb + " MB" : null),
+        infoRow("PSRAM", d.psram && d.psram.present ? d.psram.label || "yes" : null),
+        infoRow("Free heap", hasMp && mp.memfree ? humanSize(mp.memfree) : null),
+      ])
+    );
+    const m = d.match || {};
+    grid.appendChild(
+      infoGroup("Build target", [
+        infoRow("Board", m.board),
+        infoRow("Variant", m.variant || "default"),
+        infoRow("Flash size", m.flashSize),
+      ])
+    );
+    grid.appendChild(
+      infoGroup("Security", [
+        infoRow(
+          "Flash encryption",
+          d.security && d.security.available ? d.security.flashEncryption : "unavailable"
+        ),
+        infoRow(
+          "Secure boot",
+          d.security && d.security.available ? d.security.secureBoot : "unavailable"
+        ),
+      ])
+    );
+    card.appendChild(grid);
+
+    const status = hasMp
+      ? "MicroPython running (" + (mp.impl || "mpy") + ")"
+      : "No MicroPython (bootloader / other firmware)";
+    card.appendChild(el("div", "info-status", status));
+
+    if (m.confidence && m.confidence !== "matched") {
+      card.appendChild(
+        pill(
+          m.confidence === "family-only" ? "family match" : "unconfirmed",
+          "muted"
+        )
+      );
+    }
+    if (m.variantOptions && m.variantOptions.length) {
+      card.appendChild(
+        el("p", "hint sm", "Variant options: " + m.variantOptions.join(", "))
+      );
+    }
+    for (const n of m.notes || []) {
+      card.appendChild(el("p", "hint sm", n));
+    }
+    return card;
+  }
+
+  function fmtFreq(freq) {
+    if (Array.isArray(freq)) return freq[0] / 1e6 + " MHz";
+    if (typeof freq === "number") return Math.round(freq / 1e6) + " MHz";
+    return String(freq);
   }
 
   // Step 1 — Target
@@ -241,6 +417,8 @@
 
   function selectTriple(port, board, variant) {
     model.selection = { port, board, variant };
+    model.partitions = null;
+    splitRequested = false;
     vscode.postMessage({ type: "select", port, board, variant });
     render();
   }
@@ -385,12 +563,11 @@
     flash.onclick = () => vscode.postMessage({ type: "flash" });
     actions.appendChild(flash);
 
-    if (port === "esp32") {
-      const part = el("button", "btn ghost", "Partitions…");
-      part.onclick = () => vscode.postMessage({ type: "openPartitions" });
-      actions.appendChild(part);
-    }
     card.appendChild(actions);
+
+    if (port === "esp32") {
+      renderStorageSplit(card);
+    }
 
     card.appendChild(
       checkbox("Reconnect after flash", model.prefs.reconnectAfterFlash, (v) =>
@@ -408,6 +585,152 @@
       );
     }
     return card;
+  }
+
+  // Firmware / storage split (esp32)
+  const STORAGE_SUBTYPES = ["fat", "spiffs", "littlefs"];
+  const STORAGE_NAMES = ["vfs", "storage", "ffat", "user"];
+
+  function parseCsvSize(v) {
+    v = (v || "").trim().toLowerCase();
+    if (!v) return 0;
+    if (v.endsWith("k")) return (parseInt(v, 10) || 0) * 1024;
+    if (v.endsWith("m")) return (parseInt(v, 10) || 0) * 1048576;
+    return parseInt(v, v.startsWith("0x") ? 16 : 10) || 0;
+  }
+
+  function isStorageRow(r) {
+    return (
+      r.type === "data" &&
+      (STORAGE_SUBTYPES.includes(r.subtype) ||
+        STORAGE_NAMES.includes((r.name || "").toLowerCase()))
+    );
+  }
+
+  function activeTable() {
+    const p = model.partitions;
+    if (!p || !p.candidates || !p.candidates.length) return null;
+    return (
+      p.candidates.find((x) => x.isOverride) ||
+      p.candidates.find((x) => x.isStock) ||
+      p.candidates[0]
+    );
+  }
+
+  function renderStorageSplit(card) {
+    const wrap = el("div", "split");
+    const title = el("div", "split-title");
+    title.appendChild(el("span", null, "Firmware / storage"));
+    const adv = el("button", "btn ghost sm", "Advanced…");
+    adv.title = "Open the full partition editor";
+    adv.onclick = () => vscode.postMessage({ type: "openPartitions" });
+    title.appendChild(adv);
+    wrap.appendChild(title);
+
+    const p = model.partitions;
+    if (!p) {
+      if (!splitRequested) {
+        splitRequested = true;
+        vscode.postMessage({ type: "loadPartitions" });
+      }
+      wrap.appendChild(el("p", "muted sm", "Loading partition layout…"));
+      card.appendChild(wrap);
+      return;
+    }
+    const c = activeTable();
+    if (!c) {
+      wrap.appendChild(el("p", "muted sm", "No partition table for this board."));
+      card.appendChild(wrap);
+      return;
+    }
+
+    const rows = c.rows || [];
+    const s = rows.find(isStorageRow);
+    const storageBytes = s ? parseCsvSize(s.size) : 0;
+    const total = c.targetSize || 0;
+    const fixed = Math.max(0, total - storageBytes); // firmware + system regions
+    const flashMb = model.partitionsFlashMb || 0;
+    const flashBytes = flashMb * 1048576;
+    const mb = (b) => Math.round((b / 1048576) * 100) / 100;
+
+    if (!flashBytes) {
+      wrap.appendChild(
+        el(
+          "p",
+          "hint sm",
+          "Detect the board to read its flash size before adjusting storage."
+        )
+      );
+      wrap.appendChild(
+        el(
+          "p",
+          "muted sm",
+          `Current: firmware+system ${mb(fixed)} MB · storage ${mb(storageBytes)} MB`
+        )
+      );
+      card.appendChild(wrap);
+      return;
+    }
+
+    const maxStorage = Math.max(0, flashBytes - fixed);
+    const readout = el("div", "split-readout");
+    const value = el("span", "split-value");
+    const fw = el("span", "split-fw");
+    const setLabels = (storageMb) => {
+      value.textContent = "storage " + storageMb + " MB";
+      fw.textContent =
+        "firmware + system " + mb(fixed) + " MB · flash " + flashMb + " MB";
+    };
+    readout.appendChild(value);
+    readout.appendChild(fw);
+    wrap.appendChild(readout);
+
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.className = "split-slider";
+    slider.min = "0";
+    slider.max = String(mb(maxStorage));
+    slider.step = "0.25";
+    slider.value = String(Math.min(mb(storageBytes), mb(maxStorage)));
+    setLabels(slider.value);
+
+    const num = document.createElement("input");
+    num.type = "number";
+    num.className = "split-num";
+    num.min = "0";
+    num.max = slider.max;
+    num.step = "0.25";
+    num.value = slider.value;
+
+    slider.oninput = () => {
+      num.value = slider.value;
+      setLabels(slider.value);
+    };
+    num.oninput = () => {
+      slider.value = num.value;
+      setLabels(num.value);
+    };
+
+    const sliderRow = el("div", "split-row");
+    sliderRow.appendChild(slider);
+    const numWrap = el("div", "split-num-wrap");
+    numWrap.appendChild(num);
+    numWrap.appendChild(el("span", "muted sm", "MB"));
+    sliderRow.appendChild(numWrap);
+    wrap.appendChild(sliderRow);
+
+    const apply = el("button", "btn primary sm", "Apply split");
+    apply.disabled = model.busy;
+    apply.onclick = () =>
+      vscode.postMessage({ type: "applySplit", storageMb: Number(num.value) || 0 });
+    wrap.appendChild(apply);
+
+    if (p.usingOverride) {
+      wrap.appendChild(
+        el("p", "hint sm", "Using a saved override; Apply overwrites it.")
+      );
+    }
+    card.appendChild(wrap);
   }
 
   // Log
@@ -440,12 +763,13 @@
       idle: ["Idle", "muted"],
       building: ["Building", "run"],
       flashing: ["Flashing", "run"],
+      detecting: ["Detecting", "run"],
       ready: ["Ready", "ok"],
       failed: ["Failed", "err"],
     };
     const [label, kind] = map[model.phase] || ["Idle", "muted"];
     const p = el("span", "phase-pill " + kind);
-    if (model.phase === "building" || model.phase === "flashing") {
+    if (model.phase === "building" || model.phase === "flashing" || model.phase === "detecting") {
       p.appendChild(el("i", "codicon codicon-loading spin"));
     }
     p.appendChild(el("span", null, model.phaseText || label));
@@ -492,9 +816,25 @@
           selection: msg.selection || model.selection,
           prefs: msg.prefs || model.prefs,
           connectedDevice: msg.connectedDevice || "",
+          detect: msg.detect !== undefined ? msg.detect : model.detect,
           busy: msg.busy,
         });
         render();
+        break;
+      case "detect":
+        model.detect = msg.detect || null;
+        splitRequested = false;
+        model.partitions = null;
+        render();
+        break;
+      case "partitions":
+        model.partitions = msg.partitions || null;
+        model.partitionsFlashMb = msg.flashMb || 0;
+        render();
+        break;
+      case "splitApplied":
+        appendLog("[mpftp] storage split saved: " + (msg.overridePath || ""));
+        for (const w of msg.warnings || []) appendLog("[mpftp] " + w);
         break;
       case "artifact":
         model.artifact = msg.artifact || { ready: false };
@@ -509,7 +849,10 @@
       case "phase":
         model.phase = msg.phase;
         model.phaseText = msg.text || "";
-        model.busy = msg.phase === "building" || msg.phase === "flashing";
+        model.busy =
+          msg.phase === "building" ||
+          msg.phase === "flashing" ||
+          msg.phase === "detecting";
         render();
         break;
       case "clearLog":

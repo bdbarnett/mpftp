@@ -128,6 +128,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
   private remotePath = "/";
   private transferBusy = false;
   private bridgeEventsBound = false;
+  private deviceInfo = "";
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -214,8 +215,63 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.bridgeEventsBound = true;
-    this.bridge.on("connected", () => void this.pushState());
-    this.bridge.on("disconnected", () => void this.pushState());
+    this.bridge.on("connected", () => {
+      void this.refreshDeviceInfo().then(() => this.pushState());
+    });
+    this.bridge.on("disconnected", () => {
+      this.deviceInfo = "";
+      void this.pushState();
+    });
+  }
+
+  /** Compact one-line chip/build/mem hint for the header (MicroPython only). */
+  private async refreshDeviceInfo(): Promise<void> {
+    this.deviceInfo = "";
+    const code = [
+      "import json as _j",
+      "_d = {}",
+      "try:\n import sys\n _d['platform']=sys.platform\n _d['impl']=sys.implementation.name\n _d['ver']='.'.join(str(x) for x in sys.implementation.version[:3])\nexcept Exception: pass",
+      "try:\n import os as _o\n _d['machine']=_o.uname().machine\nexcept Exception: pass",
+      "try:\n import machine as _m\n _d['freq']=_m.freq()\nexcept Exception: pass",
+      "try:\n import gc as _g\n _d['memfree']=_g.mem_free()\nexcept Exception: pass",
+      "print('MPINFO:'+_j.dumps(_d))",
+    ].join("\n");
+    try {
+      const res = await this.bridge.request<{ output?: string }>("exec", {
+        code,
+        follow: true,
+      });
+      const out = String((res as any)?.output ?? "");
+      const line = out.split(/\r?\n/).find((l) => l.startsWith("MPINFO:"));
+      if (!line) {
+        return;
+      }
+      const d = JSON.parse(line.slice("MPINFO:".length)) as Record<string, unknown>;
+      const parts: string[] = [];
+      const chip = String(d.machine || d.platform || "");
+      if (chip) {
+        parts.push(chip);
+      }
+      const impl = String(d.impl || "");
+      const ver = String(d.ver || "");
+      if (impl) {
+        parts.push(ver ? `${impl} ${ver}` : impl);
+      }
+      const freq = d.freq;
+      if (typeof freq === "number" && freq > 0) {
+        parts.push(`${Math.round(freq / 1e6)} MHz`);
+      } else if (Array.isArray(freq) && freq.length) {
+        parts.push(`${Math.round(Number(freq[0]) / 1e6)} MHz`);
+      }
+      const mem = Number(d.memfree || 0);
+      if (mem > 0) {
+        const human = mem < 1048576 ? `${Math.round(mem / 1024)} KB` : `${(mem / 1048576).toFixed(1)} MB`;
+        parts.push(`${human} free`);
+      }
+      this.deviceInfo = parts.join(" · ");
+    } catch {
+      /* board busy / not MicroPython */
+    }
   }
 
   private postAll(msg: Record<string, unknown>): void {
@@ -506,6 +562,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
       type: "state",
       connected,
       device: this.bridge.connectedDevice || "",
+      deviceInfo: connected ? this.deviceInfo : "",
       localPath: this.localPath,
       // Hide board path while disconnected; keep this.remotePath for reconnect.
       remotePath: connected ? this.remotePath : "",

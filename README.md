@@ -17,7 +17,7 @@ Works on:
 - Hard-reset auto-reconnect; **Resume** reconnects the last device
 - mpremote-backed ops: eval/exec/run, soft/hard reset, bootloader, RTC, host-side **mip**, df, mount/umount, romfs, recursive `cp`, hash
 - Agent CLI + TCP RPC (`127.0.0.1:7429`) sharing the UI serial session
-- **Firmware builder**: guided build/flash UI (build MicroPython once, flash one or many boards), auto-discovered user C modules / frozen manifest, esp32/rp2/samd flashing, and an ESP32 partition editor with workspace overrides
+- **Firmware builder**: guided build/flash UI (build MicroPython once, flash one or many boards), auto-discovered user C modules / frozen manifest, esp32/rp2/samd flashing, esptool-first **Detect** (chip/flash/security + board autoset), and an ESP32 firmware/storage split with workspace partition overrides
 
 ## Requirements
 
@@ -103,14 +103,26 @@ It reimplements the useful parts of a cmods-style build without shelling out to
    ports); rp2/samd copy the `.uf2` to the bootloader drive (rp2 falls back to
    `picotool`).
 
-For esp32 the **Partitions…** editor loads the board's stock CSV, lets you edit
-it (with presets, a flash-usage bar, and overlap/alignment validation), and
-saves a **workspace override** at `<workspace>/mpftp-partitions/esp32/<board>.csv`
-— the MicroPython clone is never modified. Builds inject the override
-automatically.
+**Detect** reads the board with esptool first, so it works even on a bare board
+with no MicroPython: chip, revision, flash size, PSRAM, and flash-encryption /
+secure-boot state populate a Device Info card, and the board / variant / flash
+size are auto-selected. If a MicroPython session was active it is briefly
+released, probed, then reconnected to enrich the card (clock, free heap,
+`_build`). Non-Espressif boards get only a suggested firmware port — never a
+forced `ESP32_GENERIC_*` — and ESP32-P4 external Wi-Fi variants (`C5_WIFI` /
+`C6_WIFI`) are chosen only from MicroPython hints. If a device reports flash
+encryption or secure boot enabled, flashing is guarded behind a warning.
+
+For esp32 the Firmware page offers a simple **firmware / storage** split (resize
+or add the storage partition), and **Advanced…** opens the full **Partitions…**
+editor (presets, a flash-usage bar, and overlap/alignment validation). Both save
+a **workspace override** at `<workspace>/mpftp-partitions/esp32/<board>.csv`
+— the MicroPython clone is never modified. Builds inject the override (and its
+companion flash-size fragment) into the build-dir `sdkconfig` automatically.
 
 ```bash
 ./scripts/mpftp firmware list
+./scripts/mpftp firmware detect -d COM4         # esptool-first chip/flash/security probe
 ./scripts/mpftp firmware build --port esp32 --board ESP32_GENERIC
 ./scripts/mpftp firmware flash --port esp32 --board ESP32_GENERIC -d COM4
 ./scripts/mpftp firmware flash -d COM5          # same artifact, next board

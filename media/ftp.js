@@ -5,6 +5,7 @@
   const state = {
     connected: false,
     device: "",
+    deviceInfo: "",
     localPath: "",
     remotePath: "/",
     localEntries: [],
@@ -441,7 +442,11 @@
 
   function updateChrome() {
     const on = state.connected;
-    $("status").textContent = on ? `Connected: ${state.device}` : "Not connected";
+    const info = on && state.deviceInfo ? ` — ${state.deviceInfo}` : "";
+    $("status").textContent = on
+      ? `Connected: ${state.device}${info}`
+      : "Not connected";
+    $("status").title = on && state.deviceInfo ? state.deviceInfo : "";
     $("btnConnect").textContent = on ? "Disconnect" : "Connect";
     $("btnXferUp").disabled = !on;
     $("btnXferDown").disabled = !on;
@@ -543,6 +548,7 @@
       case "state":
         state.connected = !!msg.connected;
         state.device = msg.device || "";
+        state.deviceInfo = msg.deviceInfo || "";
         if (msg.localPath != null) state.localPath = msg.localPath;
         state.remotePath = msg.remotePath != null ? msg.remotePath : state.remotePath;
         if (msg.localEntries) {

@@ -104,7 +104,10 @@ session. All MP ports build; flash is supported for `esp32`, `rp2`, `samd`.
 ./scripts/mpftp firmware artifact --port esp32 --board ESP32_GENERIC # Ready?/path
 ./scripts/mpftp firmware flash --port esp32 --board ESP32_GENERIC -d COM4
 ./scripts/mpftp firmware flash -d COM5            # same artifact, next board (no rebuild)
+./scripts/mpftp firmware detect -d COM4           # esptool-first chip/flash/security probe
 ./scripts/mpftp firmware partitions get --board ESP32_GENERIC
+./scripts/mpftp firmware partitions candidates --board ESP32_GENERIC  # stock+override tables
+./scripts/mpftp firmware partitions split --board ESP32_GENERIC --storage-bytes 4194304 --flash-mb 8
 ./scripts/mpftp firmware partitions set --board ESP32_GENERIC --rows '[{...}]'
 ./scripts/mpftp firmware partitions reset --board ESP32_GENERIC
 ```
@@ -115,9 +118,22 @@ session. All MP ports build; flash is supported for `esp32`, `rp2`, `samd`.
   Windows python esptool so it can see `COMx`.
 - rp2/samd flash copies the `.uf2` to the bootloader drive (rp2 falls back to
   `picotool`); put the board in BOOTSEL/bootloader mode first.
+- **Detect** (Firmware page **Detect** button / `firmware detect`) is
+  **esptool-first**: it reads chip / revision / flash size / PSRAM / security
+  directly from the ROM bootloader, so it works on a bare board with no
+  MicroPython. If a MicroPython session was active it is briefly released,
+  probed, then reconnected to enrich the card (freq, heap, `_build`). It
+  auto-selects board / variant / flash size; non-Espressif boards only get a
+  suggested firmware port, never a forced `ESP32_GENERIC_*`. Flash encryption /
+  secure boot enabled → a pre-flash guard warns before writing.
+- **ESP32-P4 Wi-Fi variants** (`C5_WIFI` / `C6_WIFI`) use an external radio that
+  esptool cannot see; they are chosen only from MicroPython `_build`/machine
+  hints or an explicit user pick.
 - ESP32 partition edits save to `<workspace>/mpftp-partitions/esp32/<board>.csv`
   (workspace override — the MicroPython clone is never modified) and are injected
-  at build time.
+  into the **build-dir** `sdkconfig` at build time (with a companion
+  `<board>.sdkconfig` fragment for the flash size). The Firmware page exposes a
+  simple firmware/storage split; **Advanced…** opens the full CSV editor.
 - UI: **Firmware** button in the Board Files toolbar, or `mpftp: Build & Flash
   Firmware`. Same operations over Agent RPC as `firmware_*` methods
   (`firmware_list`, `firmware_build`, `firmware_flash`, `firmware_partitions`, …).
