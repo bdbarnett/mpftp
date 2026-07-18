@@ -568,6 +568,53 @@ class Session:
     def run_script(self, source: str, follow: bool = True) -> dict[str, Any]:
         return self.exec(source, follow=follow)
 
+    def run_path(self, path: str, follow: bool = False) -> dict[str, Any]:
+        """
+        Run a .py file already on the board.
+
+        Soft-resets first (fresh heap), then exec's the file with __name__/__file__
+        set like a normal script launch. Default follow=False so UI apps / loops
+        do not block the sidecar; output is left on the UART (open REPL to watch).
+        """
+        path_lit = json.dumps(path)
+        code = (
+            f"_p = {path_lit}\n"
+            "exec(compile(open(_p).read(), _p, \"exec\"), "
+            "{\"__name__\": \"__main__\", \"__file__\": _p})\n"
+        )
+        with self._lock:
+            self._enter_raw(soft_reset=True)
+            t = self._require()
+            try:
+                if follow:
+                    out = t.exec(code)
+                    if out is None:
+                        text = ""
+                    elif isinstance(out, bytes):
+                        text = out.decode("utf-8", "replace")
+                    else:
+                        text = str(out)
+                    return {"output": text, "path": path, "followed": True}
+                t.exec_raw_no_follow(code.encode())
+                # Leave raw REPL so the script keeps running and prints are visible.
+                try:
+                    if t.in_raw_repl:
+                        t.exit_raw_repl()
+                except Exception:
+                    pass
+                if self._repl_mode:
+                    self._start_repl_reader()
+                return {"output": "", "path": path, "followed": False}
+            except Exception:
+                if self._repl_mode:
+                    try:
+                        if self.transport and self.transport.in_raw_repl:
+                            self.transport.exit_raw_repl()
+                    except Exception:
+                        pass
+                    self._start_repl_reader()
+                raise
+
     def soft_reset(self) -> dict[str, Any]:
         with self._lock:
             t = self._require()
@@ -1119,6 +1166,7 @@ METHODS = {
     "exec": lambda p: SESSION.exec(p["code"], bool(p.get("follow", True))),
     "eval": lambda p: SESSION.eval(p["expr"]),
     "run_script": lambda p: SESSION.run_script(p["source"], bool(p.get("follow", True))),
+    "run_path": lambda p: SESSION.run_path(p["path"], bool(p.get("follow", False))),
     "soft_reset": lambda _p: SESSION.soft_reset(),
     "hard_reset": lambda _p: SESSION.hard_reset(),
     "bootloader": lambda _p: SESSION.bootloader(),

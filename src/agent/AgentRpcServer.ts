@@ -5,6 +5,8 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { ActivityLog } from "../activityLog";
 import { SidecarBridge } from "../bridge/SidecarBridge";
+import { FirmwareEngine } from "../firmware/engine";
+import { getConfig } from "../platform";
 
 const DEFAULT_PORT = 7429;
 const HOST = "127.0.0.1";
@@ -19,10 +21,15 @@ export class AgentRpcServer {
   private server: net.Server | undefined;
   private port = DEFAULT_PORT;
 
+  private readonly firmware: FirmwareEngine;
+
   constructor(
     private readonly bridge: SidecarBridge,
-    private readonly activity: ActivityLog
-  ) {}
+    private readonly activity: ActivityLog,
+    extensionPath: string
+  ) {
+    this.firmware = new FirmwareEngine(extensionPath);
+  }
 
   get path(): string {
     return `${HOST}:${this.port}`;
@@ -153,7 +160,97 @@ export class AgentRpcServer {
       await this.bridge.disconnect();
       return { ok: true };
     }
+    if (method.startsWith("firmware_")) {
+      return this.dispatchFirmware(method.slice("firmware_".length), params);
+    }
     return this.bridge.request(method, params);
+  }
+
+  /** Host-side firmware engine methods (build/flash never touch the sidecar). */
+  private async dispatchFirmware(
+    op: string,
+    params: Record<string, unknown>
+  ): Promise<unknown> {
+    const cfg = getConfig();
+    const pathArgs: Record<string, string> = {};
+    const mp = (params.mp as string) || cfg.micropythonPath;
+    if (mp) {
+      pathArgs.mp = mp;
+    }
+    if (cfg.idfPath) {
+      pathArgs.idf = cfg.idfPath;
+    }
+    if (cfg.emsdkPath) {
+      pathArgs.emsdk = cfg.emsdkPath;
+    }
+    const sel = {
+      port: (params.port as string) || "",
+      board: (params.board as string) || "",
+      variant: (params.variant as string) || "",
+    };
+
+    switch (op) {
+      case "discover":
+        return this.firmware.run("discover", pathArgs);
+      case "list":
+      case "tree":
+        return this.firmware.run("tree", pathArgs);
+      case "cmods":
+        return this.firmware.run("cmods", pathArgs);
+      case "flashers":
+        return this.firmware.run("flashers");
+      case "artifact":
+        return this.firmware.run("artifact", { ...pathArgs, ...sel });
+      case "build":
+      case "clean": {
+        const log: string[] = [];
+        const handle = this.firmware.stream(
+          op === "clean" ? "clean" : "build",
+          { ...pathArgs, ...sel, clean: op === "build" ? !!params.clean : undefined },
+          (line) => {
+            if (log.length < 4000) {
+              log.push(line);
+            }
+          }
+        );
+        const result = await handle.done;
+        return { ...result, log };
+      }
+      case "flash": {
+        const log: string[] = [];
+        const handle = this.firmware.stream(
+          "flash",
+          {
+            ...pathArgs,
+            ...sel,
+            device: (params.device as string) || "",
+            artifact: (params.artifact as string) || undefined,
+            erase: !!params.erase,
+            esptool: this.firmware.esptoolCommand() || undefined,
+          },
+          (line) => {
+            if (log.length < 4000) {
+              log.push(line);
+            }
+          }
+        );
+        const result = await handle.done;
+        return { ...result, log };
+      }
+      case "partitions": {
+        const action = (params.action as string) || "get";
+        const args: Record<string, string | undefined> = { ...pathArgs, board: sel.board, variant: sel.variant };
+        if (params.rows) {
+          args.rows = typeof params.rows === "string" ? params.rows : JSON.stringify(params.rows);
+        }
+        if (params.csvFile) {
+          args.csvFile = params.csvFile as string;
+        }
+        return this.firmware.run("partitions", args, [action]);
+      }
+      default:
+        throw new Error(`unknown firmware op: ${op}`);
+    }
   }
 
   dispose(): void {

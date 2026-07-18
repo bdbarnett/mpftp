@@ -68,6 +68,7 @@ REPL_LOG = HOME_MPFTP / "repl.log"
 
 HERE = Path(__file__).resolve().parent
 SIDECAR = HERE / "sidecar.py"
+FIRMWARE_ENGINE = HERE / "firmware_engine.py"
 
 
 def _die(msg: str, code: int = 1) -> None:
@@ -663,6 +664,148 @@ def cmd_rpc(ns: argparse.Namespace) -> None:
             client.close()
 
 
+def resolve_build_python() -> str:
+    """A native (Linux on WSL) python3 to run the firmware engine + make."""
+    env = os.environ.get("MPFTP_BUILD_PYTHON")
+    if env:
+        return env
+    import shutil
+
+    if sys.platform != "win32":
+        for cand in ("python3", "python"):
+            p = shutil.which(cand)
+            if p:
+                return p
+    return sys.executable or "python3"
+
+
+def _engine_argv(cmd: str, extra: list[str]) -> list[str]:
+    return [resolve_build_python(), str(FIRMWARE_ENGINE), cmd, *extra]
+
+
+def _engine_json(cmd: str, extra: list[str]) -> Any:
+    r = subprocess.run(_engine_argv(cmd, extra), capture_output=True, text=True)
+    if r.returncode != 0 and not r.stdout.strip():
+        _die(r.stderr.strip() or f"engine {cmd} failed")
+    try:
+        return json.loads(r.stdout)
+    except Exception:
+        _die(r.stderr.strip() or r.stdout.strip() or f"engine {cmd}: bad output")
+
+
+def _engine_stream(cmd: str, extra: list[str]) -> dict:
+    """Run a streaming engine command; log lines -> stderr, return final result."""
+    proc = subprocess.Popen(
+        _engine_argv(cmd, extra),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    result: dict = {}
+    assert proc.stdout
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            print(line, file=sys.stderr)
+            continue
+        if msg.get("type") == "log":
+            print(msg.get("line", ""), file=sys.stderr)
+        elif msg.get("type") == "result":
+            result = msg
+    proc.wait()
+    return result or {"ok": proc.returncode == 0, "returncode": proc.returncode}
+
+
+def _resolve_mp(ns: argparse.Namespace) -> Optional[str]:
+    if getattr(ns, "mp", None):
+        return ns.mp
+    info = _engine_json("discover", [])
+    return info.get("micropython")
+
+
+def _sel_args(ns: argparse.Namespace) -> list[str]:
+    args: list[str] = []
+    mp = _resolve_mp(ns)
+    if mp:
+        args += ["--mp", mp]
+    if getattr(ns, "port", None):
+        args += ["--port", ns.port]
+    if getattr(ns, "board", None):
+        args += ["--board", ns.board]
+    if getattr(ns, "variant", None):
+        args += ["--variant", ns.variant]
+    return args
+
+
+def cmd_firmware(ns: argparse.Namespace) -> None:
+    sub = ns.fw_cmd
+    if sub == "list":
+        extra = ["--mp", ns.mp] if getattr(ns, "mp", None) else []
+        out(_engine_json("tree", extra))
+        return
+    if sub == "discover":
+        extra = ["--mp", ns.mp] if getattr(ns, "mp", None) else []
+        out(_engine_json("discover", extra))
+        return
+    if sub == "cmods":
+        extra = ["--mp", ns.mp] if getattr(ns, "mp", None) else []
+        out(_engine_json("cmods", extra))
+        return
+    if sub == "artifact":
+        out(_engine_json("artifact", _sel_args(ns)))
+        return
+    if sub == "build":
+        extra = _sel_args(ns)
+        if ns.clean:
+            extra.append("--clean")
+        res = _engine_stream("build", extra)
+        out(res)
+        if not res.get("ok"):
+            raise SystemExit(1)
+        return
+    if sub == "clean":
+        res = _engine_stream("clean", _sel_args(ns))
+        out(res)
+        return
+    if sub == "flash":
+        extra = _sel_args(ns)
+        if ns.device:
+            extra += ["--device", ns.device]
+        if getattr(ns, "artifact", None):
+            extra += ["--artifact", ns.artifact]
+        if getattr(ns, "erase", False):
+            extra.append("--erase")
+        res = _engine_stream("flash", extra)
+        out(res)
+        if not res.get("ok"):
+            raise SystemExit(1)
+        return
+    if sub == "partitions":
+        extra = [ns.part_action]
+        mp = _resolve_mp(ns)
+        if mp:
+            extra += ["--mp", mp]
+        if getattr(ns, "board", None):
+            extra += ["--board", ns.board]
+        if getattr(ns, "variant", None):
+            extra += ["--variant", ns.variant]
+        if ns.part_action == "set":
+            if getattr(ns, "csv_file", None):
+                extra += ["--csv-file", ns.csv_file]
+            elif getattr(ns, "rows", None):
+                extra += ["--rows", ns.rows]
+            else:
+                _die("partitions set requires --csv-file or --rows")
+        out(_engine_json("partitions", extra))
+        return
+    _die(f"unknown firmware command: {sub}")
+
+
 def cmd_watch(ns: argparse.Namespace) -> None:
     path = Path(ns.file) if ns.file else (REPL_LOG if ns.repl else ACTIVITY_LOG)
     if not path.exists():
@@ -815,6 +958,47 @@ def build_parser() -> argparse.ArgumentParser:
     rpc.add_argument("method")
     rpc.add_argument("params", nargs="?", help='JSON object, e.g. {"path":"/"}')
     rpc.set_defaults(func=cmd_rpc)
+
+    fw = sub.add_parser("firmware", help="Build & flash MicroPython firmware (host-side)")
+    fwsub = fw.add_subparsers(dest="fw_cmd", required=True)
+
+    fw_sel = argparse.ArgumentParser(add_help=False)
+    fw_sel.add_argument("--mp", help="MicroPython tree path (auto-discovered if omitted)")
+    fw_sel.add_argument("--port", help="MicroPython port, e.g. esp32")
+    fw_sel.add_argument("--board", default="", help="Board name")
+    fw_sel.add_argument("--variant", default="", help="Board/port variant")
+
+    fwsub.add_parser("list", parents=[fw_sel], help="List ports/boards/variants").set_defaults(
+        func=cmd_firmware
+    )
+    fwsub.add_parser("discover", parents=[fw_sel], help="Show resolved MP/IDF/emsdk paths").set_defaults(
+        func=cmd_firmware
+    )
+    fwsub.add_parser("cmods", parents=[fw_sel], help="List discovered user C modules").set_defaults(
+        func=cmd_firmware
+    )
+    fwsub.add_parser("artifact", parents=[fw_sel], help="Report built firmware for a selection").set_defaults(
+        func=cmd_firmware
+    )
+
+    fwb = fwsub.add_parser("build", parents=[fw_sel], help="Build firmware (streams log)")
+    fwb.add_argument("--clean", action="store_true", help="Clean before building")
+    fwb.set_defaults(func=cmd_firmware)
+
+    fwsub.add_parser("clean", parents=[fw_sel], help="Clean a selection").set_defaults(
+        func=cmd_firmware
+    )
+
+    fwf = fwsub.add_parser("flash", parents=[fw_sel, device_opts], help="Flash a built artifact")
+    fwf.add_argument("--artifact", help="Explicit firmware file (else last build)")
+    fwf.add_argument("--erase", action="store_true", help="esp32: erase flash first")
+    fwf.set_defaults(func=cmd_firmware)
+
+    fwp = fwsub.add_parser("partitions", parents=[fw_sel], help="esp32 partition override")
+    fwp.add_argument("part_action", choices=["get", "set", "reset"])
+    fwp.add_argument("--rows", help="JSON array of partition rows (set)")
+    fwp.add_argument("--csv-file", dest="csv_file", help="CSV file to import (set)")
+    fwp.set_defaults(func=cmd_firmware)
 
     w = sub.add_parser("watch", help="Tail activity or REPL log")
     w.add_argument("--repl", action="store_true", help="Watch REPL log instead of activity")

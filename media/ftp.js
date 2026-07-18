@@ -214,10 +214,6 @@
       action: () => vscode.postMessage({ type: "localMkdir" }),
     });
     items.push({
-      label: "Refresh",
-      action: () => vscode.postMessage({ type: "refreshLocal" }),
-    });
-    items.push({
       label: "Browse…",
       action: () => vscode.postMessage({ type: "pickLocal" }),
     });
@@ -302,16 +298,6 @@
       label: "New file",
       disabled: !state.connected,
       action: () => vscode.postMessage({ type: "newFile" }),
-    });
-    items.push({
-      label: "Show tree",
-      disabled: !state.connected,
-      action: () => vscode.postMessage({ type: "showTree" }),
-    });
-    items.push({
-      label: "Refresh",
-      disabled: !state.connected,
-      action: () => vscode.postMessage({ type: "refreshRemote" }),
     });
     showContextMenu(ev.clientX, ev.clientY, items);
   }
@@ -476,6 +462,7 @@
     { command: "mpftp.openFtp", title: "Open File Browser" },
     { command: "mpftp.openFtpEditor", title: "Open File Browser in Editor" },
     { command: "mpftp.openRepl", title: "Open REPL" },
+    { command: "mpftp.openFirmware", title: "Build & Flash Firmware…" },
     { command: "mpftp.editRemote", title: "Edit Board File", needsConnected: true },
     { command: "mpftp.softReset", title: "Soft Reset", needsConnected: true },
     { command: "mpftp.hardReset", title: "Hard Reset", needsConnected: true },
@@ -535,6 +522,9 @@
   $("btnXferDown").addEventListener("click", doDownload);
   $("btnRepl").addEventListener("click", () => {
     vscode.postMessage({ type: "openRepl" });
+  });
+  $("btnFirmware").addEventListener("click", () => {
+    vscode.postMessage({ type: "command", command: "mpftp.openFirmware" });
   });
   $("btnPickLocal").addEventListener("click", () => {
     vscode.postMessage({ type: "pickLocal" });

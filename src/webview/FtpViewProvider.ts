@@ -319,19 +319,17 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
           return;
         }
         this.status(`Running ${remote}…`, "active");
-        // Execute the board file in-place (same idea as mpremote run, but for :path).
-        const code = `exec(open(${JSON.stringify(remote)}).read())`;
-        const res = await this.bridge.request<{ output: string }>("exec", {
-          code,
-          follow: true,
-        });
-        const channel = vscode.window.createOutputChannel("mpftp");
-        channel.appendLine(`>>> run ${remote}`);
-        if (res.output) {
-          channel.appendLine(res.output);
+        try {
+          // Soft-reset + exec board file; do not follow (UI apps loop forever).
+          // Output appears on the REPL UART — open it so the user can see prints/tracebacks.
+          await this.bridge.request("run_path", { path: remote, follow: false });
+          this.status(`Running ${remote} — see REPL`, "done");
+          this.onOpenRepl();
+        } catch (e: any) {
+          const err = String(e?.message || e);
+          this.status(`Run failed: ${err}`, "stalled");
+          void vscode.window.showErrorMessage(`mpftp run ${remote}: ${err}`);
         }
-        channel.show(true);
-        this.status(`Ran ${remote}`, "done");
         break;
       }
       case "hashRemote": {
@@ -345,16 +343,6 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
         });
         this.status(`${remote}: ${res.algo} ${res.hash}`);
         void vscode.window.showInformationMessage(`${remote}\n${res.hash}`);
-        break;
-      }
-      case "showTree": {
-        const res = await this.bridge.request<{ path: string; children: unknown[] }>("fs_tree", {
-          path: this.remotePath || "/",
-        });
-        const channel = vscode.window.createOutputChannel("mpftp");
-        channel.appendLine(JSON.stringify(res, null, 2));
-        channel.show(true);
-        this.status(`Tree for ${res.path}`);
         break;
       }
       case "mkdir": {
@@ -835,6 +823,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
       </button>
       <button id="btnConnect">Connect</button>
       <button id="btnRepl" class="secondary" disabled>REPL</button>
+      <button id="btnFirmware" class="secondary" title="Build & flash firmware">Firmware</button>
       <span class="status" id="status">Not connected</span>
     </div>
     <div class="panes">

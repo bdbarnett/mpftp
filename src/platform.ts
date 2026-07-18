@@ -200,6 +200,40 @@ export function resolveMpremoteCli(configured?: string): string | undefined {
   return which("mpremote");
 }
 
+/**
+ * Resolve a Python that can run the firmware engine and drive `make`.
+ * Unlike {@link resolvePython} (which prefers Windows python for COM ports),
+ * builds must run under the native Linux/host toolchain, so this prefers a
+ * Linux python3 on WSL. The engine itself is stdlib-only.
+ */
+export function resolveBuildPython(extensionPath: string, configured?: string): string {
+  if (configured && configured.trim()) {
+    return configured.trim();
+  }
+  const host = detectHost();
+  const candidates: string[] = [];
+  if (host === "windows") {
+    candidates.push(
+      which("python") || "",
+      which("py") || "",
+      path.join(extensionPath, ".venv", "Scripts", "python.exe")
+    );
+  } else {
+    // wsl + linux: native Linux python3 (make/idf must run in Linux).
+    candidates.push(
+      which("python3") || "",
+      which("python") || "",
+      path.join(extensionPath, ".venv", "bin", "python")
+    );
+  }
+  for (const c of candidates) {
+    if (c && existsFile(c)) {
+      return c;
+    }
+  }
+  return host === "windows" ? "python" : "python3";
+}
+
 export function getConfig() {
   const cfg = vscode.workspace.getConfiguration("mpftp");
   return {
@@ -209,5 +243,11 @@ export function getConfig() {
     autoConnectDevice: cfg.get<string>("autoConnectDevice") || "",
     verifyTransfers: cfg.get<boolean>("verifyTransfers") !== false,
     autoReconnectAfterReset: cfg.get<boolean>("autoReconnectAfterReset") !== false,
+    openEditorOnConnect: cfg.get<boolean>("openEditorOnConnect") !== false,
+    micropythonPath: cfg.get<string>("micropythonPath") || "",
+    idfPath: cfg.get<string>("idfPath") || "",
+    emsdkPath: cfg.get<string>("emsdkPath") || "",
+    buildPythonPath: cfg.get<string>("buildPythonPath") || "",
+    esptoolCommand: cfg.get<string>("esptoolCommand") || "",
   };
 }

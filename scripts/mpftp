@@ -3,7 +3,16 @@
 # Uses Linux python3 for TCP RPC to the extension (stdlib only).
 # Falls back to Windows python.exe + mpremote when spawning a private sidecar.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Resolve symlinks (e.g. ~/bin/mpftp → scripts/mpftp) so ROOT is the repo, not ~/bin/..
+SCRIPT="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT" ]]; do
+  target="$(readlink "$SCRIPT")"
+  if [[ "$target" != /* ]]; then
+    target="$(cd "$(dirname "$SCRIPT")" && pwd)/$target"
+  fi
+  SCRIPT="$target"
+done
+ROOT="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
 CLI="$ROOT/python/mpftp_cli.py"
 
 if [[ -n "${MPFTP_PYTHON:-}" ]]; then

@@ -87,6 +87,41 @@ Raw RPC:
 
 Standalone (no extension): pass `-d/--device` after the subcommand.
 
+## Firmware builder (host-side build & flash)
+
+Builds MicroPython from a local checkout (no `build_mp.sh`). User C modules
+(`micropython.cmake` / `*/micropython.mk`) and a frozen `manifest.py` are
+auto-discovered from the checkout's **parent** workspace. Runs as its own
+process (native Linux python on WSL for `make`), so it never blocks the serial
+session. All MP ports build; flash is supported for `esp32`, `rp2`, `samd`.
+
+```bash
+./scripts/mpftp firmware discover                 # resolved MP / IDF / emsdk paths
+./scripts/mpftp firmware list                     # ports -> boards -> variants tree
+./scripts/mpftp firmware cmods                    # discovered user C modules
+./scripts/mpftp firmware build --port esp32 --board ESP32_GENERIC   # streams log
+./scripts/mpftp firmware build --port unix --variant standard --clean
+./scripts/mpftp firmware artifact --port esp32 --board ESP32_GENERIC # Ready?/path
+./scripts/mpftp firmware flash --port esp32 --board ESP32_GENERIC -d COM4
+./scripts/mpftp firmware flash -d COM5            # same artifact, next board (no rebuild)
+./scripts/mpftp firmware partitions get --board ESP32_GENERIC
+./scripts/mpftp firmware partitions set --board ESP32_GENERIC --rows '[{...}]'
+./scripts/mpftp firmware partitions reset --board ESP32_GENERIC
+```
+
+- `--mp` is auto-discovered (setting `mpftp.micropythonPath` → `MP_DIR` →
+  common layouts). Pass `--mp PATH` to override.
+- esp32 needs ESP-IDF (`mpftp.idfPath` / `IDF_PATH`); flashing on WSL uses the
+  Windows python esptool so it can see `COMx`.
+- rp2/samd flash copies the `.uf2` to the bootloader drive (rp2 falls back to
+  `picotool`); put the board in BOOTSEL/bootloader mode first.
+- ESP32 partition edits save to `<workspace>/mpftp-partitions/esp32/<board>.csv`
+  (workspace override — the MicroPython clone is never modified) and are injected
+  at build time.
+- UI: **Firmware** button in the Board Files toolbar, or `mpftp: Build & Flash
+  Firmware`. Same operations over Agent RPC as `firmware_*` methods
+  (`firmware_list`, `firmware_build`, `firmware_flash`, `firmware_partitions`, …).
+
 ## Rules
 
 - Prefer the TCP RPC session over spawning a second sidecar while the UI is connected.

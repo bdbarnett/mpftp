@@ -5,6 +5,7 @@ import { SidecarBridge, PortInfo } from "./bridge/SidecarBridge";
 import { openBoardFileInEditor, registerEditSaveHook } from "./editRemote";
 import { openRepl } from "./terminal/ReplTerminal";
 import { FtpViewProvider } from "./webview/FtpViewProvider";
+import { FirmwarePanel } from "./firmware/FirmwarePanel";
 import { detectHost, getConfig, resolvePython } from "./platform";
 
 let bridge: SidecarBridge;
@@ -12,13 +13,14 @@ let log: vscode.OutputChannel;
 let activity: ActivityLog;
 let agentRpc: AgentRpcServer;
 let ftpProvider: FtpViewProvider;
+let firmwarePanel: FirmwarePanel;
 let statusBar: vscode.StatusBarItem;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   log = vscode.window.createOutputChannel("mpftp");
   activity = new ActivityLog();
   bridge = new SidecarBridge(context.extensionPath, log, activity);
-  agentRpc = new AgentRpcServer(bridge, activity);
+  agentRpc = new AgentRpcServer(bridge, activity, context.extensionPath);
   agentRpc.start();
 
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
@@ -42,6 +44,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           { label: "Disconnect", id: "disconnect" },
           { label: "Open REPL", id: "repl" },
           { label: "Open file browser", id: "ftp" },
+          { label: "Open file browser in editor", id: "ftpEditor" },
         ],
         { title: `Connected to ${bridge.connectedDevice}` }
       );
@@ -52,6 +55,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         openRepl(bridge, activity);
       } else if (choice?.id === "ftp") {
         await ftpProvider.reveal();
+      } else if (choice?.id === "ftpEditor") {
+        ftpProvider.openInEditor();
       }
       return;
     }
@@ -92,7 +97,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await bridge.connect(device);
       updateStatus();
       void vscode.window.showInformationMessage(`mpftp connected: ${device}`);
-      await ftpProvider.reveal();
     } catch (e: any) {
       void vscode.window.showErrorMessage(`mpftp connect failed: ${e.message || e}`);
       log.appendLine(String(e));
@@ -116,6 +120,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   );
 
+  firmwarePanel = new FirmwarePanel(context.extensionUri, context.extensionPath, bridge, activity);
+
   registerEditSaveHook(bridge, context, log);
 
   context.subscriptions.push(
@@ -134,13 +140,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await bridge.resume();
         updateStatus();
         void vscode.window.showInformationMessage(`mpftp resumed: ${bridge.connectedDevice}`);
-        await ftpProvider.reveal();
       } catch (e: any) {
         void vscode.window.showErrorMessage(`mpftp resume failed: ${e.message || e}`);
       }
     }),
     vscode.commands.registerCommand("mpftp.openFtp", () => ftpProvider.reveal()),
     vscode.commands.registerCommand("mpftp.openFtpEditor", () => ftpProvider.openInEditor()),
+    vscode.commands.registerCommand("mpftp.openFirmware", () => firmwarePanel.reveal()),
     vscode.commands.registerCommand("mpftp.openRepl", async () => {
       if (!(await ensureConnected())) {
         return;
@@ -213,7 +219,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             updateStatus();
             if (ok) {
               void vscode.window.showInformationMessage(`mpftp reconnected: ${device}`);
-              await ftpProvider.reveal();
             } else {
               void vscode.window.showWarningMessage(
                 "Hard reset sent — board did not come back; use Resume or Connect"
@@ -383,7 +388,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
 
-  bridge.on("connected", updateStatus);
+  bridge.on("connected", () => {
+    updateStatus();
+    if (getConfig().openEditorOnConnect) {
+      ftpProvider.openInEditor();
+    }
+  });
   bridge.on("disconnected", updateStatus);
 
   const host = detectHost();

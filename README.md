@@ -17,6 +17,7 @@ Works on:
 - Hard-reset auto-reconnect; **Resume** reconnects the last device
 - mpremote-backed ops: eval/exec/run, soft/hard reset, bootloader, RTC, host-side **mip**, df, mount/umount, romfs, recursive `cp`, hash
 - Agent CLI + TCP RPC (`127.0.0.1:7429`) sharing the UI serial session
+- **Firmware builder**: guided build/flash UI (build MicroPython once, flash one or many boards), auto-discovered user C modules / frozen manifest, esp32/rp2/samd flashing, and an ESP32 partition editor with workspace overrides
 
 ## Requirements
 
@@ -79,6 +80,42 @@ Useful commands:
 - `mpftp.autoConnectDevice` — e.g. `COM4` to skip the picker
 - `mpftp.verifyTransfers` — SHA-256 check after each file transfer (default `true`)
 - `mpftp.autoReconnectAfterReset` — reconnect after hard reset (default `true`)
+- `mpftp.micropythonPath` — MicroPython checkout used by the Firmware builder (auto-discovered if empty)
+- `mpftp.idfPath` / `mpftp.emsdkPath` — ESP-IDF / emsdk locations (auto-discovered if empty)
+- `mpftp.buildPythonPath` — native (Linux on WSL) python3 to run the build engine + `make`
+- `mpftp.esptoolCommand` — override esptool for flashing (e.g. a Windows `python.exe` on WSL so it sees COM ports)
+
+## Firmware builder
+
+Open **Firmware** from the Board Files toolbar (or `mpftp: Build & Flash Firmware`).
+It reimplements the useful parts of a cmods-style build without shelling out to
+`build_mp.sh`:
+
+1. **Target** — pick a port → board → variant from the tree (all MP ports are
+   listed; flashing is enabled for `esp32`, `rp2`, and `samd`).
+2. **Modules** — user C modules (`micropython.cmake` / `*/micropython.mk`) and a
+   frozen `manifest.py` are auto-discovered from the checkout's parent workspace
+   and shown before you build.
+3. **Build** — incremental `make submodules` + `make all` (with a separate
+   **Clean**), streaming log, and a **Ready** state with the artifact path/size.
+4. **Flash** — build once, then flash many: swap boards and click **Flash**
+   again with no rebuild. esp32 uses `esptool` (Windows python on WSL for COM
+   ports); rp2/samd copy the `.uf2` to the bootloader drive (rp2 falls back to
+   `picotool`).
+
+For esp32 the **Partitions…** editor loads the board's stock CSV, lets you edit
+it (with presets, a flash-usage bar, and overlap/alignment validation), and
+saves a **workspace override** at `<workspace>/mpftp-partitions/esp32/<board>.csv`
+— the MicroPython clone is never modified. Builds inject the override
+automatically.
+
+```bash
+./scripts/mpftp firmware list
+./scripts/mpftp firmware build --port esp32 --board ESP32_GENERIC
+./scripts/mpftp firmware flash --port esp32 --board ESP32_GENERIC -d COM4
+./scripts/mpftp firmware flash -d COM5          # same artifact, next board
+./scripts/mpftp firmware partitions get --board ESP32_GENERIC
+```
 
 ## Agents / CLI
 
@@ -120,7 +157,14 @@ Extension (TypeScript)
   ├─ AgentRpcServer ──TCP :7429──►  scripts/mpftp / agents
   ├─ ActivityLog     ~/.mpftp/activity.log + repl.log
   ├─ Pseudoterminal REPL (ANSI passthrough)
-  └─ Webview FTP UI (media/ftp.*)
+  ├─ Webview FTP UI (media/ftp.*)
+  └─ Firmware builder (src/firmware/*, media/firmware.*, media/partitions.*)
+       └─ python/firmware_engine.py  ──make / esptool / uf2──►  build & flash
 ```
+
+The firmware engine runs as its own extension-host child process (native Linux
+python on WSL for `make`), so builds never block the serial REPL/filesystem
+session. It is also driven by `mpftp firmware …` (CLI) and `firmware_*` Agent
+RPC methods.
 
 On WSL the sidecar is intentionally a **Windows** Python process so it opens `COMx` the same way `mpremote.exe` does.
