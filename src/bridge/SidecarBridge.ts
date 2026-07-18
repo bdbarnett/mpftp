@@ -73,6 +73,13 @@ export class SidecarBridge extends EventEmitter {
   }
 
   private async start(): Promise<void> {
+    // Drop any prior child handle before spawn. The new sidecar.py claims
+    // ~/.mpftp/sidecar.pid and force-kills orphans that still hold COM ports.
+    if (this.proc && !this.proc.killed) {
+      await this.killSidecarProcess(this.proc.pid);
+      this.proc = undefined;
+    }
+
     const cfg = getConfig();
     const python = resolvePython(this.extensionPath, cfg.pythonPath);
     const scriptLinux = path.join(this.extensionPath, "python", "sidecar.py");
@@ -299,14 +306,40 @@ export class SidecarBridge extends EventEmitter {
     }
   }
 
+  /** Force-kill sidecar (and Windows process tree) so COM ports are released. */
+  private async killSidecarProcess(pid: number | undefined): Promise<void> {
+    if (!pid) {
+      return;
+    }
+    const { execFile } = await import("child_process");
+    const { promisify } = await import("util");
+    const execFileAsync = promisify(execFile);
+    try {
+      // WSL Node → Windows python.exe: SIGTERM often leaves orphans holding COM.
+      await execFileAsync("taskkill.exe", ["/F", "/T", "/PID", String(pid)], {
+        timeout: 5000,
+        windowsHide: true,
+      });
+    } catch {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
   dispose(): void {
+    const pid = this.proc?.pid;
     try {
       this.proc?.stdin.write(JSON.stringify({ id: 0, method: "disconnect", params: {} }) + "\n");
     } catch {
       /* ignore */
     }
+    void this.killSidecarProcess(pid);
     this.proc?.kill();
     this.proc = undefined;
+    this._connectedDevice = undefined;
     this.removeAllListeners();
   }
 }

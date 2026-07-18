@@ -400,7 +400,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push({
     dispose: () => {
+      // Must dispose the bridge here too — Cursor/WSL reloads sometimes skip
+      // deactivate(), which previously left python.exe sidecars holding COM ports.
       agentRpc.dispose();
+      bridge.dispose();
       activity.event("deactivate", { message: "extension deactivated" });
     },
   });

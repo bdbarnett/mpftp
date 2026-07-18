@@ -59,6 +59,150 @@ def _error(req_id: Any, message: str, data: Any = None) -> None:
     _emit(err)
 
 
+def _mpftp_dir() -> Path:
+    d = Path.home() / ".mpftp"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _sidecar_pid_path() -> Path:
+    return _mpftp_dir() / "sidecar.pid"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _force_kill_pid(pid: int) -> None:
+    if pid <= 0 or pid == os.getpid():
+        return
+    if sys.platform == "win32":
+        import subprocess
+
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            check=False,
+            capture_output=True,
+        )
+        return
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+
+
+def _iter_sidecar_pids_win() -> list[int]:
+    """Find other Windows python processes running this sidecar script."""
+    import subprocess
+
+    script_marker = "sidecar.py"
+    my_pid = os.getpid()
+    try:
+        out = subprocess.check_output(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.CommandLine -like '*sidecar.py*' "
+                "-and $_.CommandLine -like '*mpftp*' } | "
+                "Select-Object -ExpandProperty ProcessId",
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+        ).decode("utf-8", "replace")
+    except Exception:
+        return []
+    pids: list[int] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.isdigit():
+            continue
+        pid = int(line)
+        if pid != my_pid:
+            pids.append(pid)
+    # Prefer marker match even if mpftp not in command line (WSL path forms).
+    if not pids:
+        try:
+            out = subprocess.check_output(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-Command",
+                    f"Get-CimInstance Win32_Process | "
+                    f"Where-Object {{ $_.CommandLine -like '*{script_marker}*' "
+                    f"-and $_.Name -match 'python' }} | "
+                    f"Select-Object -ExpandProperty ProcessId",
+                ],
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+            ).decode("utf-8", "replace")
+            for line in out.splitlines():
+                line = line.strip()
+                if line.isdigit() and int(line) != my_pid:
+                    pids.append(int(line))
+        except Exception:
+            pass
+    return pids
+
+
+def cleanup_stale_sidecars() -> list[int]:
+    """Kill orphaned sidecar processes that would keep COM ports locked."""
+    killed: list[int] = []
+    pid_path = _sidecar_pid_path()
+    try:
+        prev = int(pid_path.read_text(encoding="utf-8").strip())
+    except Exception:
+        prev = 0
+    if prev and prev != os.getpid() and _pid_alive(prev):
+        _force_kill_pid(prev)
+        killed.append(prev)
+    if sys.platform == "win32":
+        for pid in _iter_sidecar_pids_win():
+            if pid not in killed:
+                _force_kill_pid(pid)
+                killed.append(pid)
+    try:
+        if pid_path.exists():
+            pid_path.unlink()
+    except OSError:
+        pass
+    return killed
+
+
+def claim_sidecar_pid() -> None:
+    _sidecar_pid_path().write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+
+def release_sidecar_pid() -> None:
+    path = _sidecar_pid_path()
+    try:
+        cur = int(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return
+    if cur == os.getpid():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 class Session:
     def __init__(self) -> None:
         self.transport = None
@@ -1005,7 +1149,15 @@ METHODS = {
 
 
 def main() -> None:
-    _notify("ready", {"version": 1})
+    import atexit
+
+    killed = cleanup_stale_sidecars()
+    claim_sidecar_pid()
+    atexit.register(release_sidecar_pid)
+    ready: dict[str, Any] = {"version": 1, "pid": os.getpid()}
+    if killed:
+        ready["killed_stale"] = killed
+    _notify("ready", ready)
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1027,6 +1179,7 @@ def main() -> None:
         SESSION.disconnect()
     except Exception:
         pass
+    release_sidecar_pid()
 
 
 if __name__ == "__main__":
