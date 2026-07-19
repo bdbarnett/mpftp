@@ -217,6 +217,14 @@
           "default": "",
           "description": "Path to emsdk (folder containing emsdk_env.sh) for webassembly builds. Leave empty to auto-discover."
         },
+        "mpftp.toolchainBins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra cross-toolchain bin/ folders prepended to the build PATH (e.g. arm-none-eabi, xtensa, riscv, xc16, mingw-w64). Populated when you locate a missing toolchain from the build prompt; edit here to add more."
+        },
         "mpftp.buildPythonPath": {
           "type": "string",
           "default": "",

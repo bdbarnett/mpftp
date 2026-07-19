@@ -388,9 +388,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
 
-  bridge.on("connected", () => {
+  bridge.on("connected", (_device?: string, meta?: { silent?: boolean }) => {
     updateStatus();
-    if (getConfig().openEditorOnConnect) {
+    if (getConfig().openEditorOnConnect && !meta?.silent) {
       ftpProvider.openInEditor();
     }
   });

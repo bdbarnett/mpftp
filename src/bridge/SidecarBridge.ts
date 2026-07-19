@@ -224,14 +224,20 @@ export class SidecarBridge extends EventEmitter {
     return this.request<PortInfo[]>("list_ports");
   }
 
-  async connect(device: string, baud?: number): Promise<void> {
+  async connect(
+    device: string,
+    baud?: number,
+    opts?: { silent?: boolean }
+  ): Promise<void> {
     const cfg = getConfig();
     await this.request("connect", { device, baud: baud ?? cfg.defaultBaud });
     this._connectedDevice = device;
     this._lastDevice = device;
     await vscode.commands.executeCommand("setContext", "mpftp.connected", true);
     this.activity?.event("connected", { message: device, data: { device } });
-    this.emit("connected", device);
+    // `silent` reconnects (e.g. after detect/flash) restore the link without
+    // firing user-facing side effects such as auto-opening the file browser.
+    this.emit("connected", device, { silent: !!opts?.silent });
   }
 
   /** Reconnect to the last device (after hard-reset / port flicker). */

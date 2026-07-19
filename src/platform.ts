@@ -247,6 +247,7 @@ export function getConfig() {
     micropythonPath: cfg.get<string>("micropythonPath") || "",
     idfPath: cfg.get<string>("idfPath") || "",
     emsdkPath: cfg.get<string>("emsdkPath") || "",
+    toolchainBins: cfg.get<string[]>("toolchainBins") || [],
     buildPythonPath: cfg.get<string>("buildPythonPath") || "",
     esptoolCommand: cfg.get<string>("esptoolCommand") || "",
   };

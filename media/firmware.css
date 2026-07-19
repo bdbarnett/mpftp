@@ -118,7 +118,18 @@ body {
 
 .meta-row {
   display: flex;
+  align-items: center;
   gap: 6px;
+}
+
+.hdr-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+  color: var(--muted);
+  flex: none;
+  margin-right: 2px;
 }
 
 /* Grid of steps */
@@ -139,6 +150,10 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 16px;
+  /* Allow grid cells to shrink below their content's min-content width so a
+     wide inner layout (e.g. the two-column flash options) can't push the page
+     wider than the viewport and force a horizontal scrollbar. */
+  min-width: 0;
 }
 
 .card.empty {
@@ -382,6 +397,27 @@ body {
 }
 
 /* Modules */
+.discovered-from {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 12px;
+  font-size: 12px;
+}
+
+.discovered-label {
+  color: var(--muted);
+  flex: none;
+}
+
+.discovered-path {
+  font-family: var(--mono);
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .chips {
   display: flex;
   flex-wrap: wrap;
@@ -467,9 +503,18 @@ body {
   color: var(--ok);
 }
 
+.artifact-details {
+  min-width: 0;
+}
+
 .artifact-name {
   font-family: var(--mono);
   font-size: 12.5px;
+}
+
+.artifact-dir {
+  font-family: var(--mono);
+  word-break: break-all;
 }
 
 /* Flash */
@@ -489,6 +534,68 @@ body {
   gap: 8px;
   flex: 1;
   min-width: 0;
+}
+
+.flash-opts {
+  display: grid;
+  /* minmax(0, …) lets the columns (and their selects/inputs) shrink instead of
+     holding the card open at their content width. */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 16px;
+  margin-top: 8px;
+}
+
+/* Collapse to a single column when the card gets narrow so labels + controls
+   stay readable instead of squeezing. */
+@media (max-width: 460px) {
+  .flash-opts {
+    grid-template-columns: 1fr;
+  }
+}
+
+.flash-opts .offset-row {
+  margin-top: 0;
+}
+
+.flash-opts .offset-input,
+.flash-opts .offset-select {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+}
+
+.offset-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.offset-label {
+  font-size: 12.5px;
+  color: var(--muted);
+  min-width: 92px;
+}
+
+.offset-input {
+  width: 96px;
+  background: var(--input-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.offset-select {
+  background: var(--input-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
 }
 
 .device-info .codicon {
@@ -523,6 +630,15 @@ body {
   accent-color: var(--accent);
 }
 
+.check.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.check.disabled input {
+  cursor: not-allowed;
+}
+
 .hint {
   color: var(--muted);
   margin: 10px 0 0;
@@ -537,7 +653,7 @@ body {
 }
 
 /* Device Info */
-.device-info {
+.device-card {
   margin-bottom: 16px;
 }
 
@@ -602,67 +718,8 @@ body {
   color: var(--fg);
 }
 
-/* Firmware / storage split */
-.split {
-  margin-top: 14px;
-  padding-top: 14px;
-  border-top: 1px solid var(--border);
-}
-
-.split-title {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-weight: 600;
-  font-size: 13px;
-  margin-bottom: 10px;
-}
-
-.split-readout {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin-bottom: 8px;
-}
-
-.split-value {
-  font-family: var(--mono);
-  font-weight: 600;
-  color: var(--fg);
-}
-
-.split-fw {
-  font-size: 11.5px;
-  color: var(--muted);
-}
-
-.split-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 10px;
-}
-
-.split-slider {
-  flex: 1;
-  accent-color: var(--accent);
-}
-
-.split-num-wrap {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.split-num {
-  width: 72px;
-  background: var(--input-bg);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 5px 8px;
-  font-family: var(--mono);
-  font-size: 12px;
+.info-status.err {
+  color: var(--err);
 }
 
 /* Log */

@@ -6,7 +6,6 @@ import { ActivityLog } from "../activityLog";
 import { SidecarBridge } from "../bridge/SidecarBridge";
 import { detectHost, getConfig } from "../platform";
 import { FirmwareEngine, StreamHandle } from "./engine";
-import { PartitionsPanel } from "./PartitionsPanel";
 
 interface Selection {
   port: string;
@@ -18,6 +17,17 @@ interface Prefs {
   reconnectAfterFlash: boolean;
   alsoFlashAfterBuild: boolean;
   device: string;
+}
+
+/** Structured "toolchain missing" payload emitted by the build engine. */
+interface NeedToolchain {
+  id: string;
+  label: string;
+  kind: "dir" | "command";
+  configKey?: string | null;
+  bin?: string | null;
+  hint?: string;
+  url?: string;
 }
 
 const STATE_FILE = path.join(os.homedir(), ".mpftp", "firmware.json");
@@ -37,7 +47,6 @@ export class FirmwarePanel {
   private prefs: Prefs = { reconnectAfterFlash: false, alsoFlashAfterBuild: false, device: "" };
   private activeStream: StreamHandle | undefined;
   private busy = false;
-  private partitions: PartitionsPanel | undefined;
   private lastDetect: Record<string, unknown> | undefined;
 
   constructor(
@@ -145,6 +154,9 @@ export class FirmwarePanel {
     if (cfg.emsdkPath) {
       args.emsdk = cfg.emsdkPath;
     }
+    if (cfg.toolchainBins.length) {
+      args.toolchainBins = cfg.toolchainBins.join(path.delimiter);
+    }
     return args;
   }
 
@@ -162,6 +174,17 @@ export class FirmwarePanel {
 
   private phase(phase: string, text = ""): void {
     this.post({ type: "phase", phase, text });
+  }
+
+  /** Detect's own status channel — kept separate from the build/flash phase so
+   *  its result renders with Device Info, not in the Build step. */
+  private detectStatus(state: string, text = ""): void {
+    this.post({ type: "detectStatus", state, text });
+  }
+
+  /** Flash's own status channel — renders under the Flash step, not Build. */
+  private flashStatus(state: string, text = ""): void {
+    this.post({ type: "flashStatus", state, text });
   }
 
   private async onMessage(msg: any): Promise<void> {
@@ -191,7 +214,13 @@ export class FirmwarePanel {
         await this.doClean();
         break;
       case "flash":
-        await this.doFlash();
+        await this.doFlash(
+          typeof msg.offset === "string" ? msg.offset : "",
+          typeof msg.baud === "string" ? msg.baud : "",
+          typeof msg.before === "string" ? msg.before : "",
+          typeof msg.after === "string" ? msg.after : "",
+          msg.erase === true
+        );
         break;
       case "detect":
         await this.detectDevice();
@@ -213,15 +242,6 @@ export class FirmwarePanel {
           this.prefs.alsoFlashAfterBuild = !!msg.value;
         }
         this.savePrefs();
-        break;
-      case "openPartitions":
-        this.openPartitions();
-        break;
-      case "loadPartitions":
-        await this.loadPartitions();
-        break;
-      case "applySplit":
-        await this.applySplit(Number(msg.storageMb) || 0);
         break;
       default:
         break;
@@ -294,7 +314,7 @@ export class FirmwarePanel {
     }
 
     this.busy = true;
-    this.phase("detecting", "Detecting…");
+    this.detectStatus("detecting", "Detecting…");
     this.post({ type: "clearLog" });
     this.log(`[mpftp] detecting ${device}…`);
 
@@ -333,8 +353,8 @@ export class FirmwarePanel {
       this.applyDetect(res);
       const chip = String((res as any).chip || "");
       const board = String(((res as any).match || {}).board || "");
-      this.phase(
-        "ready",
+      this.detectStatus(
+        "ok",
         res.espressif === false
           ? "Detected — not an Espressif chip"
           : `Detected ${chip}${board ? " · " + board : ""}`
@@ -344,12 +364,12 @@ export class FirmwarePanel {
         data: { device, board },
       });
     } else {
-      this.phase("failed", "Detect failed");
+      this.detectStatus("failed", "Detect failed");
     }
 
     if (wasConnected) {
       try {
-        await this.bridge.connect(device);
+        await this.bridge.connect(device, undefined, { silent: true });
         this.log(`[mpftp] reconnected ${device}`);
         if (res && res.ok !== false && !Object.keys(mpHints).length) {
           const fresh = await this.gatherMpHints();
@@ -368,16 +388,89 @@ export class FirmwarePanel {
     await this.pushDevices();
   }
 
+  /**
+   * Choose the port esptool should flash and put the board where it can talk.
+   *
+   * Native-USB ESP32 parts (S2/S3/C3/C6/H2/P4) running MicroPython expose the
+   * firmware's *own* USB CDC (Espressif VID 0x303A, app PID e.g. 0x4001).
+   * esptool cannot reset that CDC into the ROM loader — toggling reset just
+   * keeps the app running, yielding "Invalid head of packet". We reset into the
+   * ROM USB-Serial/JTAG downloader (PID 0x1001), which enumerates as a *new*
+   * port, and flash that instead. Boards on a UART bridge (CP210x/CH340/FTDI)
+   * keep the same port; esptool's DTR/RTS auto-reset works there.
+   */
+  private async prepareEspFlashPort(device: string): Promise<string | undefined> {
+    const ESP_VID = 0x303a;
+    const ports = await this.bridge.listPorts().catch(() => []);
+    const cur = ports.find((p) => p.device === device);
+    const nativeUsb = !!cur && cur.vid === ESP_VID;
+    if (!nativeUsb) {
+      await this.bridge.disconnect().catch(() => undefined);
+      this.log(`[mpftp] disconnected ${device} for flashing`);
+      return device;
+    }
+
+    this.log("[mpftp] native-USB board — entering ROM download mode…");
+    const before = new Set(ports.map((p) => p.device));
+    try {
+      await this.bridge.request("bootloader", {});
+    } catch {
+      /* expected: the app CDC drops as the chip resets */
+    }
+    await this.bridge.disconnect().catch(() => undefined);
+
+    const rom = await this.waitForEspDownloadPort(before, device);
+    if (rom) {
+      this.log(`[mpftp] ROM download port: ${rom}`);
+      return rom;
+    }
+    // Software reset alone did not surface a usable download port (common on
+    // boards whose ROM USB-Serial/JTAG is a separate peripheral/connector).
+    // Abort rather than flashing the now-vanished app-CDC port.
+    return undefined;
+  }
+
+  /** Poll for the ESP32 ROM USB-Serial/JTAG port after a reset to bootloader. */
+  private async waitForEspDownloadPort(
+    before: Set<string>,
+    original: string,
+    timeoutMs = 15000
+  ): Promise<string | undefined> {
+    const ESP_VID = 0x303a;
+    const ROM_PID = 0x1001; // USB-Serial/JTAG (ROM download)
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 700));
+      const ports = await this.bridge.listPorts().catch(() => []);
+      const rom = ports.find((p) => p.vid === ESP_VID && p.pid === ROM_PID);
+      if (rom) {
+        return rom.device;
+      }
+      const fresh = ports.find(
+        (p) => p.vid === ESP_VID && p.device !== original && !before.has(p.device)
+      );
+      if (fresh) {
+        return fresh.device;
+      }
+    }
+    return undefined;
+  }
+
   /** Best-effort MicroPython/CircuitPython runtime hints (enrichment only). */
   private async gatherMpHints(): Promise<Record<string, unknown>> {
     const code = [
       "import json as _j",
       "_d = {}",
       "try:\n import sys\n _d['platform']=sys.platform\n _d['impl']=sys.implementation.name\n _d['build']=getattr(sys.implementation,'_build','')\nexcept Exception: pass",
-      "try:\n import os as _os\n _d['machine']=_os.uname().machine\nexcept Exception: pass",
+      // Rebuild the boot banner exactly: uname.version is "<git-tag> on <date>"
+      // and uname.machine is the "<board> with <mcu>" (or unix) suffix.
+      "try:\n import os as _os\n _u=_os.uname()\n _d['machine']=_u.machine\n _d['version']='MicroPython '+_u.version+'; '+_u.machine\nexcept Exception: pass",
       "try:\n import machine as _m\n _d['freq']=_m.freq()\nexcept Exception: pass",
       "try:\n import gc as _g\n _d['memfree']=_g.mem_free()\nexcept Exception: pass",
       "try:\n import esp as _e\n _d['flash']=_e.flash_size()\nexcept Exception: pass",
+      // Largest HEAP_DATA region on a PSRAM board is the PSRAM bank (MBs), far
+      // larger than internal DRAM regions (<~1MB); use it as the PSRAM size.
+      "try:\n import esp32 as _e2\n _mx=0\n for _r in _e2.idf_heap_info(_e2.HEAP_DATA):\n  _mx=max(_mx,_r[0])\n if _mx>1048576: _d['psramBytes']=_mx\nexcept Exception: pass",
       "print('MPHINTS:'+_j.dumps(_d))",
     ].join("\n");
     try {
@@ -514,14 +607,11 @@ export class FirmwarePanel {
   }
 
   private pushState(): void {
-    const cfg = getConfig();
     this.post({
       type: "state",
       host: detectHost(),
       micropython: this.mpDir(),
       workspace: this.discovery.workspace || null,
-      idf: cfg.idfPath || this.discovery.idf || null,
-      emsdk: cfg.emsdkPath || this.discovery.emsdk || null,
       tree: this.tree,
       cmods: this.cmods,
       flashers: this.flashers,
@@ -598,18 +688,30 @@ export class FirmwarePanel {
         variant: this.selection.variant,
         clean,
       },
-      (line) => this.log(line)
+      (line) => this.log(line),
+      (state, text) => this.phase(state, text)
     );
     this.activeStream = handle;
     const result = await handle.done;
     this.activeStream = undefined;
     this.busy = false;
     if (result.ok) {
-      this.phase("ready", "Build ready");
+      this.phase("ready", "Firmware ready");
       this.post({ type: "artifact", artifact: result });
       this.activity.event("firmware_build_ok", { data: { ...this.selection } });
       if (this.prefs.alsoFlashAfterBuild) {
         await this.doFlash();
+      }
+    } else if (result.needToolchain) {
+      this.phase("failed", String(result.error || "Toolchain not found"));
+      this.activity.event("firmware_build_need_toolchain", {
+        data: { ...this.selection, toolchain: result.needToolchain },
+      });
+      const located = await this.promptToolchain(
+        result.needToolchain as NeedToolchain
+      );
+      if (located) {
+        await this.doBuild(clean);
       }
     } else {
       this.phase("failed", String(result.error || "Build failed"));
@@ -617,6 +719,72 @@ export class FirmwarePanel {
         data: { ...this.selection, error: result.error },
       });
     }
+  }
+
+  /**
+   * Prompt the user to resolve a missing build toolchain. Returns true if the
+   * user located it (config was updated) so the caller can retry the build.
+   */
+  private async promptToolchain(need: NeedToolchain): Promise<boolean> {
+    const detail = need.hint ? `\n${need.hint}` : "";
+    const choice = await vscode.window.showWarningMessage(
+      `${need.label} not found for the ${this.selection.port} build.${detail}`,
+      "Locate…",
+      "Install instructions",
+      "Cancel"
+    );
+    if (choice === "Install instructions") {
+      if (need.url) {
+        void vscode.env.openExternal(vscode.Uri.parse(need.url));
+      }
+      return false;
+    }
+    if (choice !== "Locate…") {
+      return false;
+    }
+    const conf = vscode.workspace.getConfiguration("mpftp");
+    if (need.kind === "dir") {
+      if (!need.configKey) {
+        return false;
+      }
+      const uris = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        openLabel: `Select ${need.label} folder`,
+        title: `Locate ${need.label}`,
+      });
+      if (!uris?.[0]) {
+        return false;
+      }
+      await conf.update(
+        need.configKey,
+        uris[0].fsPath,
+        vscode.ConfigurationTarget.Global
+      );
+      return true;
+    }
+    // command kind: pick the executable, persist its bin/ dir to toolchainBins.
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: false,
+      openLabel: `Select ${need.bin || need.label}`,
+      title: `Locate ${need.bin || need.label}`,
+    });
+    if (!uris?.[0]) {
+      return false;
+    }
+    const binDir = path.dirname(uris[0].fsPath);
+    const cur = conf.get<string[]>("toolchainBins") || [];
+    if (!cur.includes(binDir)) {
+      await conf.update(
+        "toolchainBins",
+        [...cur, binDir],
+        vscode.ConfigurationTarget.Global
+      );
+    }
+    return true;
   }
 
   private async doClean(): Promise<void> {
@@ -648,7 +816,13 @@ export class FirmwarePanel {
   // Flash
   // ---------------------------------------------------------------------- //
 
-  private async doFlash(): Promise<void> {
+  private async doFlash(
+    offset = "",
+    baud = "",
+    before = "",
+    after = "",
+    erase = false
+  ): Promise<void> {
     if (this.busy || !this.guardMp()) {
       return;
     }
@@ -669,10 +843,13 @@ export class FirmwarePanel {
     }
 
     this.busy = true;
-    this.phase("flashing", "Flashing…");
+    this.flashStatus("flashing", "Flashing…");
     this.post({ type: "clearLog" });
 
-    // Release the port if we are connected to the flash target.
+    // Release the port if we are connected to the flash target. For native-USB
+    // ESP32 parts running MicroPython, esptool must talk to the ROM
+    // USB-Serial/JTAG port, which differs from the app CDC we are attached to.
+    let flashDevice = device;
     let wasConnected = false;
     const connected = this.bridge.connectedDevice;
     if (connected && (connected === device || !isSerial)) {
@@ -685,9 +862,28 @@ export class FirmwarePanel {
           } catch {
             /* board may already be in bootloader */
           }
+          await this.bridge.disconnect();
+          this.log(`[mpftp] disconnected ${connected} for flashing`);
+        } else if (isSerial) {
+          const rom = await this.prepareEspFlashPort(device);
+          if (!rom) {
+            this.busy = false;
+            this.flashStatus(
+              "failed",
+              "No download port — hold BOOT + tap RESET, then retry"
+            );
+            this.log(
+              "[mpftp] no ROM download port appeared. Put the board in download mode " +
+                "(hold BOOT, tap RESET) or use its USB-Serial/JTAG connector, then flash again."
+            );
+            await this.pushDevices();
+            return;
+          }
+          flashDevice = rom;
+        } else {
+          await this.bridge.disconnect();
+          this.log(`[mpftp] disconnected ${connected} for flashing`);
         }
-        await this.bridge.disconnect();
-        this.log(`[mpftp] disconnected ${connected} for flashing`);
       } catch {
         /* ignore */
       }
@@ -701,8 +897,13 @@ export class FirmwarePanel {
         port,
         board: this.selection.board,
         variant: this.selection.variant,
-        device,
+        device: flashDevice,
         esptool: esptool || undefined,
+        offset: port === "esp32" ? offset || undefined : undefined,
+        baud: port === "esp32" ? baud || undefined : undefined,
+        before: port === "esp32" ? before || undefined : undefined,
+        after: port === "esp32" ? after || undefined : undefined,
+        erase: port === "esp32" && erase ? true : undefined,
       },
       (line) => this.log(line)
     );
@@ -712,13 +913,13 @@ export class FirmwarePanel {
     this.busy = false;
 
     if (result.ok) {
-      this.phase("ready", "Flashed — ready for the next board");
+      this.flashStatus("ok", "Flashed — ready for the next board");
       this.activity.event("firmware_flash_ok", {
         data: { ...this.selection, device },
       });
       this.post({ type: "flashed", device });
     } else {
-      this.phase("failed", String(result.error || "Flash failed"));
+      this.flashStatus("failed", String(result.error || "Flash failed"));
       this.activity.event("firmware_flash_fail", {
         data: { ...this.selection, device, error: result.error },
       });
@@ -726,7 +927,7 @@ export class FirmwarePanel {
 
     if (wasConnected && this.prefs.reconnectAfterFlash && device) {
       try {
-        await this.bridge.connect(device);
+        await this.bridge.connect(device, undefined, { silent: true });
         this.log(`[mpftp] reconnected ${device}`);
       } catch (e: any) {
         this.log(`[mpftp] reconnect failed: ${e?.message || e}`);
@@ -810,78 +1011,6 @@ export class FirmwarePanel {
     } catch (e: any) {
       void vscode.window.showErrorMessage(`Could not list ports: ${e?.message || e}`);
     }
-  }
-
-  // ---------------------------------------------------------------------- //
-  // Partitions
-  // ---------------------------------------------------------------------- //
-
-  private partArgs(): Record<string, string> {
-    return {
-      ...this.pathArgs(),
-      board: this.selection.board,
-      variant: this.selection.variant,
-    };
-  }
-
-  /** Enumerate stock/override partition tables for the firmware/storage split. */
-  private async loadPartitions(): Promise<void> {
-    if (this.selection.port !== "esp32") {
-      this.post({ type: "partitions", partitions: null, flashMb: 0 });
-      return;
-    }
-    try {
-      const res = await this.engine.run("partitions", this.partArgs(), ["candidates"]);
-      const flashMb = Number((this.lastDetect as any)?.flashMb || 0);
-      this.post({ type: "partitions", partitions: res, flashMb });
-    } catch (e: any) {
-      this.log(`[mpftp] partitions load failed: ${e?.message || e}`);
-      this.post({ type: "partitions", partitions: null, flashMb: 0 });
-    }
-  }
-
-  /** Save a firmware/storage split by resizing (or adding) the storage partition. */
-  private async applySplit(storageMb: number): Promise<void> {
-    if (this.selection.port !== "esp32") {
-      return;
-    }
-    const flashMb = Number((this.lastDetect as any)?.flashMb || 0);
-    const args: Record<string, string | number> = {
-      ...this.partArgs(),
-      storageBytes: Math.round(storageMb * 1024 * 1024),
-    };
-    if (flashMb) {
-      args.flashBytes = flashMb * 1024 * 1024;
-      args.flashMb = flashMb;
-    }
-    try {
-      const res = await this.engine.run("partitions", args, ["split"]);
-      this.activity.event("firmware_partitions_split", {
-        data: { ...this.selection, storageMb },
-      });
-      this.post({ type: "splitApplied", ...(res as Record<string, unknown>) });
-      await this.loadPartitions();
-      await this.refreshArtifact();
-    } catch (e: any) {
-      this.log(`[mpftp] split failed: ${e?.message || e}`);
-    }
-  }
-
-  private openPartitions(): void {
-    if (this.selection.port !== "esp32") {
-      void vscode.window.showInformationMessage(
-        "The partition editor is for esp32 boards."
-      );
-      return;
-    }
-    if (!this.partitions) {
-      this.partitions = new PartitionsPanel(
-        this.extensionUri,
-        this.extensionPath,
-        this.activity
-      );
-    }
-    this.partitions.reveal(this.mpDir(), this.selection.board, this.selection.variant);
   }
 
   // ---------------------------------------------------------------------- //

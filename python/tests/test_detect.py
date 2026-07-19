@@ -38,6 +38,34 @@ Detected flash size: 32MB
 Hard resetting via RTS pin...
 """
 
+# Fixture 1b — same ESP32-P4, captured verbatim from esptool v5.3.1 (COM4 CH343
+# bridge). v5 renamed fields: "Chip type:" (was "Chip is"), "Crystal frequency:"
+# (was "Crystal is"). The v4 parser silently reported "not an ESP" on this.
+P4_FLASH_ID_V5 = """\
+Warning: Deprecated: Command 'flash_id' is deprecated. Use 'flash-id' instead.
+esptool v5.3.1
+Serial port COM4:
+Connecting....
+Detecting chip type... ESP32-P4
+Connected to ESP32-P4 on COM4:
+Chip type:          ESP32-P4 (revision v1.3)
+Features:           Dual Core + LP Core, 400MHz
+Crystal frequency:  40MHz
+MAC:                e8:f6:0a:e0:f0:70
+
+Uploading stub flasher...
+Running stub flasher...
+Stub flasher running.
+
+Flash Memory Information:
+=========================
+Manufacturer: c8
+Device: 4019
+Detected flash size: 32MB
+
+Hard resetting via RTS pin...
+"""
+
 SECURITY_OFF = """\
 Security Information:
 =====================
@@ -113,6 +141,17 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(f["flashMb"], 32)
         self.assertFalse(f["psram"]["present"])
 
+    def test_parse_p4_esptool_v5(self):
+        f = self.eng.parse_esptool_flash_id(P4_FLASH_ID_V5)
+        self.assertEqual(f["chip"], "ESP32-P4")
+        self.assertEqual(f["revision"], "v1.3")
+        self.assertEqual(f["cores"], 2)
+        self.assertTrue(f["lpCore"])
+        self.assertEqual(f["maxMhz"], 400)
+        self.assertEqual(f["crystalMhz"], 40)
+        self.assertEqual(f["mac"], "e8:f6:0a:e0:f0:70")
+        self.assertEqual(f["flashMb"], 32)
+
     def test_parse_s3_qfn_and_flash(self):
         f = self.eng.parse_esptool_flash_id(S3_NO_PSRAM)
         self.assertEqual(f["chip"], "ESP32-S3")
@@ -163,6 +202,12 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(m["flashConfig"], "CONFIG_ESPTOOLPY_FLASHSIZE_32MB")
         self.assertEqual(m["confidence"], "matched")
         self.assertIn("C6_WIFI", m["variantOptions"])
+
+    def test_p4_v5_matched(self):
+        m = self._match(P4_FLASH_ID_V5)
+        self.assertEqual(m["board"], "ESP32_GENERIC_P4")
+        self.assertEqual(m["flashSize"], "32MB")
+        self.assertEqual(m["confidence"], "matched")
 
     def test_p4_c6_wifi_from_mp_build(self):
         m = self._match(P4_FLASH_ID, {"build": "ESP32_GENERIC_P4-C6_WIFI"})
@@ -273,6 +318,72 @@ class SplitTests(unittest.TestCase):
         )
         rows, warnings = self.eng.compute_split(base, 32 * 1024 * 1024, 8 * 1024 * 1024)
         self.assertTrue(any("exceeds flash" in w for w in warnings))
+
+
+# Real ESP-IDF check_sizes.py failure captured from an ESP32-P4 build.
+OVERFLOW_LOG = """\
+[1963/1963] cd .../esp-idf/esptool_py && python .../check_sizes.py ...
+FAILED: esp-idf/esptool_py/CMakeFiles/app_check_size ...
+Error: app partition is too small for binary micropython.bin size 0x2a4e60:
+  - Part 'factory' 0/0 @ 0x10000 size 0x1f0000 (overflow 0xb4e60)
+ninja: build stopped: subcommand failed.
+"""
+
+
+class AutosizeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.eng = _load_engine()
+
+    def test_parse_overflow(self):
+        info = self.eng.parse_partition_overflow(OVERFLOW_LOG)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["imageSize"], 0x2A4E60)
+        self.assertEqual(info["partName"], "factory")
+        self.assertEqual(info["partOffset"], 0x10000)
+        self.assertEqual(info["partSize"], 0x1F0000)
+        self.assertEqual(info["overflow"], 0xB4E60)
+
+    def test_parse_overflow_absent(self):
+        self.assertIsNone(self.eng.parse_partition_overflow("Project build complete."))
+
+    def test_autosize_size_aligned_with_headroom(self):
+        # 0x2a4e60 -> align 0x2b0000 + 0x40000 headroom -> 0x2f0000.
+        new = self.eng.autosize_app_partition_size(0x2A4E60)
+        self.assertEqual(new % 0x10000, 0)
+        self.assertGreaterEqual(new, 0x2A4E60)
+        self.assertEqual(new, 0x2F0000)
+
+    def test_resize_factory_only_table(self):
+        # P4-style factory-only table: grow factory, no vfs to reflow.
+        rows = self.eng.parse_partitions_csv(
+            "# Name, Type, SubType, Offset, Size, Flags\n"
+            "nvs, data, nvs, 0x9000, 0x6000,\n"
+            "phy_init, data, phy, 0xf000, 0x1000,\n"
+            "factory, app, factory, 0x10000, 0x1F0000,\n"
+        )
+        out = self.eng.resize_app_partition(rows, "factory", 0x300000)
+        factory = next(r for r in out if r["name"] == "factory")
+        self.assertEqual(self.eng._parse_size(factory["size"]), 0x300000)
+        self.assertEqual(self.eng._parse_size(factory["offset"]), 0x10000)
+
+    def test_resize_reflows_trailing_vfs(self):
+        rows = self.eng.parse_partitions_csv(
+            "# Name, Type, SubType, Offset, Size, Flags\n"
+            "factory, app, factory, 0x10000, 0x1F0000,\n"
+            "vfs, data, fat, 0x200000, 0x600000,\n"
+        )
+        out = self.eng.resize_app_partition(rows, "factory", 0x300000)
+        vfs = next(r for r in out if r["name"] == "vfs")
+        # vfs pushed to factory offset + new size.
+        self.assertEqual(self.eng._parse_size(vfs["offset"]), 0x10000 + 0x300000)
+
+    def test_resize_no_app_returns_none(self):
+        rows = self.eng.parse_partitions_csv(
+            "# Name, Type, SubType, Offset, Size, Flags\n"
+            "nvs, data, nvs, 0x9000, 0x6000,\n"
+        )
+        self.assertIsNone(self.eng.resize_app_partition(rows, "factory", 0x300000))
 
 
 if __name__ == "__main__":

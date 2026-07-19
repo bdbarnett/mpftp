@@ -233,40 +233,74 @@ class Session:
             )
         return ports
 
-    def connect(self, device: str, baud: int = 115200) -> dict[str, Any]:
+    def connect(
+        self, device: str, baud: int = 115200, attempts: int = 3
+    ) -> dict[str, Any]:
         from mpremote.transport_serial import SerialTransport
         from mpremote.transport import TransportError
+        import time
+
+        # The raw-REPL handshake (and sometimes opening the port itself) can fail
+        # transiently right after the board enumerates or if the REPL is momentarily
+        # busy — the classic "could not enter raw repl". A fresh reopen + reprobe
+        # almost always succeeds, so retry a few times before surfacing the error
+        # (mirrors what the user would do by clicking connect again).
+        retry_delay = 0.4
 
         with self._lock:
             self.disconnect()
             self.baud = baud
-            try:
-                self.transport = SerialTransport(device, baudrate=baud)
-            except TransportError as e:
-                raise RuntimeError(str(e.args[0] if e.args else e)) from e
-            except OSError as e:
-                raise RuntimeError(f"failed to access {device}: {e}") from e
-            # Opening the COM port succeeds in UF2/bootloader mode too — require a
-            # MicroPython raw-REPL handshake before we report connected.
-            try:
-                rtc = self._probe_micropython(self.transport)
-            except Exception as e:
+            last_probe_err: Optional[Exception] = None
+            for attempt in range(1, max(1, attempts) + 1):
+                last = attempt >= max(1, attempts)
+                # (Re)open the serial transport for this attempt.
                 try:
-                    self.transport.close()
-                except Exception:
-                    pass
-                self.transport = None
-                self.device = None
-                raise RuntimeError(
-                    f"{device} is not responding as MicroPython "
-                    f"(likely bootloader/UF2 mode, wrong port, or busy REPL): {e}"
-                ) from e
-            self.device = device
-            self.last_device = device
-            result: dict[str, Any] = {"device": device, "baud": baud, "micropython": True}
-            if rtc is not None:
-                result["rtc"] = rtc
-            return result
+                    self.transport = SerialTransport(device, baudrate=baud)
+                except TransportError as e:
+                    if not last:
+                        time.sleep(retry_delay)
+                        continue
+                    raise RuntimeError(str(e.args[0] if e.args else e)) from e
+                except OSError as e:
+                    if not last:
+                        time.sleep(retry_delay)
+                        continue
+                    raise RuntimeError(f"failed to access {device}: {e}") from e
+                # Opening the COM port succeeds in UF2/bootloader mode too — require a
+                # MicroPython raw-REPL handshake before we report connected.
+                try:
+                    rtc = self._probe_micropython(self.transport)
+                except Exception as e:
+                    try:
+                        self.transport.close()
+                    except Exception:
+                        pass
+                    self.transport = None
+                    last_probe_err = e
+                    if not last:
+                        time.sleep(retry_delay)
+                        continue
+                    self.device = None
+                    raise RuntimeError(
+                        f"{device} is not responding as MicroPython "
+                        f"(likely bootloader/UF2 mode, wrong port, or busy REPL): {e}"
+                    ) from e
+                self.device = device
+                self.last_device = device
+                result: dict[str, Any] = {
+                    "device": device,
+                    "baud": baud,
+                    "micropython": True,
+                }
+                if rtc is not None:
+                    result["rtc"] = rtc
+                if attempt > 1:
+                    result["retries"] = attempt - 1
+                return result
+            # Unreachable: the loop always returns or raises on the last attempt.
+            raise RuntimeError(
+                f"{device} could not be connected: {last_probe_err}"
+            )
 
     def resume(self, baud: Optional[int] = None) -> dict[str, Any]:
         """Reconnect to the last device without requiring the caller to re-pick a port."""

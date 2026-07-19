@@ -91,12 +91,15 @@ Standalone (no extension): pass `-d/--device` after the subcommand.
 
 Builds MicroPython from a local checkout (no `build_mp.sh`). User C modules
 (`micropython.cmake` / `*/micropython.mk`) and a frozen `manifest.py` are
-auto-discovered from the checkout's **parent** workspace. Runs as its own
-process (native Linux python on WSL for `make`), so it never blocks the serial
-session. All MP ports build; flash is supported for `esp32`, `rp2`, `samd`.
+auto-discovered from the checkout's **parent** workspace. mpftp aggregates
+**every** workspace module for **every** port and never gates by compatibility;
+each module opts in/out (and owns its deps, e.g. SDL2 for `usdl2`) via its own
+`micropython.mk` / `micropython.cmake`. Runs as its own process (native Linux
+python on WSL for `make`), so it never blocks the serial session. All MP ports
+build; flash is supported for `esp32`, `rp2`, `samd`.
 
 ```bash
-./scripts/mpftp firmware discover                 # resolved MP / IDF / emsdk paths
+./scripts/mpftp firmware discover                 # resolved MP tree + workspace + host
 ./scripts/mpftp firmware list                     # ports -> boards -> variants tree
 ./scripts/mpftp firmware cmods                    # discovered user C modules
 ./scripts/mpftp firmware build --port esp32 --board ESP32_GENERIC   # streams log
@@ -114,8 +117,18 @@ session. All MP ports build; flash is supported for `esp32`, `rp2`, `samd`.
 
 - `--mp` is auto-discovered (setting `mpftp.micropythonPath` → `MP_DIR` →
   common layouts). Pass `--mp PATH` to override.
-- esp32 needs ESP-IDF (`mpftp.idfPath` / `IDF_PATH`); flashing on WSL uses the
-  Windows python esptool so it can see `COMx`.
+- **Toolchains resolve at build time, not at panel open.** When **Build** runs,
+  mpftp resolves the port's toolchain — ESP-IDF (esp32), emsdk (webassembly), or
+  a cross-gcc (windows→mingw-w64, esp8266→xtensa-lx106, arm ports→arm-none-eabi,
+  riscv qemu→riscv64, pic16bit→xc16, renesas-ra→arm+protoc-c). If one is missing
+  the build returns a structured `needToolchain` and the panel prompts to
+  **Locate…** it (saved to `mpftp.idfPath`/`mpftp.emsdkPath` or
+  `mpftp.toolchainBins`, then the build retries) or open **Install
+  instructions**. esp32 also validates the ESP-IDF version against the port's
+  supported list. `discover` no longer probes toolchains.
+- windows builds cross-compile with `CROSS_COMPILE=x86_64-w64-mingw32-`;
+  webassembly relaxes the port's `-Werror` via `EMCC_CFLAGS` (no upstream edit).
+  Flashing on WSL uses the Windows python esptool so it can see `COMx`.
 - rp2/samd flash copies the `.uf2` to the bootloader drive (rp2 falls back to
   `picotool`); put the board in BOOTSEL/bootloader mode first.
 - **Detect** (Firmware page **Detect** button / `firmware detect`) is
@@ -129,11 +142,17 @@ session. All MP ports build; flash is supported for `esp32`, `rp2`, `samd`.
 - **ESP32-P4 Wi-Fi variants** (`C5_WIFI` / `C6_WIFI`) use an external radio that
   esptool cannot see; they are chosen only from MicroPython `_build`/machine
   hints or an explicit user pick.
-- ESP32 partition edits save to `<workspace>/mpftp-partitions/esp32/<board>.csv`
-  (workspace override — the MicroPython clone is never modified) and are injected
-  into the **build-dir** `sdkconfig` at build time (with a companion
-  `<board>.sdkconfig` fragment for the flash size). The Firmware page exposes a
-  simple firmware/storage split; **Advanced…** opens the full CSV editor.
+- ESP32 partition edits save to `<workspace>/esp32_partitions/<board>.csv` (a
+  sibling of the micropython tree — the MicroPython clone is never modified) and
+  are injected into the **build-dir** `sdkconfig` at build time, referenced
+  *relative* to `ports/esp32` (`../../../esp32_partitions/<board>.csv`), with a
+  companion `<board>.sdkconfig` fragment for the flash size. The Firmware page
+  has no manual partition/storage controls — sizing is automatic (see Autosize);
+  the `partitions` CLI subcommands below remain for scripted/manual overrides.
+- **Autosize:** if a build overflows the app partition, mpftp parses the ESP-IDF
+  `app partition is too small … (overflow …)` error, grows the app partition to
+  fit (into `esp32_partitions/<board>.csv`), and rebuilds once. `--no-autosize`
+  disables it.
 - UI: **Firmware** button in the Board Files toolbar, or `mpftp: Build & Flash
   Firmware`. Same operations over Agent RPC as `firmware_*` methods
   (`firmware_list`, `firmware_build`, `firmware_flash`, `firmware_partitions`, …).

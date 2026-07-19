@@ -112,7 +112,8 @@ export class FirmwareEngine {
   stream(
     cmd: string,
     args: EngineArgs,
-    onLog: (line: string) => void
+    onLog: (line: string) => void,
+    onPhase?: (state: string, text: string) => void
   ): StreamHandle {
     const argv = this.toArgv(cmd, args);
     const proc = spawn(this.buildPython(), [this.script(), ...argv], {
@@ -133,6 +134,8 @@ export class FirmwareEngine {
         const msg = JSON.parse(t) as Record<string, unknown>;
         if (msg.type === "log") {
           onLog(String(msg.line ?? ""));
+        } else if (msg.type === "phase") {
+          onPhase?.(String(msg.state ?? ""), String(msg.text ?? ""));
         } else if (msg.type === "result") {
           result = msg;
         }

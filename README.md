@@ -17,7 +17,7 @@ Works on:
 - Hard-reset auto-reconnect; **Resume** reconnects the last device
 - mpremote-backed ops: eval/exec/run, soft/hard reset, bootloader, RTC, host-side **mip**, df, mount/umount, romfs, recursive `cp`, hash
 - Agent CLI + TCP RPC (`127.0.0.1:7429`) sharing the UI serial session
-- **Firmware builder**: guided build/flash UI (build MicroPython once, flash one or many boards), auto-discovered user C modules / frozen manifest, esp32/rp2/samd flashing, esptool-first **Detect** (chip/flash/security + board autoset), and an ESP32 firmware/storage split with workspace partition overrides
+- **Firmware builder**: guided build/flash UI (build MicroPython once, flash one or many boards), auto-discovered user C modules / frozen manifest, esp32/rp2/samd flashing, esptool-first **Detect** (chip/flash/security + board autoset), and automatic ESP32 partition autosizing with workspace partition overrides
 
 ## Requirements
 
@@ -81,7 +81,8 @@ Useful commands:
 - `mpftp.verifyTransfers` — SHA-256 check after each file transfer (default `true`)
 - `mpftp.autoReconnectAfterReset` — reconnect after hard reset (default `true`)
 - `mpftp.micropythonPath` — MicroPython checkout used by the Firmware builder (auto-discovered if empty)
-- `mpftp.idfPath` / `mpftp.emsdkPath` — ESP-IDF / emsdk locations (auto-discovered if empty)
+- `mpftp.idfPath` / `mpftp.emsdkPath` — ESP-IDF / emsdk locations, resolved when **Build** is clicked (auto-discovered if empty; you're prompted to locate them if missing)
+- `mpftp.toolchainBins` — extra cross-toolchain `bin/` folders prepended to the build `PATH` (arm-none-eabi, xtensa, riscv, xc16, mingw-w64, …); populated when you locate a missing toolchain from the build prompt
 - `mpftp.buildPythonPath` — native (Linux on WSL) python3 to run the build engine + `make`
 - `mpftp.esptoolCommand` — override esptool for flashing (e.g. a Windows `python.exe` on WSL so it sees COM ports)
 
@@ -95,9 +96,16 @@ It reimplements the useful parts of a cmods-style build without shelling out to
    listed; flashing is enabled for `esp32`, `rp2`, and `samd`).
 2. **Modules** — user C modules (`micropython.cmake` / `*/micropython.mk`) and a
    frozen `manifest.py` are auto-discovered from the checkout's parent workspace
-   and shown before you build.
+   and shown before you build. mpftp aggregates **every** workspace module for
+   **every** port and never gates by compatibility — each module opts in or out
+   (and resolves its own dependencies, e.g. SDL2 for `usdl2`) through its own
+   `micropython.mk` / `micropython.cmake`.
 3. **Build** — incremental `make submodules` + `make all` (with a separate
    **Clean**), streaming log, and a **Ready** state with the artifact path/size.
+   The port's toolchain (ESP-IDF, emsdk, or a cross-gcc such as arm-none-eabi /
+   xtensa / riscv / xc16 / mingw-w64) is resolved here, at build time. If one is
+   missing you're prompted to **Locate…** it (saved to settings and the build
+   retried) or open **Install instructions** — never a raw compiler error.
 4. **Flash** — build once, then flash many: swap boards and click **Flash**
    again with no rebuild. esp32 uses `esptool` (Windows python on WSL for COM
    ports); rp2/samd copy the `.uf2` to the bootloader drive (rp2 falls back to
@@ -113,12 +121,20 @@ forced `ESP32_GENERIC_*` — and ESP32-P4 external Wi-Fi variants (`C5_WIFI` /
 `C6_WIFI`) are chosen only from MicroPython hints. If a device reports flash
 encryption or secure boot enabled, flashing is guarded behind a warning.
 
-For esp32 the Firmware page offers a simple **firmware / storage** split (resize
-or add the storage partition), and **Advanced…** opens the full **Partitions…**
-editor (presets, a flash-usage bar, and overlap/alignment validation). Both save
-a **workspace override** at `<workspace>/mpftp-partitions/esp32/<board>.csv`
-— the MicroPython clone is never modified. Builds inject the override (and its
-companion flash-size fragment) into the build-dir `sdkconfig` automatically.
+For esp32, partition sizing is handled automatically — there is no manual
+firmware/storage split to adjust. When a partition override is needed it is
+written as a CSV in the **`esp32_partitions` sibling of the micropython tree**
+(`<workspace>/esp32_partitions/<board>.csv`) — the MicroPython clone is never
+modified. Builds reference it relative to `ports/esp32`
+(`../../../esp32_partitions/<board>.csv`) and inject it (plus any companion
+flash-size fragment) into the build-dir `sdkconfig` automatically.
+
+Builds **autosize** on overflow: if `make` fails because the app image is
+larger than the `factory` partition, mpftp parses the ESP-IDF
+`app partition is too small … (overflow …)` error, grows the app partition to
+fit (64 KiB-aligned, with headroom) into `esp32_partitions/<board>.csv`, and
+rebuilds once — no manual partition editing required. Pass `--no-autosize` to
+disable.
 
 ```bash
 ./scripts/mpftp firmware list

@@ -6,26 +6,30 @@
     host: "",
     micropython: "",
     workspace: "",
-    idf: null,
-    emsdk: null,
     tree: [],
-    cmods: { cmods: [], hasAggregator: false, hasManifest: false },
+    cmods: { modules: [], hasAggregator: false, hasManifest: false },
     flashers: {},
     selection: { port: "", board: "", variant: "" },
     prefs: { reconnectAfterFlash: false, alsoFlashAfterBuild: false, device: "" },
     connectedDevice: "",
     devices: [],
     detect: null,
-    partitions: null,
-    partitionsFlashMb: 0,
+    detecting: false,
+    detectStatus: null,
     artifact: { ready: false },
+    flashOffset: "",
+    flashBaud: "460800",
+    flashBefore: "default_reset",
+    flashAfter: "hard_reset",
+    flashErase: false,
+    flashStatus: null,
+    flashing: false,
     phase: "idle",
     phaseText: "Idle",
     filter: "",
     busy: false,
+    cleanBuild: false,
   };
-
-  let splitRequested = false;
 
   const $ = (sel, root) => (root || document).querySelector(sel);
   const el = (tag, cls, txt) => {
@@ -65,11 +69,11 @@
       return;
     }
 
+    app.appendChild(renderModules());
     app.appendChild(renderDeviceInfo());
 
     const grid = el("div", "grid");
     grid.appendChild(renderTarget());
-    grid.appendChild(renderModules());
     grid.appendChild(renderBuild());
     grid.appendChild(renderFlash());
     app.appendChild(grid);
@@ -89,7 +93,9 @@
     h.appendChild(left);
 
     const right = el("div", "hdr-right");
+
     const pathRow = el("div", "path-row");
+    pathRow.appendChild(el("span", "hdr-label", "MicroPython repo"));
     const icon = el("i", "codicon codicon-repo");
     pathRow.appendChild(icon);
     const pathText = el("span", "path-text", model.micropython || "No MicroPython found");
@@ -101,16 +107,19 @@
     right.appendChild(pathRow);
 
     const meta = el("div", "meta-row");
-    if (model.idf) meta.appendChild(pill("ESP-IDF", "ok"));
-    if (model.emsdk) meta.appendChild(pill("emsdk", "ok"));
-    meta.appendChild(pill(model.host, "muted"));
+    meta.appendChild(el("span", "hdr-label", "Environment"));
+    meta.appendChild(
+      pill(model.host, "muted", "Host platform running the build (" + model.host + ")")
+    );
     right.appendChild(meta);
     h.appendChild(right);
     return h;
   }
 
-  function pill(text, kind) {
-    return el("span", "pill " + (kind || ""), text);
+  function pill(text, kind, title) {
+    const p = el("span", "pill " + (kind || ""), text);
+    if (title) p.title = title;
+    return p;
   }
 
   function renderNoMp() {
@@ -171,22 +180,45 @@
     return g;
   }
 
+  // PSRAM display: prefer esptool's embedded size, else the MicroPython
+  // runtime probe (largest PSRAM heap bank), else just presence/type.
+  function psramValue(d, mp) {
+    const p = (d && d.psram) || {};
+    const bytes = mp && mp.psramBytes;
+    if (!p.present && !bytes) return null;
+    const parts = [];
+    if (p.sizeMb) parts.push(p.sizeMb + " MB");
+    else if (bytes) parts.push("~" + humanSize(bytes));
+    if (p.octal) parts.push("Octal");
+    if (!parts.length) parts.push(p.label || "yes");
+    return parts.join(" · ");
+  }
+
   function renderDeviceInfo() {
-    const card = el("section", "card device-info");
+    const card = el("section", "card device-card");
     const head = el("div", "info-head");
     head.appendChild(el("span", "step-title", "Device Info"));
-    const btn = el("button", "btn accent sm", model.busy ? "Detecting…" : "Detect");
-    btn.disabled = model.busy;
+    const btn = el("button", "btn accent sm", model.detecting ? "Detecting…" : "Detect");
+    btn.disabled = model.busy || model.detecting || model.flashing;
     btn.title = "Probe the selected device with esptool (bare board OK)";
     btn.onclick = () => vscode.postMessage({ type: "detect" });
     head.appendChild(btn);
     card.appendChild(head);
 
+    const ds = model.detectStatus;
+    if (ds && ds.state === "failed") {
+      card.appendChild(el("p", "info-status err", ds.text || "Detect failed"));
+    }
+
     const d = model.detect;
     if (!d) {
-      card.appendChild(
-        el("p", "muted", "No device selected — click Detect to inspect.")
-      );
+      if (model.detecting) {
+        card.appendChild(el("p", "muted", "Detecting…"));
+      } else if (!(ds && ds.state === "failed")) {
+        card.appendChild(
+          el("p", "muted", "No device selected — click Detect to inspect.")
+        );
+      }
       return card;
     }
 
@@ -245,8 +277,8 @@
     addGroup(
       infoGroup("Memory", [
         infoRow("SRAM", d.sramKb ? d.sramKb + " KB" : null),
-        infoRow("Flash", d.flashMb ? d.flashMb + " MB" : null),
-        infoRow("PSRAM", d.psram && d.psram.present ? d.psram.label || "yes" : null),
+        infoRow("PSRAM", psramValue(d, mp)),
+        infoRow("Flash storage", d.flashMb ? d.flashMb + " MB" : null),
         infoRow("Free heap", hasMp && mp.memfree ? humanSize(mp.memfree) : null),
       ])
     );
@@ -272,8 +304,12 @@
     );
     card.appendChild(grid);
 
+    // Prefer the running firmware's full boot banner (reconstructed from
+    // os.uname); fall back to impl · build name when the version isn't known.
+    const buildName = mp.build ? " · " + mp.build : "";
+    const running = mp.version || (mp.impl || "mpy") + buildName;
     const status = hasMp
-      ? "MicroPython running (" + (mp.impl || "mpy") + ")"
+      ? "MicroPython running (" + running + ")"
       : "No MicroPython (bootloader / other firmware)";
     card.appendChild(el("div", "info-status", status));
 
@@ -421,18 +457,32 @@
 
   function selectTriple(port, board, variant) {
     model.selection = { port, board, variant };
-    model.partitions = null;
-    splitRequested = false;
+    // Let the new board's default offset re-populate the field, and drop any
+    // stale flash result from the previous board.
+    model.flashOffset = "";
+    model.flashStatus = null;
+    model.flashing = false;
     vscode.postMessage({ type: "select", port, board, variant });
     render();
   }
 
-  // Step 2 — Modules
+  // Modules — discovery only (not a numbered step). The C-module set is scanned
+  // from the workspace (parent of the MicroPython checkout); repoint via the
+  // header's Change… control.
   function renderModules() {
     const card = el("section", "card step");
-    card.appendChild(stepHead("2", "Modules", ""));
+    card.appendChild(stepHead("", "Modules", ""));
+    const from = model.workspace || model.micropython;
+    if (from) {
+      const src = el("p", "discovered-from");
+      src.appendChild(el("span", "discovered-label", "Discovered from"));
+      const path = el("span", "discovered-path", from);
+      path.title = from;
+      src.appendChild(path);
+      card.appendChild(src);
+    }
     const cm = model.cmods || {};
-    const list = cm.cmods || [];
+    const list = cm.modules || [];
     if (!list.length) {
       card.appendChild(
         el(
@@ -455,16 +505,32 @@
       card.appendChild(chips);
     }
     const flags = el("div", "flags");
-    if (cm.hasAggregator) flags.appendChild(pill("USER_C_MODULES", "ok"));
-    if (cm.hasManifest) flags.appendChild(pill("FROZEN_MANIFEST", "ok"));
+    if (cm.hasAggregator) {
+      flags.appendChild(
+        pill(
+          "USER_C_MODULES",
+          "ok",
+          "A micropython.cmake / micropython.mk aggregator was found in the workspace — the discovered C modules are compiled into the firmware via USER_C_MODULES."
+        )
+      );
+    }
+    if (cm.hasManifest) {
+      flags.appendChild(
+        pill(
+          "FROZEN_MANIFEST",
+          "ok",
+          "A manifest.py was found in the workspace — its Python modules are frozen into the firmware via FROZEN_MANIFEST."
+        )
+      );
+    }
     if (flags.children.length) card.appendChild(flags);
     return card;
   }
 
-  // Step 3 — Build
+  // Step 2 — Build
   function renderBuild() {
     const card = el("section", "card step");
-    card.appendChild(stepHead("3", "Build", ""));
+    card.appendChild(stepHead("2", "Build", chipText()));
 
     const statusRow = el("div", "status-row");
     statusRow.appendChild(phasePill());
@@ -474,8 +540,15 @@
       const info = el("div", "artifact");
       info.appendChild(el("i", "codicon codicon-file-binary"));
       const details = el("div", "artifact-details");
-      const name = (model.artifact.artifact || "").split("/").pop();
+      const full = model.artifact.artifact || "";
+      const name = full.split("/").pop();
       details.appendChild(el("div", "artifact-name", name));
+      const dir = full.slice(0, full.length - name.length).replace(/\/$/, "");
+      if (dir) {
+        const dirEl = el("div", "artifact-dir muted sm", dir);
+        dirEl.title = dir;
+        details.appendChild(dirEl);
+      }
       details.appendChild(
         el(
           "div",
@@ -491,33 +564,49 @@
       card.appendChild(el("p", "muted", "Not built yet for this selection."));
     }
 
+    card.appendChild(
+      checkbox(
+        "Clean build",
+        model.cleanBuild,
+        (v) => {
+          model.cleanBuild = v;
+        },
+        { title: "Run make clean before building (from-scratch rebuild)." }
+      )
+    );
+
+    const flashable = selectedPortFlashable();
+    card.appendChild(
+      prefCheckbox("Also flash after build", "alsoFlashAfterBuild", {
+        disabled: !flashable,
+        title: flashable
+          ? ""
+          : "This target builds a binary that isn't flashed to a board.",
+      })
+    );
+
     const actions = el("div", "actions");
     const build = el("button", "btn primary", model.busy ? "Working…" : "Build");
-    build.disabled = model.busy || !model.selection.port;
-    build.onclick = () => vscode.postMessage({ type: "build" });
+    build.disabled =
+      model.busy || model.detecting || model.flashing || !model.selection.port;
+    build.onclick = () =>
+      vscode.postMessage({ type: "build", clean: !!model.cleanBuild });
     actions.appendChild(build);
-
-    const clean = el("button", "btn ghost", "Clean");
-    clean.disabled = model.busy || !model.selection.port;
-    clean.onclick = () => vscode.postMessage({ type: "build", clean: true });
-    clean.title = "Clean then rebuild";
-    actions.appendChild(clean);
-
     card.appendChild(actions);
-
-    const alsoFlash = checkbox(
-      "Also flash after build",
-      model.prefs.alsoFlashAfterBuild,
-      (v) => vscode.postMessage({ type: "setPref", key: "alsoFlashAfterBuild", value: v })
-    );
-    card.appendChild(alsoFlash);
     return card;
   }
 
-  // Step 4 — Flash
+  // Step 3 — Firmware (flash)
   function renderFlash() {
     const card = el("section", "card step");
-    card.appendChild(stepHead("4", "Flash", ""));
+    card.appendChild(stepHead("3", "Firmware", ""));
+
+    const fp = flashPill();
+    if (fp) {
+      const statusRow = el("div", "status-row");
+      statusRow.appendChild(fp);
+      card.appendChild(statusRow);
+    }
 
     const port = model.selection.port;
     const flasher = model.flashers[port];
@@ -559,25 +648,118 @@
     const ready = model.artifact && model.artifact.ready;
     const needsDevice = port === "esp32" && !model.prefs.device;
 
-    const actions = el("div", "actions");
-    const flash = el("button", "btn accent", "Flash");
-    flash.disabled = model.busy || !ready || needsDevice;
-    if (!ready) flash.title = "Build this board first";
-    else if (needsDevice) flash.title = "Select a device";
-    flash.onclick = () => vscode.postMessage({ type: "flash" });
-    actions.appendChild(flash);
-
-    card.appendChild(actions);
-
+    // esp32 only: editable flash offset + baud, between the device row and Flash.
     if (port === "esp32") {
-      renderStorageSplit(card);
+      // Two-column grid: offset | baud on the first row, reset-before | reset-after
+      // on the second. The erase checkbox sits full-width below.
+      const opts = el("div", "flash-opts");
+
+      const offRow = el("div", "offset-row");
+      offRow.appendChild(el("span", "offset-label", "Flash offset"));
+      const off = document.createElement("input");
+      off.type = "text";
+      off.className = "offset-input";
+      off.value = model.flashOffset || "";
+      off.placeholder = (model.artifact && model.artifact.flashOffset) || "0x0";
+      off.title = "Where the merged firmware.bin is written (board default shown)";
+      off.oninput = () => {
+        model.flashOffset = off.value.trim();
+      };
+      offRow.appendChild(off);
+      opts.appendChild(offRow);
+
+      const baudRow = el("div", "offset-row");
+      baudRow.appendChild(el("span", "offset-label", "Baud rate"));
+      const baud = document.createElement("input");
+      baud.type = "text";
+      baud.inputMode = "numeric";
+      baud.className = "offset-input";
+      baud.setAttribute("list", "baud-rates");
+      baud.value = model.flashBaud || "";
+      baud.placeholder = "460800";
+      baud.title = "esptool baud rate — pick a common rate or type your own";
+      baud.oninput = () => {
+        model.flashBaud = baud.value.trim();
+      };
+      baudRow.appendChild(baud);
+      const rates = document.createElement("datalist");
+      rates.id = "baud-rates";
+      for (const r of ["115200", "230400", "460800", "921600", "1500000"]) {
+        const opt = document.createElement("option");
+        opt.value = r;
+        rates.appendChild(opt);
+      }
+      baudRow.appendChild(rates);
+      opts.appendChild(baudRow);
+
+      opts.appendChild(
+        selectRow(
+          "Reset before",
+          [
+            ["default_reset", "default_reset"],
+            ["no_reset", "no_reset"],
+            ["usb_reset", "usb_reset"],
+          ],
+          model.flashBefore,
+          (v) => {
+            model.flashBefore = v;
+          },
+          "esptool --before: how the chip enters the bootloader. Use no_reset when you've manually put the board in download mode."
+        )
+      );
+      opts.appendChild(
+        selectRow(
+          "Reset after",
+          [
+            ["hard_reset", "hard_reset"],
+            ["soft_reset", "soft_reset"],
+            ["no_reset", "no_reset"],
+          ],
+          model.flashAfter,
+          (v) => {
+            model.flashAfter = v;
+          },
+          "esptool --after: what the chip does when flashing finishes."
+        )
+      );
+
+      card.appendChild(opts);
+
+      card.appendChild(
+        checkbox(
+          "Erase flash before writing",
+          model.flashErase,
+          (v) => {
+            model.flashErase = v;
+          },
+          {
+            title:
+              "Full chip erase before flashing (guarantees a clean filesystem). A layout change auto-erases regardless.",
+          }
+        )
+      );
     }
 
-    card.appendChild(
-      checkbox("Reconnect after flash", model.prefs.reconnectAfterFlash, (v) =>
-        vscode.postMessage({ type: "setPref", key: "reconnectAfterFlash", value: v })
-      )
-    );
+    const actions = el("div", "actions");
+    const flash = el("button", "btn accent", model.flashing ? "Flashing…" : "Flash");
+    flash.disabled =
+      model.busy || model.detecting || model.flashing || !ready || needsDevice;
+    if (!ready) flash.title = "Build this board first";
+    else if (needsDevice) flash.title = "Select a device";
+    flash.onclick = () =>
+      vscode.postMessage({
+        type: "flash",
+        offset: model.flashOffset || "",
+        baud: model.flashBaud || "",
+        before: model.flashBefore || "",
+        after: model.flashAfter || "",
+        erase: !!model.flashErase,
+      });
+    actions.appendChild(flash);
+
+    card.appendChild(prefCheckbox("Reconnect after flash", "reconnectAfterFlash"));
+
+    card.appendChild(actions);
 
     if (ready) {
       card.appendChild(
@@ -589,152 +771,6 @@
       );
     }
     return card;
-  }
-
-  // Firmware / storage split (esp32)
-  const STORAGE_SUBTYPES = ["fat", "spiffs", "littlefs"];
-  const STORAGE_NAMES = ["vfs", "storage", "ffat", "user"];
-
-  function parseCsvSize(v) {
-    v = (v || "").trim().toLowerCase();
-    if (!v) return 0;
-    if (v.endsWith("k")) return (parseInt(v, 10) || 0) * 1024;
-    if (v.endsWith("m")) return (parseInt(v, 10) || 0) * 1048576;
-    return parseInt(v, v.startsWith("0x") ? 16 : 10) || 0;
-  }
-
-  function isStorageRow(r) {
-    return (
-      r.type === "data" &&
-      (STORAGE_SUBTYPES.includes(r.subtype) ||
-        STORAGE_NAMES.includes((r.name || "").toLowerCase()))
-    );
-  }
-
-  function activeTable() {
-    const p = model.partitions;
-    if (!p || !p.candidates || !p.candidates.length) return null;
-    return (
-      p.candidates.find((x) => x.isOverride) ||
-      p.candidates.find((x) => x.isStock) ||
-      p.candidates[0]
-    );
-  }
-
-  function renderStorageSplit(card) {
-    const wrap = el("div", "split");
-    const title = el("div", "split-title");
-    title.appendChild(el("span", null, "Firmware / storage"));
-    const adv = el("button", "btn ghost sm", "Advanced…");
-    adv.title = "Open the full partition editor";
-    adv.onclick = () => vscode.postMessage({ type: "openPartitions" });
-    title.appendChild(adv);
-    wrap.appendChild(title);
-
-    const p = model.partitions;
-    if (!p) {
-      if (!splitRequested) {
-        splitRequested = true;
-        vscode.postMessage({ type: "loadPartitions" });
-      }
-      wrap.appendChild(el("p", "muted sm", "Loading partition layout…"));
-      card.appendChild(wrap);
-      return;
-    }
-    const c = activeTable();
-    if (!c) {
-      wrap.appendChild(el("p", "muted sm", "No partition table for this board."));
-      card.appendChild(wrap);
-      return;
-    }
-
-    const rows = c.rows || [];
-    const s = rows.find(isStorageRow);
-    const storageBytes = s ? parseCsvSize(s.size) : 0;
-    const total = c.targetSize || 0;
-    const fixed = Math.max(0, total - storageBytes); // firmware + system regions
-    const flashMb = model.partitionsFlashMb || 0;
-    const flashBytes = flashMb * 1048576;
-    const mb = (b) => Math.round((b / 1048576) * 100) / 100;
-
-    if (!flashBytes) {
-      wrap.appendChild(
-        el(
-          "p",
-          "hint sm",
-          "Detect the board to read its flash size before adjusting storage."
-        )
-      );
-      wrap.appendChild(
-        el(
-          "p",
-          "muted sm",
-          `Current: firmware+system ${mb(fixed)} MB · storage ${mb(storageBytes)} MB`
-        )
-      );
-      card.appendChild(wrap);
-      return;
-    }
-
-    const maxStorage = Math.max(0, flashBytes - fixed);
-    const readout = el("div", "split-readout");
-    const value = el("span", "split-value");
-    const fw = el("span", "split-fw");
-    const setLabels = (storageMb) => {
-      value.textContent = "storage " + storageMb + " MB";
-      fw.textContent =
-        "firmware + system " + mb(fixed) + " MB · flash " + flashMb + " MB";
-    };
-    readout.appendChild(value);
-    readout.appendChild(fw);
-    wrap.appendChild(readout);
-
-    const slider = document.createElement("input");
-    slider.type = "range";
-    slider.className = "split-slider";
-    slider.min = "0";
-    slider.max = String(mb(maxStorage));
-    slider.step = "0.25";
-    slider.value = String(Math.min(mb(storageBytes), mb(maxStorage)));
-    setLabels(slider.value);
-
-    const num = document.createElement("input");
-    num.type = "number";
-    num.className = "split-num";
-    num.min = "0";
-    num.max = slider.max;
-    num.step = "0.25";
-    num.value = slider.value;
-
-    slider.oninput = () => {
-      num.value = slider.value;
-      setLabels(slider.value);
-    };
-    num.oninput = () => {
-      slider.value = num.value;
-      setLabels(num.value);
-    };
-
-    const sliderRow = el("div", "split-row");
-    sliderRow.appendChild(slider);
-    const numWrap = el("div", "split-num-wrap");
-    numWrap.appendChild(num);
-    numWrap.appendChild(el("span", "muted sm", "MB"));
-    sliderRow.appendChild(numWrap);
-    wrap.appendChild(sliderRow);
-
-    const apply = el("button", "btn primary sm", "Apply split");
-    apply.disabled = model.busy;
-    apply.onclick = () =>
-      vscode.postMessage({ type: "applySplit", storageMb: Number(num.value) || 0 });
-    wrap.appendChild(apply);
-
-    if (p.usingOverride) {
-      wrap.appendChild(
-        el("p", "hint sm", "Using a saved override; Apply overwrites it.")
-      );
-    }
-    card.appendChild(wrap);
   }
 
   // Log
@@ -756,7 +792,7 @@
 
   function stepHead(n, title, chip) {
     const h = el("div", "step-head");
-    h.appendChild(el("span", "step-num", n));
+    if (n) h.appendChild(el("span", "step-num", n));
     h.appendChild(el("span", "step-title", title));
     if (chip) h.appendChild(el("span", "sel-chip", chip));
     return h;
@@ -766,35 +802,137 @@
     const map = {
       idle: ["Idle", "muted"],
       building: ["Building", "run"],
-      flashing: ["Flashing", "run"],
-      detecting: ["Detecting", "run"],
       ready: ["Ready", "ok"],
       failed: ["Failed", "err"],
     };
     const [label, kind] = map[model.phase] || ["Idle", "muted"];
     const p = el("span", "phase-pill " + kind);
-    if (model.phase === "building" || model.phase === "flashing" || model.phase === "detecting") {
+    if (model.phase === "building") {
       p.appendChild(el("i", "codicon codicon-loading spin"));
     }
     p.appendChild(el("span", null, model.phaseText || label));
     return p;
   }
 
-  function checkbox(label, checked, onChange) {
+  // Flash-step status pill (separate from the Build phase pill).
+  function flashPill() {
+    const fs = model.flashStatus;
+    if (!fs || !fs.state) return null;
+    const map = {
+      flashing: ["Flashing", "run"],
+      ok: ["Flashed", "ok"],
+      failed: ["Failed", "err"],
+    };
+    const [label, kind] = map[fs.state] || ["", "muted"];
+    const p = el("span", "phase-pill " + kind);
+    if (fs.state === "flashing") {
+      p.appendChild(el("i", "codicon codicon-loading spin"));
+    }
+    p.appendChild(el("span", null, fs.text || label));
+    return p;
+  }
+
+  // Labeled <select> laid out like the offset/baud rows. options is a list of
+  // [value, label] pairs; current is the selected value.
+  function selectRow(label, options, current, onChange, title) {
+    const row = el("div", "offset-row");
+    const lab = el("span", "offset-label", label);
+    if (title) lab.title = title;
+    row.appendChild(lab);
+    const sel = document.createElement("select");
+    sel.className = "offset-select";
+    if (title) sel.title = title;
+    for (const [value, text] of options) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = text;
+      if (value === current) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.onchange = () => onChange(sel.value);
+    row.appendChild(sel);
+    return row;
+  }
+
+  function checkbox(label, checked, onChange, opts) {
     const wrap = el("label", "check");
     const input = document.createElement("input");
     input.type = "checkbox";
     input.checked = !!checked;
     input.onchange = (e) => onChange(e.target.checked);
+    if (opts && opts.disabled) {
+      input.disabled = true;
+      wrap.classList.add("disabled");
+      if (opts.title) wrap.title = opts.title;
+    }
     wrap.appendChild(input);
     wrap.appendChild(el("span", null, label));
     return wrap;
   }
 
+  // Checkbox bound to a persisted pref. Updates the local model on toggle so a
+  // later render() (e.g. from a build/flash phase change) reflects the user's
+  // actual choice instead of reverting to the last pushed state.
+  //
+  // When disabled (opts.disabled), the box renders unchecked and read-only
+  // without touching the persisted pref, so the user's real choice is restored
+  // once a flashable target is selected again.
+  function prefCheckbox(label, key, opts) {
+    const disabled = !!(opts && opts.disabled);
+    return checkbox(
+      label,
+      disabled ? false : model.prefs[key],
+      (v) => {
+        model.prefs[key] = v;
+        vscode.postMessage({ type: "setPref", key, value: v });
+      },
+      opts
+    );
+  }
+
+  // The tree node for the currently selected port carries its .flashable flag;
+  // build-only ports (unix/windows/webassembly) produce non-flashable binaries.
+  function selectedPortFlashable() {
+    const p = model.selection && model.selection.port;
+    if (!p) return true;
+    const node = (model.tree || []).find((t) => t.port === p);
+    return node ? !!node.flashable : true;
+  }
+
   // ---------------------------------------------------------------- log buffer
   let logBuffer = [];
+
+  // esptool emits one "Writing at 0x… NN.N% …/… bytes…" line per progress tick
+  // (text-mode reads split on \r), which would flood the log. Collapse a run of
+  // these into a single entry that updates in place, with a blank line above the
+  // bar and a blank line below once it finishes.
+  const WRITE_PROGRESS_RE = /Writing at 0x[0-9a-fA-F]+.*%.*bytes\.\.\./;
+  let inWriteProgress = false;
+
   function appendLog(line) {
-    logBuffer.push(line);
+    const isProgress = WRITE_PROGRESS_RE.test(line);
+    if (isProgress) {
+      const last = logBuffer.length - 1;
+      if (inWriteProgress && last >= 0 && WRITE_PROGRESS_RE.test(logBuffer[last])) {
+        logBuffer[last] = line; // overwrite the previous progress tick in place
+      } else {
+        if (logBuffer.length && logBuffer[logBuffer.length - 1] !== "") {
+          logBuffer.push(""); // blank line above a fresh progress bar
+        }
+        logBuffer.push(line);
+        inWriteProgress = true;
+      }
+    } else if (inWriteProgress && line === "") {
+      // Swallow esptool's own blank lines while a bar is live so it keeps
+      // updating in place instead of scrolling.
+      return;
+    } else {
+      if (inWriteProgress) {
+        inWriteProgress = false;
+        logBuffer.push(""); // blank line below the completed bar
+      }
+      logBuffer.push(line);
+    }
     if (logBuffer.length > 5000) logBuffer = logBuffer.slice(-4000);
     const pre = $("#logPre");
     if (pre) {
@@ -812,8 +950,6 @@
           host: msg.host,
           micropython: msg.micropython,
           workspace: msg.workspace,
-          idf: msg.idf,
-          emsdk: msg.emsdk,
           tree: msg.tree || [],
           cmods: msg.cmods || {},
           flashers: msg.flashers || {},
@@ -825,23 +961,30 @@
         });
         render();
         break;
+      case "detectStatus":
+        model.detectStatus = { state: msg.state, text: msg.text || "" };
+        // Latch "detecting" on start; cleared by the later "detect" message so
+        // the Detect button stays disabled until Device Info is populated.
+        if (msg.state === "detecting") {
+          model.detecting = true;
+        }
+        render();
+        break;
       case "detect":
         model.detect = msg.detect || null;
-        splitRequested = false;
-        model.partitions = null;
+        // Detect is the last message of the probe (posted after enrichment), so
+        // clear the in-progress flag here — not on the earlier status change —
+        // to keep the button disabled until Device Info is populated.
+        model.detecting = false;
         render();
-        break;
-      case "partitions":
-        model.partitions = msg.partitions || null;
-        model.partitionsFlashMb = msg.flashMb || 0;
-        render();
-        break;
-      case "splitApplied":
-        appendLog("[mpftp] storage split saved: " + (msg.overridePath || ""));
-        for (const w of msg.warnings || []) appendLog("[mpftp] " + w);
         break;
       case "artifact":
         model.artifact = msg.artifact || { ready: false };
+        // Pre-fill the offset field with the resolved board default until the
+        // user edits it (empty === "use default").
+        if (!model.flashOffset && model.artifact.flashOffset) {
+          model.flashOffset = model.artifact.flashOffset;
+        }
         render();
         break;
       case "devices":
@@ -853,14 +996,17 @@
       case "phase":
         model.phase = msg.phase;
         model.phaseText = msg.text || "";
-        model.busy =
-          msg.phase === "building" ||
-          msg.phase === "flashing" ||
-          msg.phase === "detecting";
+        model.busy = msg.phase === "building";
+        render();
+        break;
+      case "flashStatus":
+        model.flashStatus = { state: msg.state, text: msg.text || "" };
+        model.flashing = msg.state === "flashing";
         render();
         break;
       case "clearLog":
         logBuffer = [];
+        inWriteProgress = false;
         appendLog("");
         break;
       case "log":

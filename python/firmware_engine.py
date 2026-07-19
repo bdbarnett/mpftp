@@ -56,6 +56,11 @@ def emit_log(line: str) -> None:
     emit({"type": "log", "line": line.rstrip("\n")})
 
 
+def emit_phase(state: str, text: str = "") -> None:
+    """Stream a build-phase update the panel maps onto the Build pill."""
+    emit({"type": "phase", "state": state, "text": text})
+
+
 def emit_result(ok: bool, **kw: Any) -> None:
     emit({"type": "result", "ok": ok, **kw})
 
@@ -229,6 +234,229 @@ def find_emsdk(hint: Optional[str], workspace: Optional[Path]) -> Optional[Path]
 
 
 # --------------------------------------------------------------------------- #
+# Build-time toolchain requirements
+#
+# Toolchains are resolved when Build is clicked (not at panel open). Each port
+# maps to the toolchain(s) its build needs. "dir" requirements are SDK trees
+# (ESP-IDF/emsdk) validated by find_idf/find_emsdk and persisted via a VS Code
+# config key; "command" requirements are cross-compilers looked up on PATH (plus
+# any user-located bin dirs). A missing requirement is reported back to the panel
+# as a structured `needToolchain` so it can prompt the user to locate it or open
+# install instructions — never a raw make failure deep in the build.
+# --------------------------------------------------------------------------- #
+
+_TC_IDF = {
+    "id": "esp-idf",
+    "label": "ESP-IDF",
+    "kind": "dir",
+    "configKey": "idfPath",
+    "hint": "Locate the ESP-IDF folder (contains export.sh), or set mpftp.idfPath / IDF_PATH.",
+    "url": "https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/",
+}
+_TC_EMSDK = {
+    "id": "emsdk",
+    "label": "Emscripten SDK (emsdk)",
+    "kind": "dir",
+    "configKey": "emsdkPath",
+    "hint": "Locate the emsdk folder (contains emsdk_env.sh), or set mpftp.emsdkPath / EMSDK.",
+    "url": "https://emscripten.org/docs/getting_started/downloads.html",
+}
+_TC_MINGW = {
+    "id": "mingw-w64",
+    "label": "MinGW-w64 GCC (x86_64-w64-mingw32-gcc)",
+    "kind": "command",
+    "bin": "x86_64-w64-mingw32-gcc",
+    "hint": "Install mingw-w64 (e.g. apt install gcc-mingw-w64-x86-64) or locate its bin/ folder.",
+    "url": "https://www.mingw-w64.org/downloads/",
+}
+_TC_ARM = {
+    "id": "arm-none-eabi-gcc",
+    "label": "GNU Arm Embedded toolchain (arm-none-eabi-gcc)",
+    "kind": "command",
+    "bin": "arm-none-eabi-gcc",
+    "hint": "Install the GNU Arm Embedded toolchain and put arm-none-eabi-gcc on PATH, or locate its bin/ folder.",
+    "url": "https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads",
+}
+_TC_XTENSA_LX106 = {
+    "id": "xtensa-lx106-elf-gcc",
+    "label": "ESP8266 toolchain (xtensa-lx106-elf-gcc)",
+    "kind": "command",
+    "bin": "xtensa-lx106-elf-gcc",
+    "hint": "Install the xtensa-lx106-elf toolchain and put it on PATH, or locate its bin/ folder.",
+    "url": "https://docs.espressif.com/projects/esp8266-rtos-sdk/en/latest/get-started/",
+}
+_TC_RISCV = {
+    "id": "riscv64-unknown-elf-gcc",
+    "label": "RISC-V toolchain (riscv64-unknown-elf-gcc)",
+    "kind": "command",
+    "bin": "riscv64-unknown-elf-gcc",
+    "hint": "Install a riscv64-unknown-elf toolchain and put it on PATH, or locate its bin/ folder.",
+    "url": "https://github.com/riscv-collab/riscv-gnu-toolchain",
+}
+_TC_XC16 = {
+    "id": "xc16-gcc",
+    "label": "Microchip XC16 (xc16-gcc)",
+    "kind": "command",
+    "bin": "xc16-gcc",
+    "hint": "Install Microchip XC16 and put xc16-gcc on PATH, or locate its bin/ folder.",
+    "url": "https://www.microchip.com/en-us/tools-resources/develop/mplab-xc-compilers",
+}
+_TC_PROTOC_C = {
+    "id": "protoc-c",
+    "label": "protobuf-c compiler (protoc-c)",
+    "kind": "command",
+    "bin": "protoc-c",
+    "hint": "Install protobuf-c (e.g. apt install protobuf-c-compiler) so extmod can generate its sources.",
+    "url": "https://github.com/protobuf-c/protobuf-c",
+}
+
+# ESP-IDF supplies the xtensa/riscv esp32 cross-compilers, so esp32 only needs
+# the IDF tree itself. minimal/bare-arm are intentionally absent (accepted hard
+# fails). unix/windows-host builds use system gcc (windows additionally needs
+# MinGW for a real cross-build — see do_build CROSS_COMPILE handling).
+TOOLCHAIN_REQUIREMENTS: dict[str, list[dict]] = {
+    "esp32": [_TC_IDF],
+    "webassembly": [_TC_EMSDK],
+    "windows": [_TC_MINGW],
+    "esp8266": [_TC_XTENSA_LX106],
+    "stm32": [_TC_ARM],
+    "samd": [_TC_ARM],
+    "nrf": [_TC_ARM],
+    "mimxrt": [_TC_ARM],
+    "rp2": [_TC_ARM],
+    "alif": [_TC_ARM],
+    "cc3200": [_TC_ARM],
+    "renesas-ra": [_TC_ARM, _TC_PROTOC_C],
+    "qemu": [_TC_ARM],
+    "pic16bit": [_TC_XC16],
+}
+
+
+def _toolchain_bin_dirs(ns: argparse.Namespace) -> list[Path]:
+    """User-located cross-toolchain bin dirs (os.pathsep-joined via --toolchain-bins)."""
+    raw = getattr(ns, "toolchain_bins", None) or ""
+    dirs: list[Path] = []
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if part:
+            dirs.append(Path(part).expanduser())
+    return dirs
+
+
+def _requirements_for(port: str, ns: argparse.Namespace) -> list[dict]:
+    if port == "qemu":
+        board = (getattr(ns, "board", "") or "").lower()
+        if any(tok in board for tok in ("rv32", "rv64", "riscv")):
+            return [_TC_RISCV]
+    return TOOLCHAIN_REQUIREMENTS.get(port, [])
+
+
+def _need_toolchain(req: dict) -> dict:
+    return {
+        "id": req["id"],
+        "label": req["label"],
+        "kind": req["kind"],
+        "configKey": req.get("configKey"),
+        "bin": req.get("bin"),
+        "hint": req["hint"],
+        "url": req["url"],
+    }
+
+
+def idf_version(idf: Path) -> Optional[str]:
+    """Best-effort ESP-IDF version string (e.g. 'v5.5.2')."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(idf), "describe", "--tags"],
+            capture_output=True, text=True, timeout=10,
+        )
+        v = out.stdout.strip()
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        vf = idf / "version.txt"
+        if vf.is_file():
+            v = vf.read_text("utf-8", "replace").strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    return None
+
+
+def supported_idf_minors(port_dir: Path) -> set[str]:
+    """Parse supported ESP-IDF major.minor versions from the esp32 port README."""
+    minors: set[str] = set()
+    try:
+        txt = (port_dir / "README.md").read_text("utf-8", "replace")
+        for m in re.finditer(r"v(\d+)\.(\d+)(?:\.\d+)?", txt):
+            minors.add(f"{m.group(1)}.{m.group(2)}")
+    except Exception:
+        pass
+    return minors
+
+
+def idf_version_mismatch(idf: Path, port_dir: Path) -> Optional[dict]:
+    """If the ESP-IDF version isn't supported by this esp32 port, return a
+    needToolchain describing the mismatch; otherwise None. Compared at
+    major.minor granularity so patch releases within a supported line pass."""
+    ver = idf_version(idf)
+    supported = supported_idf_minors(port_dir)
+    if not ver or not supported:
+        return None
+    m = re.match(r"v?(\d+)\.(\d+)", ver)
+    if not m:
+        return None
+    minor = f"{m.group(1)}.{m.group(2)}"
+    if minor in supported:
+        return None
+    want = ", ".join("v" + s for s in sorted(supported))
+    return {
+        "id": "esp-idf-version",
+        "label": f"a supported ESP-IDF (found {ver})",
+        "kind": "dir",
+        "configKey": "idfPath",
+        "bin": None,
+        "hint": (
+            f"This ESP-IDF is {ver}, but MicroPython's esp32 port supports {want}. "
+            "Locate a supported ESP-IDF checkout, or set mpftp.idfPath / IDF_PATH."
+        ),
+        "url": "https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/",
+    }
+
+
+def resolve_build_toolchains(
+    port: str, ns: argparse.Namespace, workspace: Optional[Path]
+) -> tuple[Optional[dict], list[Path]]:
+    """Resolve every toolchain the port build needs.
+
+    Returns (needToolchain | None, extra_path_dirs). extra_path_dirs are the
+    user-located bin dirs, prepended to the build PATH so located command
+    toolchains are visible to make.
+    """
+    extra = _toolchain_bin_dirs(ns)
+    search_path = os.pathsep.join(
+        [str(d) for d in extra] + [os.environ.get("PATH", "")]
+    )
+    for req in _requirements_for(port, ns):
+        if req["kind"] == "dir":
+            if req["configKey"] == "idfPath":
+                found = find_idf(getattr(ns, "idf", None), workspace)
+            elif req["configKey"] == "emsdkPath":
+                found = find_emsdk(getattr(ns, "emsdk", None), workspace)
+            else:
+                found = None
+            if not found:
+                return _need_toolchain(req), extra
+        else:  # command
+            if not shutil.which(req["bin"], path=search_path):
+                return _need_toolchain(req), extra
+    return None, extra
+
+
+# --------------------------------------------------------------------------- #
 # Tree / port model
 # --------------------------------------------------------------------------- #
 
@@ -310,7 +538,8 @@ def build_tree(mp: Path) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
-# cmods / user modules discovery
+# User C-module discovery (the workspace is the micropython tree's parent — no
+# directory named "cmods" is required anywhere)
 # --------------------------------------------------------------------------- #
 
 def workspace_of(mp: Path) -> Path:
@@ -319,7 +548,7 @@ def workspace_of(mp: Path) -> Path:
 
 def discover_cmods(workspace: Path) -> dict:
     """Find user C modules (micropython.cmake / */micropython.mk) + manifest."""
-    cmods: list[dict] = []
+    modules: list[dict] = []
     seen: set[str] = set()
     try:
         for child in sorted(workspace.iterdir()):
@@ -331,7 +560,7 @@ def discover_cmods(workspace: Path) -> dict:
                 if child.name in seen:
                     continue
                 seen.add(child.name)
-                cmods.append(
+                modules.append(
                     {
                         "name": child.name,
                         "path": str(child),
@@ -345,7 +574,7 @@ def discover_cmods(workspace: Path) -> dict:
     manifest = (workspace / "manifest.py").is_file()
     return {
         "workspaceDir": str(workspace),
-        "cmods": cmods,
+        "modules": modules,
         "hasAggregator": aggregator,
         "hasManifest": manifest,
         "manifest": str(workspace / "manifest.py") if manifest else None,
@@ -392,7 +621,18 @@ def build_dir(port_dir: Path, kind: str, board: str, variant: str) -> Optional[P
     return port_dir / "build"
 
 
-ARTIFACT_NAMES = ["firmware.uf2", "firmware.bin", "firmware.hex", "micropython.bin", "micropython"]
+# Flashable artifacts first (esp32/rp2/samd), then the build-only host/wasm
+# outputs: unix -> "micropython", windows -> "micropython.exe", webassembly ->
+# "micropython.mjs" (its "micropython.wasm" companion lives beside it).
+ARTIFACT_NAMES = [
+    "firmware.uf2",
+    "firmware.bin",
+    "firmware.hex",
+    "micropython.bin",
+    "micropython.exe",
+    "micropython.mjs",
+    "micropython",
+]
 
 
 def find_artifact(bdir: Path) -> Optional[Path]:
@@ -416,14 +656,24 @@ def artifact_info(mp: Path, port: str, board: str, variant: str) -> dict:
     art = find_artifact(bdir) if bdir else None
     if art and art.is_file():
         st = art.stat()
-        return {
+        info = {
             "ready": True,
             "artifact": str(art),
             "size": st.st_size,
             "mtime": st.st_mtime,
             "buildDir": str(bdir),
         }
-    return {"ready": False, "artifact": None, "buildDir": str(bdir) if bdir else None}
+    else:
+        info = {
+            "ready": False,
+            "artifact": None,
+            "buildDir": str(bdir) if bdir else None,
+        }
+    # Surface the resolved default flash offset so the UI can pre-fill (and let
+    # the user override) it. esp32 only — other ports don't use an offset.
+    if port == "esp32":
+        info["flashOffset"] = esp32_flash_offset(port_dir, board)
+    return info
 
 
 # --------------------------------------------------------------------------- #
@@ -431,8 +681,11 @@ def artifact_info(mp: Path, port: str, board: str, variant: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 def partition_override_path(workspace: Path, board: str, variant: str) -> Path:
+    # Sibling of the micropython tree (workspace == micropython's parent). The
+    # build references this relative to ports/esp32 (../../../esp32_partitions/…),
+    # so no MicroPython file is edited — only this CSV is authored.
     name = board + (f"_{variant}" if variant else "")
-    return workspace / "mpftp-partitions" / "esp32" / f"{name}.csv"
+    return workspace / "esp32_partitions" / f"{name}.csv"
 
 
 # --------------------------------------------------------------------------- #
@@ -482,22 +735,40 @@ def do_build(ns: argparse.Namespace) -> None:
     env.pop("FROZEN_MANIFEST", None)
     env["PYTHONUNBUFFERED"] = "1"
 
+    # Resolve the port's toolchain(s) now (build time), not at panel open. A
+    # missing toolchain is reported as a structured needToolchain so the panel
+    # can prompt to locate it or open install instructions.
+    need, extra_bins = resolve_build_toolchains(port, ns, workspace)
+    if need:
+        emit_result(
+            False,
+            error=f"{need['label']} not found for the {port} build. {need['hint']}",
+            needToolchain=need,
+        )
+        return
+    if extra_bins:
+        env["PATH"] = os.pathsep.join(
+            [str(d) for d in extra_bins] + [env.get("PATH", "")]
+        )
+        emit_log(f"[mpftp] toolchain PATH += {os.pathsep.join(str(d) for d in extra_bins)}")
+
     make_args: list[str] = []
 
-    cmods = discover_cmods(workspace)
-    use_user_modules = cmods["hasAggregator"] or any(
-        c["kind"] == "make" for c in cmods["cmods"]
+    discovery = discover_cmods(workspace)
+    modules = discovery["modules"]
+    use_user_modules = discovery["hasAggregator"] or any(
+        m["kind"] == "make" for m in modules
     )
     if use_user_modules:
         make_args.append(f"USER_C_MODULES={workspace}")
         emit_log(f"[mpftp] USER_C_MODULES={workspace}")
-        if cmods["cmods"]:
-            names = ", ".join(c["name"] for c in cmods["cmods"])
+        if modules:
+            names = ", ".join(m["name"] for m in modules)
             emit_log(f"[mpftp] user C modules: {names}")
     else:
         emit_log("[mpftp] no workspace user C modules found; building vanilla")
 
-    if cmods["hasManifest"]:
+    if discovery["hasManifest"]:
         make_args.append(f"FROZEN_MANIFEST={workspace / 'manifest.py'}")
         upstream = resolve_upstream_frozen_manifest(port_dir, kind, board, variant)
         if upstream:
@@ -512,6 +783,13 @@ def do_build(ns: argparse.Namespace) -> None:
     elif kind == "variants":
         if variant:
             make_args.append(f"VARIANT={variant}")
+
+    # Windows is a cross-compile from Linux/WSL: force the MinGW-w64 toolchain so
+    # make doesn't fall back to host gcc (which fails on <windows.h>). The MinGW
+    # requirement was already resolved above, so the prefix is guaranteed present.
+    if port == "windows":
+        make_args.append("CROSS_COMPILE=x86_64-w64-mingw32-")
+        emit_log("[mpftp] CROSS_COMPILE=x86_64-w64-mingw32-")
 
     # Partition override (esp32): patch the build-dir sdkconfig after reconfigure.
     part_override = None
@@ -529,6 +807,14 @@ def do_build(ns: argparse.Namespace) -> None:
             emit_result(False, error="ESP-IDF not found. Set mpftp.idfPath or IDF_PATH.")
             return
         emit_log(f"[mpftp] ESP-IDF: {idf}")
+        mismatch = idf_version_mismatch(idf, port_dir)
+        if mismatch:
+            emit_result(
+                False,
+                error=f"{mismatch['label']}. {mismatch['hint']}",
+                needToolchain=mismatch,
+            )
+            return
         script_lines.append(f'. "{idf}/export.sh"')
     elif port == "webassembly":
         emsdk = find_emsdk(ns.emsdk, workspace)
@@ -537,6 +823,16 @@ def do_build(ns: argparse.Namespace) -> None:
             return
         emit_log(f"[mpftp] emsdk: {emsdk}")
         script_lines.append(f'. "{emsdk}/emsdk_env.sh"')
+        # The webassembly port appends -Werror after py.mk merges user-module
+        # flags, so CFLAGS_USERMOD/-Wno-* can't neutralize it and CFLAGS_EXTRA
+        # isn't consumed by this make-based port. emcc appends EMCC_CFLAGS after
+        # the port's own flags, so a port-scoped -Wno-error there lands last and
+        # relaxes the newer emsdk clang's warnings-as-errors (e.g. main.c
+        # unused-but-set-global, LVGL unused-function) without patching upstream.
+        werror_relief = "-Wno-error -Wno-unused-function -Wno-unused-but-set-variable"
+        existing_emcc = env.get("EMCC_CFLAGS", "").strip()
+        env["EMCC_CFLAGS"] = (existing_emcc + " " + werror_relief).strip()
+        emit_log(f"[mpftp] EMCC_CFLAGS={env['EMCC_CFLAGS']}")
 
     q_args = " ".join(_shq(a) for a in make_args)
 
@@ -548,25 +844,55 @@ def do_build(ns: argparse.Namespace) -> None:
     if ns.clean:
         script_lines.append(f'make {" ".join(j_arg)} clean {q_args}')
 
-    if part_override is not None:
-        # Reconfigure to create the build dir + sdkconfig, patch it, then build.
-        bdir = build_dir(port_dir, kind, board, variant)
-        script_lines.append(f'make {" ".join(j_arg)} submodules {q_args}')
-        emit_log("[mpftp] applying partition override to build sdkconfig")
+    submodules = f'make {" ".join(j_arg)} submodules {q_args}'
+    make_all = f'make {" ".join(j_arg)} all {q_args}'
+    bdir = build_dir(port_dir, kind, board, variant)
+
+    if port == "esp32":
+        # Prep first so the build dir + sdkconfig exist; that lets us patch a
+        # partition override and — if the build overflows the app partition —
+        # autosize the table and rebuild without touching any MicroPython file.
+        script_lines.append(submodules)
         _run_shell(script_lines, port_dir, env)  # run prep so build dir exists
-        if bdir:
+        if part_override is not None and bdir:
+            emit_log("[mpftp] applying partition override to build sdkconfig")
             _patch_sdkconfig_partition(bdir, part_override)
-        rc = _run_shell(
-            ["set -e", "set -o pipefail", *_env_prefix(port, ns, workspace),
-             f'make {" ".join(j_arg)} all {q_args}'],
-            port_dir, env,
-        )
+
+        all_lines = ["set -e", "set -o pipefail",
+                     *_env_prefix(port, ns, workspace), make_all]
+        rc, out = _run_shell_cap(all_lines, port_dir, env)
+
+        autosize = getattr(ns, "autosize", True)
+        if rc != 0 and autosize and bdir:
+            info = parse_partition_overflow(out)
+            if info:
+                override = partition_override_path(workspace, board, variant)
+                emit_log(
+                    f"[mpftp] autosize: image 0x{info['imageSize']:x} overflows "
+                    f"'{info.get('partName', 'app')}' partition — growing table "
+                    "and rebuilding once"
+                )
+                new_size = _autosize_regenerate_override(
+                    port_dir, override, board, variant, info
+                )
+                if new_size:
+                    emit_log(
+                        f"[mpftp] autosize: {override.name} app -> 0x{new_size:x}; "
+                        f"override at {override}"
+                    )
+                    _patch_sdkconfig_partition(bdir, override)
+                    emit_phase(
+                        "building",
+                        f"Autosized app → {new_size // 1024} KiB — rebuilding",
+                    )
+                    rc, out = _run_shell_cap(all_lines, port_dir, env)
+                else:
+                    emit_log("[mpftp] autosize: no app partition to resize; giving up")
         _finish_build(rc, mp, port, board, variant)
         return
 
-    script_lines.append(f'make {" ".join(j_arg)} submodules {q_args}')
-    script_lines.append(f'make {" ".join(j_arg)} all {q_args}')
-
+    script_lines.append(submodules)
+    script_lines.append(make_all)
     rc = _run_shell(script_lines, port_dir, env)
     _finish_build(rc, mp, port, board, variant)
 
@@ -602,6 +928,31 @@ def _run_shell(script_lines: list[str], cwd: Path, env: dict) -> int:
     return proc.returncode or 0
 
 
+def _run_shell_cap(script_lines: list[str], cwd: Path, env: dict) -> tuple[int, str]:
+    """Like ``_run_shell`` but also captures the streamed output as text.
+
+    Used for the esp32 ``make all`` pass so autosize can scan for the ESP-IDF
+    ``app partition is too small`` error and grow the partition.
+    """
+    script = "\n".join(script_lines)
+    proc = subprocess.Popen(
+        ["bash", "-c", script],
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout
+    captured: list[str] = []
+    for line in proc.stdout:
+        emit_log(line)
+        captured.append(line)
+    proc.wait()
+    return proc.returncode or 0, "".join(captured)
+
+
 def _finish_build(rc: int, mp: Path, port: str, board: str, variant: str) -> None:
     if rc != 0:
         emit_result(False, error=f"make failed (exit {rc})", returncode=rc)
@@ -616,24 +967,35 @@ def _finish_build(rc: int, mp: Path, port: str, board: str, variant: str) -> Non
 def _patch_sdkconfig_partition(
     bdir: Path, override_csv: Path, flash_mb: Optional[int] = None
 ) -> None:
-    """Point the esp32 build's sdkconfig at an absolute custom partition CSV.
+    """Point the esp32 build's sdkconfig at a custom partition CSV.
+
+    The CSV lives in the ``esp32_partitions`` sibling of the micropython tree and
+    is referenced *relative to the esp32 project dir* (``bdir.parent`` ==
+    ``ports/esp32``), e.g. ``../../../esp32_partitions/<board>.csv`` — no absolute
+    paths. ESP-IDF resolves ``CONFIG_PARTITION_TABLE_CUSTOM_FILENAME`` relative to
+    PROJECT_DIR, so this points the build at the sibling CSV without editing any
+    MicroPython file (only the build-dir sdkconfig is touched).
 
     Optionally set ``CONFIG_ESPTOOLPY_FLASHSIZE_*`` (from Detect/autoset) and
-    append a companion ``.sdkconfig`` fragment saved beside the CSV. Only the
-    build-dir sdkconfig is touched — never files under ``ports/**``.
+    append a companion ``.sdkconfig`` fragment saved beside the CSV.
     """
     sdk = bdir / "sdkconfig"
     try:
         lines = sdk.read_text("utf-8").splitlines() if sdk.is_file() else []
     except Exception:
         lines = []
+    # Relative to ports/esp32 (the idf PROJECT_DIR); posix so cmake is happy.
+    try:
+        rel = Path(os.path.relpath(override_csv, bdir.parent)).as_posix()
+    except Exception:
+        rel = str(override_csv)
     drop = ["CONFIG_PARTITION_TABLE_CUSTOM", "CONFIG_PARTITION_TABLE_FILENAME"]
     if flash_mb:
         drop.append("CONFIG_ESPTOOLPY_FLASHSIZE")
     filtered = [ln for ln in lines if not ln.startswith(tuple(drop))]
     filtered.append("CONFIG_PARTITION_TABLE_CUSTOM=y")
-    filtered.append(f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{override_csv}"')
-    filtered.append(f'CONFIG_PARTITION_TABLE_FILENAME="{override_csv}"')
+    filtered.append(f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{rel}"')
+    filtered.append(f'CONFIG_PARTITION_TABLE_FILENAME="{rel}"')
     if flash_mb:
         filtered.append(f'CONFIG_ESPTOOLPY_FLASHSIZE="{flash_mb}MB"')
         filtered.append(f"CONFIG_ESPTOOLPY_FLASHSIZE_{flash_mb}MB=y")
@@ -686,15 +1048,41 @@ def do_clean(ns: argparse.Namespace) -> None:
 # Flash
 # --------------------------------------------------------------------------- #
 
+# Second-stage bootloader offset in flash by chip family. The merged
+# firmware.bin starts at the bootloader, so this is where it is written when a
+# board.json does not spell out deploy_options.flash_offset.
+_BOOTLOADER_OFFSET_BY_MCU = {
+    "esp32": "0x1000",
+    "esp32s2": "0x1000",
+    "esp32s3": "0x0",
+    "esp32c2": "0x0",
+    "esp32c3": "0x0",
+    "esp32c5": "0x0",
+    "esp32c6": "0x0",
+    "esp32h2": "0x0",
+    "esp32p4": "0x2000",
+}
+
+
 def esp32_flash_offset(port_dir: Path, board: str) -> str:
+    """Resolve the esp32 flash offset for ``board``.
+
+    Prefers ``board.json``'s ``deploy_options.flash_offset``; when that is
+    absent, infers the bootloader offset from the chip family (``board.json``
+    ``mcu``) — classic/S2 at 0x1000, P4 at 0x2000, newer parts at 0x0.
+    """
     if not board:
         return "0x0"
     bj = port_dir / "boards" / board / "board.json"
     try:
         data = json.loads(bj.read_text("utf-8"))
-        return str(data.get("deploy_options", {}).get("flash_offset", "0x0"))
     except Exception:
         return "0x0"
+    explicit = data.get("deploy_options", {}).get("flash_offset")
+    if explicit:
+        return str(explicit)
+    mcu = str(data.get("mcu", "")).lower()
+    return _BOOTLOADER_OFFSET_BY_MCU.get(mcu, "0x0")
 
 
 def _wslpath_w(p: str) -> str:
@@ -730,21 +1118,86 @@ def _esptool_cmd(ns: argparse.Namespace) -> list[str]:
     return [sys.executable, "-m", "esptool"]
 
 
+# Standard esp32 partition-table offset (CONFIG_PARTITION_TABLE_OFFSET).
+_PARTITION_TABLE_OFFSET = 0x8000
+
+
+def _read_device_partition_table(base: list[str], nbytes: int) -> Optional[bytes]:
+    """Read the on-device partition-table region, or None if it can't be read.
+
+    The read runs through the same esptool as the flash (Windows esptool under
+    WSL), writing to a temp file whose path is translated for that host.
+    """
+    import tempfile
+    tmp = Path(tempfile.gettempdir()) / f"mpftp_pt_{os.getpid()}.bin"
+    out_arg = _wslpath_w(str(tmp)) if HOST == "wsl" else str(tmp)
+    cmd = base + ["--before", "default_reset", "--after", "no_reset",
+                  "read_flash", hex(_PARTITION_TABLE_OFFSET), hex(nbytes), out_arg]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 or not tmp.is_file():
+            return None
+        return tmp.read_bytes()
+    except Exception:
+        return None
+    finally:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+
+def _esp32_layout_changed(base: list[str], artifact: Path) -> Optional[bool]:
+    """Does the device's partition table differ from the one we're about to flash?
+
+    Returns True if it changed (erase needed to avoid a stale filesystem at the
+    moved vfs offset), False if identical, or None if it couldn't be determined.
+    """
+    new_pt = artifact.parent / "partition_table" / "partition-table.bin"
+    if not new_pt.is_file():
+        return None
+    try:
+        want = new_pt.read_bytes()
+    except Exception:
+        return None
+    got = _read_device_partition_table(base, len(want))
+    if got is None:
+        return None
+    return got[: len(want)] != want
+
+
 def flash_esp32(ns: argparse.Namespace, mp: Path, artifact: Path) -> None:
     port_dir = mp / "ports" / ns.port
-    offset = esp32_flash_offset(port_dir, ns.board or "")
+    offset = (getattr(ns, "offset", "") or "").strip() or esp32_flash_offset(
+        port_dir, ns.board or ""
+    )
+    emit_log(f"[mpftp] flash offset {offset}")
     fw = str(artifact)
     if HOST == "wsl":
         fw = _wslpath_w(fw)
     cmd = _esptool_cmd(ns)
     base = cmd + ["-b", str(ns.baud or 460800), "-p", ns.device]
-    if getattr(ns, "erase", False):
+
+    erase = getattr(ns, "erase", False)
+    if not erase:
+        # Auto-erase when the partition layout changed since the last flash: a
+        # moved vfs/storage offset leaves a stale filesystem that boots corrupt.
+        changed = _esp32_layout_changed(base, artifact)
+        if changed:
+            emit_log("[mpftp] partition layout changed on device — erasing flash first")
+            erase = True
+        elif changed is None:
+            emit_log("[mpftp] could not read on-device partition table; skipping pre-erase")
+
+    if erase:
         emit_log("[mpftp] erasing flash…")
         rc = stream_process(base + ["erase_flash"], Path.cwd(), dict(os.environ))
         if rc != 0:
             emit_result(False, error=f"erase_flash failed (exit {rc})")
             return
-    full = base + ["--before", "default_reset", "--after", "hard_reset",
+    before = getattr(ns, "before", "") or "default_reset"
+    after = getattr(ns, "after", "") or "hard_reset"
+    full = base + ["--before", before, "--after", after,
                    "write_flash", offset, fw]
     rc = stream_process(full, Path.cwd(), dict(os.environ))
     if rc != 0:
@@ -1058,6 +1511,93 @@ def validate_partitions(rows: list[dict]) -> list[str]:
     return warnings
 
 
+# --------------------------------------------------------------------------- #
+# Autosize (esp32): grow the app partition to fit an overflowing build
+# --------------------------------------------------------------------------- #
+
+# ESP-IDF check_sizes.py failure, e.g.:
+#   Error: app partition is too small for binary micropython.bin size 0x2a4e60:
+#     - Part 'factory' 0/0 @ 0x10000 size 0x1f0000 (overflow 0xb4e60)
+_OVERFLOW_IMG_RE = re.compile(
+    r"app partition is too small for binary \S+ size (0x[0-9a-fA-F]+)"
+)
+_OVERFLOW_PART_RE = re.compile(
+    r"Part '([^']+)'.*?@\s*(0x[0-9a-fA-F]+)\s+size\s+(0x[0-9a-fA-F]+)"
+    r"\s+\(overflow\s+(0x[0-9a-fA-F]+)\)"
+)
+
+_APP_ALIGN = 0x10000   # app partitions must start on a 64 KiB boundary
+_APP_HEADROOM = 0x40000  # 256 KiB slack so a slightly larger next build still fits
+
+
+def parse_partition_overflow(text: str) -> Optional[dict]:
+    """Parse an ESP-IDF app-partition-too-small error, or None if not present."""
+    img = _OVERFLOW_IMG_RE.search(text or "")
+    if not img:
+        return None
+    out: dict = {"imageSize": int(img.group(1), 16)}
+    part = _OVERFLOW_PART_RE.search(text)
+    if part:
+        out.update(
+            partName=part.group(1),
+            partOffset=int(part.group(2), 16),
+            partSize=int(part.group(3), 16),
+            overflow=int(part.group(4), 16),
+        )
+    return out
+
+
+def autosize_app_partition_size(image_size: int) -> int:
+    """Smallest 64 KiB-aligned app size that fits ``image_size`` plus headroom."""
+    required = (image_size + _APP_ALIGN - 1) & ~(_APP_ALIGN - 1)
+    return (required + _APP_HEADROOM + _APP_ALIGN - 1) & ~(_APP_ALIGN - 1)
+
+
+def resize_app_partition(rows: list[dict], part_name: str, new_size: int) -> Optional[list[dict]]:
+    """Grow the named (or first) app partition to ``new_size`` and reflow the rest.
+
+    Returns the new rows, or None if no app partition is present.
+    """
+    rows = [dict(r) for r in rows]
+    idx = next((i for i, r in enumerate(rows) if r.get("name") == part_name), None)
+    if idx is None:
+        idx = next((i for i, r in enumerate(rows) if r.get("type") == "app"), None)
+    if idx is None:
+        return None
+    rows[idx]["size"] = _fmt_hex(new_size)
+    _reflow_offsets(rows, idx + 1)  # keep app offset; push later partitions up
+    return rows
+
+
+def _autosize_regenerate_override(
+    port_dir: Path,
+    override: Path,
+    board: str,
+    variant: str,
+    info: dict,
+) -> Optional[int]:
+    """Write a grown partition CSV to the sibling override path.
+
+    Base table is the current override (if any) else the stock CSV. Returns the
+    new app size on success, or None if the table couldn't be resized.
+    """
+    if override.is_file():
+        base_text = override.read_text("utf-8")
+    else:
+        stock = _sdkconfig_partition_csv(port_dir, board, variant)
+        if not stock:
+            return None
+        base_text = stock.read_text("utf-8")
+    rows = parse_partitions_csv(base_text)
+    new_size = autosize_app_partition_size(int(info["imageSize"]))
+    resized = resize_app_partition(rows, info.get("partName", "factory"), new_size)
+    if resized is None:
+        return None
+    override.parent.mkdir(parents=True, exist_ok=True)
+    override.write_text(rows_to_csv(resized), encoding="utf-8")
+    return new_size
+
+
 def do_partitions(ns: argparse.Namespace) -> None:
     mp = Path(ns.mp).expanduser().resolve()
     workspace = workspace_of(mp)
@@ -1261,15 +1801,22 @@ def parse_esptool_flash_id(text: str) -> dict:
         "crystalMhz": None,
         "mac": "",
         "flashMb": None,
-        "psram": {"present": False, "octal": False, "label": ""},
+        "psram": {"present": False, "octal": False, "label": "", "sizeMb": None},
         "usbMode": "",
     }
-    m = re.search(r"Chip is (.+?)(?: \(QFN\d+\))? \(revision (v?[^)]+)\)", text)
+    # esptool v5: "Chip type:  ESP32-P4 (revision v1.3)";
+    # esptool v4: "Chip is ESP32-P4 (revision v1.3)".
+    m = re.search(
+        r"Chip (?:is|type:)\s+(.+?)(?: \(QFN\d+\))? \(revision (v?[^)]+)\)", text
+    )
     if m:
         out["chip"] = m.group(1).strip()
         out["revision"] = m.group(2).strip()
     else:
-        m2 = re.search(r"Chip is (ESP32\S*)", text)
+        m2 = re.search(
+            r"(?:Chip (?:is|type:)\s+|Connected to\s+|Detecting chip type\W+)(ESP32\S*)",
+            text,
+        )
         if m2:
             out["chip"] = m2.group(1).strip()
     fm = re.search(r"Features:\s*(.+)", text)
@@ -1292,7 +1839,14 @@ def parse_esptool_flash_id(text: str) -> dict:
                 out["psram"]["label"] = f
                 if "octal" in low:
                     out["psram"]["octal"] = True
-    cm = re.search(r"Crystal is (\d+)\s*MHz", text)
+                # Embedded-PSRAM chips report size in the feature line, e.g.
+                # "Embedded PSRAM 2MB". External (S3/P4) PSRAM usually omits it —
+                # the MicroPython runtime probe fills that in when available.
+                ps = re.search(r"(\d+)\s*MB", f)
+                if ps:
+                    out["psram"]["sizeMb"] = int(ps.group(1))
+    # v4: "Crystal is 40 MHz"; v5: "Crystal frequency:  40MHz".
+    cm = re.search(r"Crystal (?:is|frequency:)\s*(\d+)\s*MHz", text)
     if cm:
         out["crystalMhz"] = int(cm.group(1))
     mac = re.search(r"MAC:\s*([0-9a-fA-F:]{17})", text)
@@ -1303,6 +1857,8 @@ def parse_esptool_flash_id(text: str) -> dict:
         out["flashMb"] = int(fl.group(1))
     if "USB-Serial/JTAG" in text:
         out["usbMode"] = "USB-Serial/JTAG"
+    elif "USB-OTG" in text:
+        out["usbMode"] = "USB-OTG"
     return out
 
 
@@ -1536,7 +2092,9 @@ def do_detect(ns: argparse.Namespace) -> None:
         "crystalMhz": flash.get("crystalMhz"),
         "mac": flash.get("mac", ""),
         "flashMb": flash_mb,
-        "psram": flash.get("psram", {"present": False, "octal": False, "label": ""}),
+        "psram": flash.get(
+            "psram", {"present": False, "octal": False, "label": "", "sizeMb": None}
+        ),
         "sramKb": spec["sramKb"],
         "security": sec,
         "match": match,
@@ -1565,16 +2123,14 @@ def do_detect(ns: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 
 def do_discover(ns: argparse.Namespace) -> None:
+    # Toolchains (ESP-IDF/emsdk/cross-gcc) are resolved at build time, not here.
+    # Discovery only reports the MicroPython tree, its workspace, and the host.
     mp = find_micropython(ns.mp)
     workspace = workspace_of(mp) if mp else None
-    idf = find_idf(ns.idf, workspace)
-    emsdk = find_emsdk(ns.emsdk, workspace)
     result = {
         "host": HOST,
         "micropython": str(mp) if mp else None,
         "workspace": str(workspace) if workspace else None,
-        "idf": str(idf) if idf else None,
-        "emsdk": str(emsdk) if emsdk else None,
         "state": load_state(),
     }
     if mp:
@@ -1599,7 +2155,7 @@ def do_tree(ns: argparse.Namespace) -> None:
 def do_cmods(ns: argparse.Namespace) -> None:
     mp = Path(ns.mp).expanduser().resolve() if ns.mp else find_micropython(None)
     if not mp:
-        print_json({"error": "MicroPython tree not found", "cmods": []})
+        print_json({"error": "MicroPython tree not found", "modules": []})
         return
     print_json(discover_cmods(workspace_of(mp)))
 
@@ -1621,6 +2177,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--mp", default=None, required=required, help="MicroPython tree path")
         sp.add_argument("--idf", default=None, help="ESP-IDF path")
         sp.add_argument("--emsdk", default=None, help="emsdk path")
+        sp.add_argument(
+            "--toolchain-bins",
+            default="",
+            help="os.pathsep-joined cross-toolchain bin dirs prepended to the build PATH",
+        )
 
     d = sub.add_parser("discover")
     add_mp(d)
@@ -1648,6 +2209,8 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--variant", default="")
     b.add_argument("--clean", action="store_true")
     b.add_argument("--jobs", type=int, default=0)
+    b.add_argument("--no-autosize", dest="autosize", action="store_false", default=True,
+                   help="disable esp32 partition autosize-on-overflow (grow app + rebuild once)")
     b.set_defaults(func=do_build)
 
     cl = sub.add_parser("clean")
@@ -1665,7 +2228,15 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--device", default="")
     f.add_argument("--artifact", default="")
     f.add_argument("--baud", type=int, default=460800)
+    f.add_argument("--offset", default="",
+                   help="esp32 flash offset override (default: board.json / chip family)")
     f.add_argument("--erase", action="store_true")
+    f.add_argument("--before", default="default_reset",
+                   choices=["default_reset", "no_reset", "usb_reset"],
+                   help="esp32 reset mode before flashing")
+    f.add_argument("--after", default="hard_reset",
+                   choices=["hard_reset", "soft_reset", "no_reset"],
+                   help="esp32 reset mode after flashing")
     f.add_argument("--esptool", default=None, help="esptool interpreter/executable")
     f.set_defaults(func=do_flash)
 
