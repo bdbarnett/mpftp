@@ -63,13 +63,18 @@ Useful commands:
 
 | Command | Action |
 |--------|--------|
-| `mpftp: Connect to Board` | Port picker / disconnect menu |
+| `mpftp: Connect to Board` | Port picker; always interrupts and raw soft-resets so `main.py` is not left running |
 | `mpftp: Resume Last Device` | Reconnect previous COM port |
-| `mpftp: Open File Browser` | Focus FTP view |
+| `mpftp: Open File Browser in Sidebar` | Focus the sidebar FTP view |
+| `mpftp: Open File Browser in Editor` | Open Board Files as an editor tab (default workflow) |
 | `mpftp: Edit Board File` | Pull → edit → save back |
 | `mpftp: Open REPL` | ANSI REPL terminal |
-| `mpftp: Run Current File on Board` | exec buffer via raw REPL |
-| `mpftp: Soft Reset` / `Hard Reset` | reset (hard reset auto-reconnects by default) |
+| `mpftp: Interrupt (Ctrl+C)` | stop a running program without resetting |
+| `mpftp: Soft Reset (skip main.py)` | fresh heap via raw soft-reset; does **not** run `main.py` |
+| `mpftp: Hard Reset` | hardware reset (auto-reconnects by default; cancellable) |
+| `mpftp: Run Current File on Board` | editor **Run** play menu + ⋯ menu; interrupt/soft-reset, exec buffer, open **REPL** (for prints/`input()`) |
+| Board file → **Run on board** | right-click in Board Files; runs the file already on the device |
+| Local `.py` → **Upload & Run** | right-click in Board Files; upload to current board folder, then run |
 | `mpftp: mip Install Package` | Host-side mip install onto the board |
 
 ## Settings

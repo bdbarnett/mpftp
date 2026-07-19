@@ -123,10 +123,22 @@
       ctxMenu.appendChild(btn);
     }
     ctxMenu.hidden = false;
+    // Measure after show; clamp into the viewport and keep a scrollable menu
+    // when the list is taller than the webview (⋯ commands, long context menus).
     const pad = 4;
+    const maxW = window.innerWidth - pad * 2;
+    const maxH = window.innerHeight - pad * 2;
+    ctxMenu.style.maxWidth = maxW + "px";
+    ctxMenu.style.maxHeight = maxH + "px";
     const rect = ctxMenu.getBoundingClientRect();
-    const left = Math.min(x, window.innerWidth - rect.width - pad);
-    const top = Math.min(y, window.innerHeight - rect.height - pad);
+    let left = x;
+    let top = y;
+    if (left + rect.width > window.innerWidth - pad) {
+      left = window.innerWidth - rect.width - pad;
+    }
+    if (top + rect.height > window.innerHeight - pad) {
+      top = window.innerHeight - rect.height - pad;
+    }
     ctxMenu.style.left = Math.max(pad, left) + "px";
     ctxMenu.style.top = Math.max(pad, top) + "px";
   }
@@ -190,11 +202,30 @@
             vscode.postMessage({ type: "localCd", path: joinLocal(state.localPath, entry.name) }),
         });
       }
-      items.push({
-        label: "Upload",
-        disabled: !state.connected,
-        action: doUpload,
-      });
+      if (!entry.isDir) {
+        items.push({
+          label: "Upload",
+          disabled: !state.connected,
+          action: doUpload,
+        });
+        if (/\.py$/i.test(entry.name || "")) {
+          items.push({
+            label: "Upload & Run",
+            disabled: !state.connected,
+            action: () =>
+              vscode.postMessage({
+                type: "uploadAndRun",
+                localPath: joinLocal(state.localPath, entry.name),
+              }),
+          });
+        }
+      } else {
+        items.push({
+          label: "Upload",
+          disabled: !state.connected,
+          action: doUpload,
+        });
+      }
       items.push({
         label: "Rename",
         action: () =>
@@ -249,7 +280,7 @@
         });
         if (/\.py$/i.test(entry.name || "")) {
           items.push({
-            label: "Run",
+            label: "Run on board",
             disabled: !state.connected,
             action: () =>
               vscode.postMessage({
@@ -464,15 +495,16 @@
     { command: "mpftp.connect", title: "Connect to Board" },
     { command: "mpftp.disconnect", title: "Disconnect", needsConnected: true },
     { command: "mpftp.resume", title: "Resume Last Device" },
-    { command: "mpftp.openFtp", title: "Open File Browser" },
+    { command: "mpftp.openFtp", title: "Open File Browser in Sidebar" },
     { command: "mpftp.openFtpEditor", title: "Open File Browser in Editor" },
     { command: "mpftp.openRepl", title: "Open REPL" },
+    { command: "mpftp.interrupt", title: "Interrupt (Ctrl+C)", needsConnected: true },
+    { command: "mpftp.softReset", title: "Soft Reset (skip main.py)", needsConnected: true },
+    { command: "mpftp.hardReset", title: "Hard Reset", needsConnected: true },
+    { command: "mpftp.runFile", title: "Run Current File on Board", needsConnected: true },
     { command: "mpftp.openFirmware", title: "Build & Flash Firmware…" },
     { command: "mpftp.editRemote", title: "Edit Board File", needsConnected: true },
-    { command: "mpftp.softReset", title: "Soft Reset", needsConnected: true },
-    { command: "mpftp.hardReset", title: "Hard Reset", needsConnected: true },
     { command: "mpftp.bootloader", title: "Enter Bootloader", needsConnected: true },
-    { command: "mpftp.runFile", title: "Run Current File on Board", needsConnected: true },
     { command: "mpftp.eval", title: "Eval Expression", needsConnected: true },
     { command: "mpftp.exec", title: "Exec Code", needsConnected: true },
     { command: "mpftp.rtcGet", title: "Get RTC", needsConnected: true },

@@ -408,6 +408,10 @@ button:disabled {
   position: fixed;
   z-index: 1000;
   min-width: 180px;
+  max-width: min(360px, calc(100vw - 8px));
+  max-height: min(70vh, calc(100vh - 8px));
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 4px 0;
   background: var(--vscode-menu-background, #252526);
   color: var(--vscode-menu-foreground, var(--fg));

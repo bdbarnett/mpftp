@@ -259,9 +259,15 @@ export class SidecarBridge extends EventEmitter {
 
   /**
    * After hard-reset / disconnect, wait for the previous COM port and reconnect.
+   * Connect always interrupts (and raw soft-resets) so main.py is not left running.
    */
   async reconnectAfterReset(
-    opts: { attempts?: number; delayMs?: number; device?: string } = {}
+    opts: {
+      attempts?: number;
+      delayMs?: number;
+      device?: string;
+      token?: vscode.CancellationToken;
+    } = {}
   ): Promise<boolean> {
     const device = opts.device || this._lastDevice;
     if (!device) {
@@ -271,7 +277,15 @@ export class SidecarBridge extends EventEmitter {
     const delayMs = opts.delayMs ?? 1000;
     await this.disconnect().catch(() => undefined);
     for (let i = 0; i < attempts; i++) {
+      if (opts.token?.isCancellationRequested) {
+        this.log.appendLine("reconnect cancelled");
+        return false;
+      }
       await new Promise((r) => setTimeout(r, delayMs));
+      if (opts.token?.isCancellationRequested) {
+        this.log.appendLine("reconnect cancelled");
+        return false;
+      }
       try {
         const ports = await this.listPorts();
         if (!ports.some((p) => p.device === device)) {

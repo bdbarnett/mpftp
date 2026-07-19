@@ -15,6 +15,7 @@ Examples:
   mpftp get /main.py ./main.py
   mpftp eval '1+1'
   mpftp exec 'print(42)'
+  mpftp interrupt
   mpftp soft-reset
   mpftp watch          # tail activity log
 """
@@ -564,6 +565,16 @@ def cmd_run(ns: argparse.Namespace) -> None:
             client.close()
 
 
+def cmd_interrupt(ns: argparse.Namespace) -> None:
+    client, mode = get_client()
+    try:
+        ensure_device(client, ns.device, ns.baud)
+        out(client.call("interrupt"))
+    finally:
+        if mode.startswith("sidecar"):
+            client.close()
+
+
 def cmd_soft_reset(ns: argparse.Namespace) -> None:
     client, mode = get_client()
     try:
@@ -941,7 +952,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("file")
     run.set_defaults(func=cmd_run)
 
-    sub.add_parser("soft-reset", parents=[device_opts], help="Soft reset").set_defaults(func=cmd_soft_reset)
+    sub.add_parser(
+        "interrupt",
+        parents=[device_opts],
+        help="Send Ctrl-C (interrupt running program; no reset)",
+    ).set_defaults(func=cmd_interrupt)
+    sub.add_parser(
+        "soft-reset",
+        parents=[device_opts],
+        help="Soft reset via raw REPL (fresh heap; does not run main.py)",
+    ).set_defaults(func=cmd_soft_reset)
     sub.add_parser("hard-reset", parents=[device_opts], help="Hard reset").set_defaults(func=cmd_hard_reset)
     sub.add_parser("bootloader", parents=[device_opts], help="Enter bootloader").set_defaults(
         func=cmd_bootloader

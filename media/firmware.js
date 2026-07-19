@@ -82,18 +82,24 @@
 
   function renderHeader() {
     const h = el("header", "hdr");
-    const left = el("div", "hdr-left");
+
+    const top = el("div", "hdr-top");
     const brand = el("div", "brand");
     brand.appendChild(el("span", "brand-mark", "mpftp"));
     brand.appendChild(el("span", "brand-title", "Firmware"));
-    left.appendChild(brand);
-    left.appendChild(
+    top.appendChild(brand);
+    const meta = el("div", "meta-row");
+    meta.appendChild(el("span", "hdr-label", "Environment"));
+    meta.appendChild(
+      pill(model.host, "ok", "Host platform running the build (" + model.host + ")")
+    );
+    top.appendChild(meta);
+    h.appendChild(top);
+
+    const below = el("div", "hdr-below");
+    below.appendChild(
       el("p", "subtitle", "Build MicroPython once, then flash one or many boards.")
     );
-    h.appendChild(left);
-
-    const right = el("div", "hdr-right");
-
     const pathRow = el("div", "path-row");
     pathRow.appendChild(el("span", "hdr-label", "MicroPython repo"));
     const icon = el("i", "codicon codicon-repo");
@@ -104,15 +110,8 @@
     const change = el("button", "btn ghost sm", "Change…");
     change.onclick = () => vscode.postMessage({ type: "changePath" });
     pathRow.appendChild(change);
-    right.appendChild(pathRow);
-
-    const meta = el("div", "meta-row");
-    meta.appendChild(el("span", "hdr-label", "Environment"));
-    meta.appendChild(
-      pill(model.host, "muted", "Host platform running the build (" + model.host + ")")
-    );
-    right.appendChild(meta);
-    h.appendChild(right);
+    below.appendChild(pathRow);
+    h.appendChild(below);
     return h;
   }
 

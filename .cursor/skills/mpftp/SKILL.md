@@ -45,7 +45,7 @@ tail -f ~/.mpftp/activity.log
 
 ```bash
 ./scripts/mpftp ports
-./scripts/mpftp connect COM4       # probes MicroPython + sets RTC
+./scripts/mpftp connect COM4       # interrupt + raw soft-reset (skip main.py) + RTC
 ./scripts/mpftp resume             # reconnect last device
 ./scripts/mpftp ls /
 ./scripts/mpftp tree /
@@ -63,7 +63,8 @@ tail -f ~/.mpftp/activity.log
 ./scripts/mpftp eval '1+1'
 ./scripts/mpftp exec 'print(42)'
 ./scripts/mpftp run ./script.py
-./scripts/mpftp soft-reset
+./scripts/mpftp interrupt              # Ctrl-C; no reset
+./scripts/mpftp soft-reset             # raw soft-reset; does not run main.py
 ./scripts/mpftp hard-reset
 ./scripts/mpftp bootloader
 ./scripts/mpftp rtc

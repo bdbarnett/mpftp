@@ -39,12 +39,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const connectCommand = async (): Promise<void> => {
     if (bridge.connected) {
+      // Labels match package.json / ⋯ menu (without the "mpftp: " prefix).
       const choice = await vscode.window.showQuickPick(
         [
           { label: "Disconnect", id: "disconnect" },
           { label: "Open REPL", id: "repl" },
-          { label: "Open file browser", id: "ftp" },
-          { label: "Open file browser in editor", id: "ftpEditor" },
+          { label: "Open File Browser in Sidebar", id: "ftp" },
+          { label: "Open File Browser in Editor", id: "ftpEditor" },
         ],
         { title: `Connected to ${bridge.connectedDevice}` }
       );
@@ -185,12 +186,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         `mpftp agent RPC: ${info.rpc}` + (info.connected ? ` · ${info.device}` : " · not connected")
       );
     }),
+    vscode.commands.registerCommand("mpftp.interrupt", async () => {
+      if (!(await ensureConnected())) {
+        return;
+      }
+      await bridge.request("interrupt");
+      void vscode.window.showInformationMessage("Interrupt (Ctrl+C) sent");
+    }),
     vscode.commands.registerCommand("mpftp.softReset", async () => {
       if (!(await ensureConnected())) {
         return;
       }
       await bridge.request("soft_reset");
-      void vscode.window.showInformationMessage("Soft reset sent");
+      void vscode.window.showInformationMessage("Soft reset sent (main.py not run)");
     }),
     vscode.commands.registerCommand("mpftp.hardReset", async () => {
       if (!(await ensureConnected())) {
@@ -213,11 +221,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           {
             location: vscode.ProgressLocation.Notification,
             title: `mpftp: waiting to reconnect ${device}…`,
+            cancellable: true,
           },
-          async () => {
-            const ok = await bridge.reconnectAfterReset({ device });
+          async (_progress, token) => {
+            const ok = await bridge.reconnectAfterReset({ device, token });
             updateStatus();
-            if (ok) {
+            if (token.isCancellationRequested) {
+              void vscode.window.showInformationMessage(
+                "Reconnect cancelled — use Resume or Connect when ready"
+              );
+            } else if (ok) {
               void vscode.window.showInformationMessage(`mpftp reconnected: ${device}`);
             } else {
               void vscode.window.showWarningMessage(
@@ -255,12 +268,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       const ed = vscode.window.activeTextEditor;
       if (!ed) {
+        void vscode.window.showWarningMessage("mpftp: open a .py file to run");
         return;
       }
       const source = ed.document.getText();
-      const res = await bridge.request<{ output: string }>("run_script", { source, follow: true });
-      log.appendLine(res.output || "");
-      log.show(true);
+      // follow=false: leave UART free for prints and input(); same as Board Files → Run.
+      await bridge.request("run_script", { source, follow: false });
+      openRepl(bridge, activity);
     }),
     vscode.commands.registerCommand("mpftp.eval", async () => {
       if (!(await ensureConnected())) {

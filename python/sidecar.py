@@ -347,17 +347,80 @@ class Session:
         t.exec(f"import machine; machine.RTC().datetime({tup})")
         return list(tup)
 
-    def _probe_micropython(self, t: Any) -> Optional[list[int]]:
-        """Prove MicroPython via raw REPL, set RTC from the host, then leave raw REPL."""
-        from mpremote.transport import TransportError
-
+    @staticmethod
+    def _serial_flush(serial: Any) -> None:
         try:
-            # soft_reset=False: don't reboot; still requires the raw-REPL banner.
-            t.enter_raw_repl(soft_reset=False, timeout_overall=5)
-        except TransportError as e:
-            raise RuntimeError(str(e.args[0] if e.args else e)) from e
-        except Exception as e:
-            raise RuntimeError(str(e)) from e
+            n = serial.inWaiting()
+            while n > 0:
+                serial.read(n)
+                n = serial.inWaiting()
+        except Exception:
+            pass
+
+    def _take_control(
+        self, t: Any, *, clean: bool = True, timeout_overall: float = 20.0
+    ) -> None:
+        """Interrupt any running program and enter raw REPL.
+
+        Always sends Ctrl-C (Thonny-style interrupt-on-connect). When ``clean``
+        is True, soft-resets *while in raw REPL* so ``main.py`` does not run
+        (MicroPython skips auto-start after a raw soft-reset).
+        """
+        import time
+
+        serial = getattr(t, "serial", None)
+        if serial is None:
+            raise RuntimeError("transport has no serial port")
+
+        def ctrl_c() -> None:
+            try:
+                serial.write(b"\r\x03")
+            except Exception:
+                pass
+
+        # Thorough interrupt before raw mode (see micropython#7867 / Thonny pipkin).
+        for delay in (0.0, 0.1, 0.1, 0.2):
+            if delay:
+                time.sleep(delay)
+            ctrl_c()
+        time.sleep(0.05)
+        self._serial_flush(serial)
+
+        last_err: Optional[Exception] = None
+        attempts = 4
+        per = max(5.0, float(timeout_overall) / attempts)
+        for attempt in range(attempts):
+            try:
+                t.enter_raw_repl(soft_reset=clean, timeout_overall=per)
+                return
+            except Exception as e:
+                last_err = e
+                try:
+                    t.in_raw_repl = False
+                except Exception:
+                    pass
+                ctrl_c()
+                ctrl_c()
+                time.sleep(0.15 + 0.1 * attempt)
+                self._serial_flush(serial)
+                try:
+                    serial.write(b"\r\x01")  # poke raw REPL (Thonny)
+                except Exception:
+                    pass
+                time.sleep(0.1)
+
+        detail = str(last_err.args[0] if last_err and getattr(last_err, "args", None) else last_err)
+        raise RuntimeError(
+            f"could not take control of MicroPython (interrupt/raw REPL failed): {detail}"
+        ) from last_err
+
+    def _probe_micropython(self, t: Any) -> Optional[list[int]]:
+        """Take control (interrupt + raw soft-reset), set RTC, leave raw REPL.
+
+        Connect never leaves ``main.py`` running: interrupt is unconditional and
+        the raw soft-reset refreshes the heap without auto-starting main.
+        """
+        self._take_control(t, clean=True, timeout_overall=20.0)
         rtc: Optional[list[int]] = None
         try:
             rtc = self._apply_rtc(t)
@@ -600,15 +663,49 @@ class Session:
         return self.with_raw(op)
 
     def run_script(self, source: str, follow: bool = True) -> dict[str, Any]:
-        return self.exec(source, follow=follow)
+        """Run source on the board after interrupt + raw soft-reset (skip main.py)."""
+        with self._lock:
+            t = self._require()
+            self._stop_repl_reader()
+            self._take_control(t, clean=True, timeout_overall=20.0)
+            try:
+                if follow:
+                    out = t.exec(source)
+                    if out is None:
+                        text = ""
+                    elif isinstance(out, bytes):
+                        text = out.decode("utf-8", "replace")
+                    else:
+                        text = str(out)
+                    return {"output": text}
+                t.exec_raw_no_follow(source.encode())
+                try:
+                    if t.in_raw_repl:
+                        t.exit_raw_repl()
+                except Exception:
+                    pass
+                if self._repl_mode:
+                    self._start_repl_reader()
+                return {"output": ""}
+            except Exception:
+                if self._repl_mode:
+                    try:
+                        if self.transport and self.transport.in_raw_repl:
+                            self.transport.exit_raw_repl()
+                    except Exception:
+                        pass
+                    self._start_repl_reader()
+                raise
 
     def run_path(self, path: str, follow: bool = False) -> dict[str, Any]:
         """
         Run a .py file already on the board.
 
-        Soft-resets first (fresh heap), then exec's the file with __name__/__file__
-        set like a normal script launch. Default follow=False so UI apps / loops
-        do not block the sidecar; output is left on the UART (open REPL to watch).
+        Takes control (interrupt + raw soft-reset, skipping main.py), then execs
+        the file with __name__/__file__ set like a normal script launch. This is
+        how user code is started — Soft Reset alone never runs main.py.
+        Default follow=False so UI apps / loops do not block the sidecar; output
+        is left on the UART (open REPL to watch).
         """
         path_lit = json.dumps(path)
         code = (
@@ -617,8 +714,9 @@ class Session:
             "{\"__name__\": \"__main__\", \"__file__\": _p})\n"
         )
         with self._lock:
-            self._enter_raw(soft_reset=True)
             t = self._require()
+            self._stop_repl_reader()
+            self._take_control(t, clean=True, timeout_overall=20.0)
             try:
                 if follow:
                     out = t.exec(code)
@@ -649,24 +747,46 @@ class Session:
                     self._start_repl_reader()
                 raise
 
+    def interrupt(self) -> dict[str, Any]:
+        """Send Ctrl-C without resetting or entering raw REPL."""
+        with self._lock:
+            t = self._require()
+            serial = getattr(t, "serial", None)
+            if serial is None:
+                raise RuntimeError("transport has no serial port")
+            try:
+                serial.write(b"\r\x03")
+            except Exception as e:
+                raise RuntimeError(f"interrupt failed: {e}") from e
+            return {"ok": True}
+
     def soft_reset(self) -> dict[str, Any]:
+        """Fresh heap via raw soft-reset. Does not run main.py."""
         with self._lock:
             t = self._require()
             self._stop_repl_reader()
-            t.enter_raw_repl(soft_reset=True)
+            self._take_control(t, clean=True, timeout_overall=20.0)
             if self._repl_mode:
-                t.exit_raw_repl()
+                try:
+                    if t.in_raw_repl:
+                        t.exit_raw_repl()
+                except Exception:
+                    pass
                 self._start_repl_reader()
-            return {"ok": True}
+            return {"ok": True, "main_skipped": True}
 
     def hard_reset(self) -> dict[str, Any]:
         code = "import time, machine; time.sleep_ms(100); machine.reset()"
         with self._lock:
             t = self._require()
             self._stop_repl_reader()
-            if not t.in_raw_repl:
-                t.enter_raw_repl(soft_reset=False)
             try:
+                self._take_control(t, clean=False, timeout_overall=15.0)
+            except Exception:
+                pass
+            try:
+                if not t.in_raw_repl:
+                    t.enter_raw_repl(soft_reset=False, timeout_overall=5)
                 t.exec_raw_no_follow(code.encode())
             except Exception:
                 pass
@@ -684,9 +804,13 @@ class Session:
         with self._lock:
             t = self._require()
             self._stop_repl_reader()
-            if not t.in_raw_repl:
-                t.enter_raw_repl(soft_reset=False)
             try:
+                self._take_control(t, clean=False, timeout_overall=15.0)
+            except Exception:
+                pass
+            try:
+                if not t.in_raw_repl:
+                    t.enter_raw_repl(soft_reset=False, timeout_overall=5)
                 t.exec_raw_no_follow(code.encode())
             except Exception:
                 pass
@@ -1201,6 +1325,7 @@ METHODS = {
     "eval": lambda p: SESSION.eval(p["expr"]),
     "run_script": lambda p: SESSION.run_script(p["source"], bool(p.get("follow", True))),
     "run_path": lambda p: SESSION.run_path(p["path"], bool(p.get("follow", False))),
+    "interrupt": lambda _p: SESSION.interrupt(),
     "soft_reset": lambda _p: SESSION.soft_reset(),
     "hard_reset": lambda _p: SESSION.hard_reset(),
     "bootloader": lambda _p: SESSION.bootloader(),

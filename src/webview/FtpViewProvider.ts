@@ -192,6 +192,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
       this.editorPanel = undefined;
     });
     this.bindBridgeEvents();
+    void this.pushState();
   }
 
   private attachWebview(webview: vscode.Webview): void {
@@ -275,8 +276,26 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
   }
 
   private postAll(msg: Record<string, unknown>): void {
-    for (const webview of this.webviews) {
-      void webview.postMessage(msg);
+    // Sidebar and editor tabs share this set; a disposed view (e.g. closed
+    // sidebar) must be pruned or postMessage surfaces "Webview is disposed".
+    for (const webview of [...this.webviews]) {
+      try {
+        const result = webview.postMessage(msg);
+        void Promise.resolve(result).then(
+          () => undefined,
+          (e: unknown) => {
+            if (/disposed/i.test(String((e as Error)?.message || e))) {
+              this.webviews.delete(webview);
+            }
+          }
+        );
+      } catch (e: unknown) {
+        if (/disposed/i.test(String((e as Error)?.message || e))) {
+          this.webviews.delete(webview);
+          continue;
+        }
+        throw e;
+      }
     }
   }
 
@@ -374,18 +393,34 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
           this.status("Run is only for .py files");
           return;
         }
-        this.status(`Running ${remote}…`, "active");
+        await this.runRemotePath(remote);
+        break;
+      }
+      case "uploadAndRun": {
+        const local = String(msg.localPath || "");
+        if (!local) {
+          return;
+        }
+        if (!/\.py$/i.test(local)) {
+          this.status("Upload & Run is only for .py files");
+          return;
+        }
+        if (!this.bridge.connected) {
+          this.status("Not connected", "stalled");
+          return;
+        }
+        const remote = joinRemote(this.remotePath, path.basename(local));
+        this.status(`Uploading ${path.basename(local)}…`, "active");
         try {
-          // Soft-reset + exec board file; do not follow (UI apps loop forever).
-          // Output appears on the REPL UART — open it so the user can see prints/tracebacks.
-          await this.bridge.request("run_path", { path: remote, follow: false });
-          this.status(`Running ${remote} — see REPL`, "done");
-          this.onOpenRepl();
+          await this.uploadMany([local]);
+          await this.pushState();
         } catch (e: any) {
           const err = String(e?.message || e);
-          this.status(`Run failed: ${err}`, "stalled");
-          void vscode.window.showErrorMessage(`mpftp run ${remote}: ${err}`);
+          this.status(`Upload failed: ${err}`, "stalled");
+          void vscode.window.showErrorMessage(`mpftp upload: ${err}`);
+          return;
         }
+        await this.runRemotePath(remote);
         break;
       }
       case "hashRemote": {
@@ -676,6 +711,22 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
       );
     } finally {
       this.transferBusy = false;
+    }
+  }
+
+  /** Interrupt + raw soft-reset, then exec a .py already on the board; open REPL. */
+  private async runRemotePath(remote: string): Promise<void> {
+    this.status(`Running ${remote}…`, "active");
+    try {
+      // Soft-reset + exec board file; do not follow (UI apps loop forever).
+      // Output appears on the REPL UART — open it so the user can see prints/tracebacks.
+      await this.bridge.request("run_path", { path: remote, follow: false });
+      this.status(`Running ${remote} — see REPL`, "done");
+      this.onOpenRepl();
+    } catch (e: any) {
+      const err = String(e?.message || e);
+      this.status(`Run failed: ${err}`, "stalled");
+      void vscode.window.showErrorMessage(`mpftp run ${remote}: ${err}`);
     }
   }
 

@@ -43,7 +43,7 @@
       },
       {
         "command": "mpftp.openFtp",
-        "title": "mpftp: Open File Browser",
+        "title": "mpftp: Open File Browser in Sidebar",
         "icon": "$(folder-opened)"
       },
       {
@@ -58,7 +58,7 @@
       },
       {
         "command": "mpftp.openFirmware",
-        "title": "mpftp: Build & Flash Firmware",
+        "title": "mpftp: Build & Flash Firmware…",
         "icon": "$(chip)"
       },
       {
@@ -66,8 +66,12 @@
         "title": "mpftp: Edit Board File"
       },
       {
+        "command": "mpftp.interrupt",
+        "title": "mpftp: Interrupt (Ctrl+C)"
+      },
+      {
         "command": "mpftp.softReset",
-        "title": "mpftp: Soft Reset"
+        "title": "mpftp: Soft Reset (skip main.py)"
       },
       {
         "command": "mpftp.hardReset",
@@ -79,7 +83,8 @@
       },
       {
         "command": "mpftp.runFile",
-        "title": "mpftp: Run Current File on Board"
+        "title": "mpftp: Run Current File on Board",
+        "icon": "$(play)"
       },
       {
         "command": "mpftp.eval",
@@ -131,7 +136,7 @@
       }
     ],
     "menus": {
-      "editor/title": [
+      "editor/title/run": [
         {
           "command": "mpftp.runFile",
           "when": "resourceExtname == .py && mpftp.connected",
