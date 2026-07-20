@@ -89,8 +89,14 @@ that must land intact. Startup script is usually `main.py` (MP) or `code.py` (CP
 | Host dep | `mpremote` | `circup` on the sidecar Python |
 | Transport | serial (host download → board write) | **Web Workflow preferred** (`circup --host` when Wi‑Fi + `CIRCUITPY_WEB_API_PASSWORD` are set); else host stage → serial put / CIRCUITPY MSC |
 
-`mount` / `umount` / `romfs` remain **MicroPython-only**. CIRCUITPY USB MSC is
-not the preferred transport.
+`mount` / `umount` / `romfs` remain **MicroPython-only**.
+
+**CircuitPython file transfers**
+
+While the **CIRCUITPY** USB drive is mounted on the host, `put` / `cp` / mkdir /
+rm write through that volume (USB MSC) — the same default workflow as Mu/Thonny
+and circup ``--path``. Serial writes stay available when MSC is not mounted
+(or after `storage.disable_usb_drive()` in `boot.py`).
 
 **CircuitPython packages (no ``boot.py`` required)**
 

@@ -118,6 +118,31 @@ body {
   line-height: 1;
 }
 
+.toolbar .runtime-pill {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  background: var(--vscode-badge-background, color-mix(in srgb, var(--fg) 12%, transparent));
+  user-select: none;
+}
+
+.toolbar .runtime-pill[data-runtime="micropython"] {
+  border-color: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 55%, var(--border));
+  color: var(--vscode-charts-blue, #3794ff);
+}
+
+.toolbar .runtime-pill[data-runtime="circuitpython"] {
+  border-color: color-mix(in srgb, var(--vscode-charts-orange, #e2162c) 50%, var(--border));
+  color: var(--vscode-charts-orange, #e2162c);
+}
+
 button,
 select {
   background: var(--accent);

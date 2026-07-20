@@ -545,6 +545,28 @@
     $("remotePane").classList.toggle("disconnected", !on);
     $("btnXferUp").classList.toggle("xfer-disabled", !on);
     $("btnXferDown").classList.toggle("xfer-disabled", !on);
+    const pill = $("runtimePill");
+    if (on && state.runtime === "circuitpython") {
+      pill.hidden = false;
+      pill.textContent = "CircuitPython";
+      pill.dataset.runtime = "circuitpython";
+      pill.title = "Connected runtime: CircuitPython";
+    } else if (on && (state.runtime === "micropython" || state.runtime)) {
+      pill.hidden = false;
+      pill.textContent = "MicroPython";
+      pill.dataset.runtime = "micropython";
+      pill.title = "Connected runtime: MicroPython";
+    } else if (on) {
+      pill.hidden = false;
+      pill.textContent = "Python";
+      pill.dataset.runtime = "";
+      pill.title = "Connected (runtime unknown)";
+    } else {
+      pill.hidden = true;
+      pill.textContent = "";
+      pill.dataset.runtime = "";
+      pill.title = "";
+    }
     updatePaneActions();
   }
 

@@ -1118,6 +1118,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
       <button id="btnFirmware" class="secondary tool-label-btn" title="Build & flash firmware" aria-label="Firmware">
         <i class="codicon codicon-chip"></i><span>Firmware</span>
       </button>
+      <span id="runtimePill" class="runtime-pill" hidden aria-live="polite"></span>
     </div>
     <div class="panes">
       <section class="pane" id="localPane">

@@ -36,6 +36,15 @@ def host_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def map_circuitpy_remote_path(host_root: Path, remote: str) -> Path:
+    """Map a board path (``/lib/foo.py``) onto a host CIRCUITPY root."""
+    rel = (remote or "").strip().replace("\\", "/")
+    if rel in ("", "/"):
+        return host_root
+    parts = [p for p in rel.lstrip("/").split("/") if p and p != ".."]
+    return host_root.joinpath(*parts) if parts else host_root
+
+
 def normalize_runtime_name(name: Any) -> str:
     """Map ``sys.implementation.name`` to ``micropython`` | ``circuitpython``."""
     n = str(name or "").strip().lower()
@@ -1050,6 +1059,11 @@ print(repr(_out))
 
     def fs_write(self, path: str, data_b64: str) -> dict[str, Any]:
         data = base64.b64decode(data_b64)
+        host = self._circuitpy_host_path(path)
+        if host is not None:
+            host.parent.mkdir(parents=True, exist_ok=True)
+            host.write_bytes(data)
+            return {"path": path, "size": len(data), "via": "circuitpy_msc"}
 
         def op(t):
             self._ensure_cp_writable(t)
@@ -1060,6 +1074,11 @@ print(repr(_out))
         return self.with_raw(op)
 
     def fs_mkdir(self, path: str) -> dict[str, Any]:
+        host = self._circuitpy_host_path(path)
+        if host is not None:
+            host.mkdir(parents=True, exist_ok=True)
+            return {"path": path, "via": "circuitpy_msc"}
+
         def op(t):
             t.fs_mkdir(path)
             return {"path": path}
@@ -1067,6 +1086,14 @@ print(repr(_out))
         return self.with_raw(op)
 
     def fs_rm(self, path: str) -> dict[str, Any]:
+        host = self._circuitpy_host_path(path)
+        if host is not None:
+            if host.is_dir():
+                raise RuntimeError(f"is a directory: {path} (use fs_rmdir or fs_rm_rf)")
+            if host.exists():
+                host.unlink()
+            return {"path": path, "via": "circuitpy_msc"}
+
         def op(t):
             if t.fs_isdir(path):
                 raise RuntimeError(f"is a directory: {path} (use fs_rmdir or fs_rm_rf)")
@@ -1076,6 +1103,11 @@ print(repr(_out))
         return self.with_raw(op)
 
     def fs_rmdir(self, path: str) -> dict[str, Any]:
+        host = self._circuitpy_host_path(path)
+        if host is not None:
+            host.rmdir()
+            return {"path": path, "via": "circuitpy_msc"}
+
         def op(t):
             t.fs_rmdir(path)
             return {"path": path}
@@ -1083,6 +1115,16 @@ print(repr(_out))
         return self.with_raw(op)
 
     def fs_rm_rf(self, path: str) -> dict[str, Any]:
+        host = self._circuitpy_host_path(path)
+        if host is not None:
+            if path in ("", "/", "."):
+                raise RuntimeError("refusing to rm -rf CIRCUITPY root via MSC")
+            if host.is_dir():
+                shutil.rmtree(host)
+            elif host.exists():
+                host.unlink()
+            return {"path": path, "via": "circuitpy_msc"}
+
         def _rm(t, p: str) -> None:
             if t.fs_isdir(p):
                 for e in self._board_listdir(t, p):
@@ -1102,6 +1144,12 @@ print(repr(_out))
         return self.with_raw(op)
 
     def fs_touch(self, path: str) -> dict[str, Any]:
+        host = self._circuitpy_host_path(path)
+        if host is not None:
+            host.parent.mkdir(parents=True, exist_ok=True)
+            host.touch(exist_ok=True)
+            return {"path": path, "via": "circuitpy_msc"}
+
         def op(t):
             t.fs_touchfile(path)
             return {"path": path}
@@ -1109,6 +1157,13 @@ print(repr(_out))
         return self.with_raw(op)
 
     def fs_rename(self, src: str, dest: str) -> dict[str, Any]:
+        host_src = self._circuitpy_host_path(src)
+        host_dest = self._circuitpy_host_path(dest)
+        if host_src is not None and host_dest is not None:
+            host_dest.parent.mkdir(parents=True, exist_ok=True)
+            host_src.rename(host_dest)
+            return {"src": src, "dest": dest, "via": "circuitpy_msc"}
+
         def op(t):
             # mpremote Transport has no fs_rename; use device os.rename.
             t.exec(f"import os\nos.rename({src!r}, {dest!r})")
@@ -1494,6 +1549,30 @@ print(repr(_out))
                 shutil.copy2(child, target)
             copied.append(str(target))
         return copied
+
+    def _circuitpy_msc_root(self) -> Optional[Path]:
+        """Host CIRCUITPY mount when runtime is CircuitPython and the drive is up.
+
+        While USB MSC is exposed, the board FS is read-only over serial/Web.
+        Host writes to this volume are the default CircuitPython file workflow
+        (same idea as Mu/Thonny/drag-drop and circup ``--path``).
+        """
+        if (self.runtime or "") != "circuitpython":
+            return None
+        for root in self._find_circuitpy_host_roots():
+            p = Path(root)
+            try:
+                if p.is_dir():
+                    return p
+            except OSError:
+                continue
+        return None
+
+    def _circuitpy_host_path(self, remote: str) -> Optional[Path]:
+        root = self._circuitpy_msc_root()
+        if root is None:
+            return None
+        return map_circuitpy_remote_path(root, remote)
 
     def _ensure_cp_writable(self, t: Any) -> None:
         """Remount CIRCUITPY root read-write when USB MSC left it read-only."""
@@ -2158,6 +2237,14 @@ print(repr(rows))
         src_p = Path(src)
         if not src_p.exists():
             raise RuntimeError(f"local path not found: {src}")
+
+        msc_root = self._circuitpy_msc_root()
+        if msc_root is not None:
+            self._cp_local_to_circuitpy_msc(
+                msc_root, src_p, dest, verify, copied, verified
+            )
+            return
+
         if src_p.is_dir():
             # If dest exists as dir, copy into it as basename; else create dest as the tree root.
             dest_exists = False
@@ -2213,6 +2300,61 @@ print(repr(rows))
                 verified.append(final)
         if copied:
             self._sync_remote_fs(t)
+
+    def _cp_local_to_circuitpy_msc(
+        self,
+        msc_root: Path,
+        src_p: Path,
+        dest: str,
+        verify: bool,
+        copied: list[str],
+        verified: list[str],
+    ) -> None:
+        """Local → board copy via mounted CIRCUITPY (USB MSC)."""
+
+        def _host_isdir(remote: str) -> bool:
+            p = map_circuitpy_remote_path(msc_root, remote)
+            try:
+                return p.is_dir()
+            except OSError:
+                return False
+
+        def _write_one(local_file: Path, remote_file: str) -> None:
+            host = map_circuitpy_remote_path(msc_root, remote_file)
+            host.parent.mkdir(parents=True, exist_ok=True)
+            data = local_file.read_bytes()
+            host.write_bytes(data)
+            copied.append(remote_file)
+            if verify:
+                if host_sha256(host.read_bytes()) != host_sha256(data):
+                    raise RuntimeError(f"hash mismatch after MSC upload: {remote_file}")
+                verified.append(remote_file)
+
+        if src_p.is_dir():
+            dest_exists = _host_isdir(dest)
+            root = (dest.rstrip("/") + "/" + src_p.name) if dest_exists else dest
+            map_circuitpy_remote_path(msc_root, root).mkdir(parents=True, exist_ok=True)
+            for dirpath, dirnames, filenames in os.walk(src_p):
+                rel = os.path.relpath(dirpath, src_p)
+                remote_dir = root if rel == "." else root.rstrip("/") + "/" + rel.replace("\\", "/")
+                map_circuitpy_remote_path(msc_root, remote_dir).mkdir(parents=True, exist_ok=True)
+                for name in dirnames:
+                    map_circuitpy_remote_path(
+                        msc_root, remote_dir.rstrip("/") + "/" + name
+                    ).mkdir(parents=True, exist_ok=True)
+                for name in filenames:
+                    if name.startswith(".") or name in ("__pycache__",) or name.endswith(
+                        (".pyc", ".pyo")
+                    ):
+                        continue
+                    local_file = Path(dirpath) / name
+                    remote_file = remote_dir.rstrip("/") + "/" + name
+                    _write_one(local_file, remote_file)
+        else:
+            final = dest
+            if dest.endswith("/") or _host_isdir(dest):
+                final = dest.rstrip("/") + "/" + src_p.name
+            _write_one(src_p, final)
 
     def _cp_remote_to_local(
         self, t, src: str, dest: str, verify: bool, copied: list[str], verified: list[str]

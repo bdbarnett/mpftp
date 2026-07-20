@@ -60,6 +60,9 @@ with a single serial ownership model so the UI and agents do not fight over the 
 | MicroPython | Raw soft-reset (skips `main.py`) | **mip** (host download → board) |
 | CircuitPython | Friendly↔raw toggle (does **not** run `code.py`) | **circup** — CIRCUITPY `--path` when mounted, else Web Workflow if writable, else USB staging |
 
+File `put` / `cp` on CircuitPython also prefer the mounted **CIRCUITPY** drive
+(USB MSC) when present; serial writes are used when the drive is not mounted.
+
 Use **mpftp: Install Package** in the UI, or CLI `mpftp mip …` / `mpftp circup …`.
 
 ### REPL

@@ -88,6 +88,18 @@ class CircuitPythonHelperTests(unittest.TestCase):
             ],
         )
 
+    def test_map_circuitpy_remote_path(self):
+        root = Path("/tmp/circuitpy-root")
+        self.assertEqual(self.mod.map_circuitpy_remote_path(root, "/"), root)
+        self.assertEqual(
+            self.mod.map_circuitpy_remote_path(root, "/lib/path.py"),
+            root / "lib" / "path.py",
+        )
+        self.assertEqual(
+            self.mod.map_circuitpy_remote_path(root, "lib/../etc/passwd"),
+            root / "lib" / "etc" / "passwd",
+        )
+
     def test_circup_staging_layout(self):
         """Host staging dir shaped like a CIRCUITPY root (boot_out + lib/)."""
         with tempfile.TemporaryDirectory(prefix="mpftp-circup-test-") as stage:
