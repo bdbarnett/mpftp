@@ -50,8 +50,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         [
           { label: "Disconnect", id: "disconnect" },
           { label: "Open REPL", id: "repl" },
-          { label: "Open File Browser in Sidebar", id: "ftp" },
-          { label: "Open File Browser in Editor", id: "ftpEditor" },
+          { label: "Open File Transfer in Panel", id: "ftp" },
+          { label: "Open File Transfer in Editor", id: "ftpEditor" },
         ],
         { title: `Connected to ${bridge.connectedDevice}` }
       );
@@ -61,7 +61,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       } else if (choice?.id === "repl") {
         openRepl(bridge, activity);
       } else if (choice?.id === "ftp") {
-        await ftpProvider.reveal();
+        await ftpProvider.openInPanel();
       } else if (choice?.id === "ftpEditor") {
         ftpProvider.openInEditor();
       }
@@ -152,7 +152,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void vscode.window.showErrorMessage(`mpftp resume failed: ${e.message || e}`);
       }
     }),
-    vscode.commands.registerCommand("mpftp.openFtp", () => ftpProvider.reveal()),
+    vscode.commands.registerCommand("mpftp.openFtp", () => ftpProvider.openInPanel()),
     vscode.commands.registerCommand("mpftp.openFtpEditor", () => ftpProvider.openInEditor()),
     vscode.commands.registerCommand("mpftp.openFirmware", () => firmwarePanel.reveal()),
     vscode.commands.registerCommand("mpftp.openRepl", async () => {
@@ -275,11 +275,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       const ed = vscode.window.activeTextEditor;
       if (!ed) {
-        void vscode.window.showWarningMessage("mpftp: open a .py file to run");
+        void vscode.window.showWarningMessage("mpftp: open a .py editor tab to run the buffer");
         return;
       }
       const source = ed.document.getText();
-      // follow=false: leave UART free for prints and input(); same as Board Files → Run.
+      // follow=false: leave UART free for prints and input(); same as File Transfer → Run.
       await bridge.request("run_script", { source, follow: false });
       openRepl(bridge, activity);
     }),

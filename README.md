@@ -1,6 +1,6 @@
 # mpftp — MicroPython board tools for VS Code / Cursor
 
-FTP-style dual-pane file browser and full ANSI REPL for MicroPython boards over USB serial.
+FTP-style dual-pane file transfer and full ANSI REPL for MicroPython boards over USB serial.
 
 Works on:
 
@@ -10,7 +10,7 @@ Works on:
 
 ## Features
 
-- Dual-pane local ↔ board file browser (upload, download, mkdir, new file, delete, rename, drag-and-drop)
+- Dual-pane local ↔ board file transfer (upload, download, mkdir, new file, delete, rename, drag-and-drop)
 - Open board files in the editor (save writes back); SHA-256 verify on transfers (configurable)
 - Integrated REPL with ANSI/VT color codes
 - Connect probes MicroPython raw REPL (rejects UF2/bootloader-only ports) and sets RTC from the host
@@ -56,7 +56,7 @@ Then **Extensions: Install from VSIX…** and pick the generated `.vsix`.
 
 1. Click the **mpftp** activity-bar icon (or status-bar **mpftp**)
 2. **Connect** and pick a port (`COM4`, `/dev/ttyACM0`, …)
-3. Use the dual-pane browser (drag local → board / board → local); **REPL** opens an ANSI terminal
+3. Use dual-pane File Transfer (drag local → board / board → local); **REPL** opens an ANSI terminal
 4. Double-click a board file to edit it in VS Code; save pushes it back
 
 Useful commands:
@@ -65,16 +65,16 @@ Useful commands:
 |--------|--------|
 | `mpftp: Connect to Board` | Port picker; always interrupts and raw soft-resets so `main.py` is not left running |
 | `mpftp: Resume Last Device` | Reconnect previous COM port |
-| `mpftp: Open File Browser in Sidebar` | Focus the sidebar FTP view |
-| `mpftp: Open File Browser in Editor` | Open Board Files as an editor tab (default workflow) |
+| `mpftp: Open File Transfer in Panel` | Focus File Transfer in the bottom panel (Terminal area) |
+| `mpftp: Open File Transfer in Editor` | Open File Transfer as an editor tab (default workflow) |
 | `mpftp: Edit Board File` | Pull → edit → save back |
 | `mpftp: Open REPL` | ANSI REPL terminal |
 | `mpftp: Interrupt (Ctrl+C)` | stop a running program without resetting |
 | `mpftp: Soft Reset (skip main.py)` | fresh heap via raw soft-reset; does **not** run `main.py` |
 | `mpftp: Hard Reset` | hardware reset (auto-reconnects by default; cancellable) |
-| `mpftp: Run Current File on Board` | editor **Run** play menu + ⋯ menu; interrupt/soft-reset, exec buffer, open **REPL** (for prints/`input()`) |
-| Board file → **Run on board** | right-click in Board Files; runs the file already on the device |
-| Local `.py` → **Upload & Run** | right-click in Board Files; upload to current board folder, then run |
+| `mpftp: Run Editor Buffer` | editor Play + ⋯ menu; interrupt/soft-reset, **exec buffer** (does not upload), open **REPL** |
+| Board file → **Run board file** | header / right-click in File Transfer; runs the `.py` already on the device |
+| Local `.py` → **Upload & Run** | right-click in File Transfer; upload to current board folder, then run |
 | `mpftp: mip Install Package` | Host-side mip install onto the board |
 
 ## Settings
@@ -93,7 +93,7 @@ Useful commands:
 
 ## Firmware builder
 
-Open **Firmware** from the Board Files toolbar (or `mpftp: Build & Flash Firmware`).
+Open **Firmware** from the File Transfer toolbar (or `mpftp: Build & Flash Firmware`).
 It reimplements the useful parts of a cmods-style build without shelling out to
 `build_mp.sh`:
 

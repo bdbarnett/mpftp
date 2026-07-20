@@ -17,6 +17,8 @@
 
   const $ = (id) => document.getElementById(id);
   const ctxMenu = $("ctxMenu");
+  /** Host surface for this webview: "panel" | "editor". */
+  const hostSurface = document.body.dataset.surface || "panel";
 
   function fmtSize(n, isDir) {
     if (isDir) return "";
@@ -204,6 +206,14 @@
       }
       if (!entry.isDir) {
         items.push({
+          label: "Open in Editor",
+          action: () =>
+            vscode.postMessage({
+              type: "openLocal",
+              path: joinLocal(state.localPath, entry.name),
+            }),
+        });
+        items.push({
           label: "Upload",
           disabled: !state.connected,
           action: doUpload,
@@ -246,6 +256,10 @@
       action: () => vscode.postMessage({ type: "localMkdir" }),
     });
     items.push({
+      label: "New file",
+      action: () => vscode.postMessage({ type: "localNewFile" }),
+    });
+    items.push({
       label: "Browse…",
       action: () => vscode.postMessage({ type: "pickLocal" }),
     });
@@ -280,7 +294,7 @@
         });
         if (/\.py$/i.test(entry.name || "")) {
           items.push({
-            label: "Run on board",
+            label: "Run board file",
             disabled: !state.connected,
             action: () =>
               vscode.postMessage({
@@ -348,6 +362,7 @@
         ev.preventDefault();
         openRemoteContext(ev, null);
       };
+      updatePaneActions();
       return;
     }
 
@@ -460,6 +475,7 @@
       if (which === "local") openLocalContext(ev, null);
       else openRemoteContext(ev, null);
     };
+    updatePaneActions();
   }
 
   function setStatus(msg, phase) {
@@ -471,47 +487,108 @@
     else if (phase === "done") footer.classList.add("xfer-done");
   }
 
+  function selectedEntries(which) {
+    const selected = which === "local" ? state.localSelected : state.remoteSelected;
+    const entries = which === "local" ? state.localEntries : state.remoteEntries;
+    return entries.filter((e) => selected.has(e.name));
+  }
+
+  function updatePaneActions() {
+    const on = state.connected;
+    const localSel = selectedEntries("local");
+    const remoteSel = selectedEntries("remote");
+
+    const oneLocalFile = localSel.length === 1 && !localSel[0].isDir;
+    const oneLocalPy =
+      oneLocalFile && /\.py$/i.test(localSel[0].name || "");
+    $("btnLocalRun").disabled = !on || !oneLocalPy;
+    $("btnLocalOpen").disabled = !oneLocalFile;
+    $("btnLocalRename").disabled = localSel.length !== 1;
+    $("btnLocalDelete").disabled = localSel.length === 0;
+
+    $("btnRemoteMkdir").disabled = !on;
+    $("btnRemoteNewFile").disabled = !on;
+    const oneRemoteFile = remoteSel.length === 1 && !remoteSel[0].isDir;
+    const oneRemotePy =
+      oneRemoteFile && /\.py$/i.test(remoteSel[0].name || "");
+    $("btnRemoteRun").disabled = !on || !oneRemotePy;
+    $("btnRemoteOpen").disabled = !on || !oneRemoteFile;
+    $("btnRemoteRename").disabled = !on || remoteSel.length !== 1;
+    $("btnRemoteDelete").disabled = !on || remoteSel.length === 0;
+  }
+
   function updateChrome() {
     const on = state.connected;
-    $("btnConnect").textContent = on ? "Disconnect" : "Connect";
+    const connectBtn = $("btnConnect");
+    const connectIcon = $("btnConnectIcon");
+    connectBtn.title = on ? "Disconnect" : "Connect";
+    connectBtn.setAttribute("aria-label", on ? "Disconnect" : "Connect");
+    connectIcon.className = on
+      ? "codicon codicon-debug-disconnect"
+      : "codicon codicon-plug";
     $("btnXferUp").disabled = !on;
     $("btnXferDown").disabled = !on;
     $("btnRefreshRemote").disabled = !on;
+    $("btnInterrupt").disabled = !on;
+    $("btnSoftReset").disabled = !on;
+    $("btnHardReset").disabled = !on;
     $("btnRepl").disabled = !on;
     $("remotePath").disabled = !on;
     $("remotePath").placeholder = on ? "" : "Not connected";
     $("remotePane").classList.toggle("disconnected", !on);
     $("btnXferUp").classList.toggle("xfer-disabled", !on);
     $("btnXferDown").classList.toggle("xfer-disabled", !on);
+    updatePaneActions();
   }
 
-  /** Same set as Command Palette entries titled "mpftp: …". */
-  const MPFTP_COMMANDS = [
-    { command: "mpftp.connect", title: "Connect to Board" },
-    { command: "mpftp.disconnect", title: "Disconnect", needsConnected: true },
-    { command: "mpftp.resume", title: "Resume Last Device" },
-    { command: "mpftp.openFtp", title: "Open File Browser in Sidebar" },
-    { command: "mpftp.openFtpEditor", title: "Open File Browser in Editor" },
-    { command: "mpftp.openRepl", title: "Open REPL" },
-    { command: "mpftp.interrupt", title: "Interrupt (Ctrl+C)", needsConnected: true },
-    { command: "mpftp.softReset", title: "Soft Reset (skip main.py)", needsConnected: true },
-    { command: "mpftp.hardReset", title: "Hard Reset", needsConnected: true },
-    { command: "mpftp.runFile", title: "Run Current File on Board", needsConnected: true },
-    { command: "mpftp.openFirmware", title: "Build & Flash Firmware…" },
-    { command: "mpftp.editRemote", title: "Edit Board File", needsConnected: true },
-    { command: "mpftp.bootloader", title: "Enter Bootloader", needsConnected: true },
-    { command: "mpftp.eval", title: "Eval Expression", needsConnected: true },
-    { command: "mpftp.exec", title: "Exec Code", needsConnected: true },
-    { command: "mpftp.rtcGet", title: "Get RTC", needsConnected: true },
-    { command: "mpftp.rtcSet", title: "Set RTC from Host", needsConnected: true },
-    { command: "mpftp.mipInstall", title: "mip Install Package", needsConnected: true },
-    { command: "mpftp.df", title: "Disk Free (df)", needsConnected: true },
-    { command: "mpftp.mount", title: "Mount Local Folder (/remote)", needsConnected: true },
-    { command: "mpftp.umount", title: "Unmount /remote", needsConnected: true },
-    { command: "mpftp.romfsQuery", title: "ROMFS Query", needsConnected: true },
-    { command: "mpftp.hashRemote", title: "Hash Board File", needsConnected: true },
-    { command: "mpftp.refreshPorts", title: "Refresh Serial Ports" },
-    { command: "mpftp.agentStatus", title: "Agent Status (RPC / logs)" },
+  /**
+   * ⋯ menu groups (mirrors Command Palette). Most-used session/control first;
+   * specialized mpremote tools last.
+   */
+  const MPFTP_COMMAND_GROUPS = [
+    {
+      // Session + board control (also on the toolbar)
+      items: [
+        { command: "mpftp.connect", title: "Connect to Board" },
+        { command: "mpftp.disconnect", title: "Disconnect", needsConnected: true },
+        { command: "mpftp.resume", title: "Resume Last Device" },
+        { command: "mpftp.refreshPorts", title: "Refresh Serial Ports" },
+        { command: "mpftp.interrupt", title: "Interrupt (Ctrl+C)", needsConnected: true },
+        { command: "mpftp.softReset", title: "Soft Reset (skip main.py)", needsConnected: true },
+        { command: "mpftp.hardReset", title: "Hard Reset", needsConnected: true },
+        { command: "mpftp.openRepl", title: "Open REPL" },
+        { command: "mpftp.runFile", title: "Run Editor Buffer", needsConnected: true },
+      ],
+    },
+    {
+      // Views / tooling
+      items: [
+        { command: "mpftp.openFtp", title: "Open File Transfer in Panel" },
+        { command: "mpftp.openFtpEditor", title: "Open File Transfer in Editor" },
+        { command: "mpftp.openFirmware", title: "Build & Flash Firmware…" },
+        { command: "mpftp.editRemote", title: "Edit Board File", needsConnected: true },
+      ],
+    },
+    {
+      // mpremote-oriented tools
+      items: [
+        { command: "mpftp.eval", title: "Eval Expression", needsConnected: true },
+        { command: "mpftp.exec", title: "Exec Code", needsConnected: true },
+        { command: "mpftp.bootloader", title: "Enter Bootloader", needsConnected: true },
+        { command: "mpftp.rtcGet", title: "Get RTC", needsConnected: true },
+        { command: "mpftp.rtcSet", title: "Set RTC from Host", needsConnected: true },
+        { command: "mpftp.mipInstall", title: "mip Install Package", needsConnected: true },
+        { command: "mpftp.df", title: "Disk Free (df)", needsConnected: true },
+        { command: "mpftp.mount", title: "Mount Local Folder (/remote)", needsConnected: true },
+        { command: "mpftp.umount", title: "Unmount /remote", needsConnected: true },
+        { command: "mpftp.romfsQuery", title: "ROMFS Query", needsConnected: true },
+        { command: "mpftp.hashRemote", title: "Hash Board File", needsConnected: true },
+      ],
+    },
+    {
+      // Diagnostics (last)
+      items: [{ command: "mpftp.agentStatus", title: "Agent Status (RPC / logs)" }],
+    },
   ];
 
   function openCommandsMenu(ev) {
@@ -519,16 +596,35 @@
     ev.stopPropagation();
     const rect = $("btnMore").getBoundingClientRect();
     const items = [];
-    for (const c of MPFTP_COMMANDS) {
-      // Mirror palette: Disconnect only when connected (commandPalette when clause).
-      if (c.command === "mpftp.disconnect" && !state.connected) {
+    for (const group of MPFTP_COMMAND_GROUPS) {
+      const rows = [];
+      for (const c of group.items) {
+        // Mirror palette: Disconnect only when connected (commandPalette when clause).
+        if (c.command === "mpftp.disconnect" && !state.connected) {
+          continue;
+        }
+        // Only offer opening the other host surface.
+        if (c.command === "mpftp.openFtp" && hostSurface === "panel") {
+          continue;
+        }
+        if (c.command === "mpftp.openFtpEditor" && hostSurface === "editor") {
+          continue;
+        }
+        rows.push({
+          label: c.title,
+          disabled: !!(c.needsConnected && !state.connected),
+          action: () => vscode.postMessage({ type: "command", command: c.command }),
+        });
+      }
+      if (!rows.length) {
         continue;
       }
-      items.push({
-        label: c.title,
-        disabled: !!(c.needsConnected && !state.connected),
-        action: () => vscode.postMessage({ type: "command", command: c.command }),
-      });
+      if (items.length) {
+        items.push("---");
+      }
+      for (const row of rows) {
+        items.push(row);
+      }
     }
     showContextMenu(rect.left, rect.bottom + 4, items);
   }
@@ -544,12 +640,108 @@
   $("btnConnect").addEventListener("click", () => {
     vscode.postMessage({ type: state.connected ? "disconnect" : "connect" });
   });
+  $("btnInterrupt").addEventListener("click", () => {
+    vscode.postMessage({ type: "command", command: "mpftp.interrupt" });
+  });
+  $("btnSoftReset").addEventListener("click", () => {
+    vscode.postMessage({ type: "command", command: "mpftp.softReset" });
+  });
+  $("btnHardReset").addEventListener("click", () => {
+    vscode.postMessage({ type: "command", command: "mpftp.hardReset" });
+  });
   $("btnRefreshLocal").addEventListener("click", () => {
     vscode.postMessage({ type: "refreshLocal" });
   });
   $("btnRefreshRemote").addEventListener("click", () => {
     vscode.postMessage({ type: "refreshRemote" });
   });
+  $("btnLocalMkdir").addEventListener("click", () => {
+    vscode.postMessage({ type: "localMkdir" });
+  });
+  $("btnLocalNewFile").addEventListener("click", () => {
+    vscode.postMessage({ type: "localNewFile" });
+  });
+  $("btnLocalBrowse").addEventListener("click", () => {
+    vscode.postMessage({ type: "pickLocal" });
+  });
+  $("btnLocalRun").addEventListener("click", () => {
+    const sel = selectedEntries("local");
+    if (sel.length !== 1 || sel[0].isDir || !/\.py$/i.test(sel[0].name || "")) {
+      setStatus("Select one local .py file to upload & run");
+      return;
+    }
+    if (!state.connected) {
+      setStatus("Connect to upload & run");
+      return;
+    }
+    vscode.postMessage({
+      type: "uploadAndRun",
+      localPath: joinLocal(state.localPath, sel[0].name),
+    });
+  });
+  $("btnLocalOpen").addEventListener("click", () => {
+    const sel = selectedEntries("local");
+    if (sel.length !== 1 || sel[0].isDir) {
+      setStatus("Select one local file to open");
+      return;
+    }
+    vscode.postMessage({
+      type: "openLocal",
+      path: joinLocal(state.localPath, sel[0].name),
+    });
+  });
+  $("btnLocalRename").addEventListener("click", () => {
+    const sel = selectedEntries("local");
+    if (sel.length !== 1) {
+      setStatus("Select one local item to rename");
+      return;
+    }
+    vscode.postMessage({
+      type: "localRename",
+      path: joinLocal(state.localPath, sel[0].name),
+    });
+  });
+  $("btnLocalDelete").addEventListener("click", doLocalDelete);
+  $("btnRemoteMkdir").addEventListener("click", () => {
+    vscode.postMessage({ type: "mkdir" });
+  });
+  $("btnRemoteNewFile").addEventListener("click", () => {
+    vscode.postMessage({ type: "newFile" });
+  });
+  $("btnRemoteRun").addEventListener("click", () => {
+    const sel = selectedEntries("remote");
+    if (sel.length !== 1 || sel[0].isDir || !/\.py$/i.test(sel[0].name || "")) {
+      setStatus("Select one board .py file to run");
+      return;
+    }
+    vscode.postMessage({
+      type: "runRemote",
+      path: joinRemote(state.remotePath, sel[0].name),
+    });
+  });
+  $("btnRemoteOpen").addEventListener("click", () => {
+    const sel = selectedEntries("remote");
+    if (sel.length !== 1 || sel[0].isDir) {
+      setStatus("Select one board file to open");
+      return;
+    }
+    vscode.postMessage({
+      type: "openRemote",
+      path: joinRemote(state.remotePath, sel[0].name),
+    });
+  });
+  $("btnRemoteRename").addEventListener("click", () => {
+    const sel = selectedEntries("remote");
+    if (sel.length !== 1) {
+      setStatus("Select one board item to rename");
+      return;
+    }
+    vscode.postMessage({
+      type: "remoteRename",
+      path: joinRemote(state.remotePath, sel[0].name),
+    });
+  });
+  $("btnRemoteDelete").addEventListener("click", doRemoteDelete);
   $("btnXferUp").addEventListener("click", doUpload);
   $("btnXferDown").addEventListener("click", doDownload);
   $("btnRepl").addEventListener("click", () => {
@@ -557,9 +749,6 @@
   });
   $("btnFirmware").addEventListener("click", () => {
     vscode.postMessage({ type: "command", command: "mpftp.openFirmware" });
-  });
-  $("btnPickLocal").addEventListener("click", () => {
-    vscode.postMessage({ type: "pickLocal" });
   });
 
   $("localPath").addEventListener("change", (e) => {

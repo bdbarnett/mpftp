@@ -1,7 +1,7 @@
 {
   "name": "mpftp",
   "displayName": "mpftp - MicroPython Board",
-  "description": "FTP-style file browser and ANSI REPL for MicroPython boards over USB serial (Linux, Windows, WSL via mpremote.exe).",
+  "description": "FTP-style file transfer and ANSI REPL for MicroPython boards over USB serial (Linux, Windows, WSL via mpremote.exe).",
   "version": "0.1.0",
   "publisher": "bdbarnett",
   "license": "MIT",
@@ -43,12 +43,12 @@
       },
       {
         "command": "mpftp.openFtp",
-        "title": "mpftp: Open File Browser in Sidebar",
-        "icon": "$(folder-opened)"
+        "title": "mpftp: Open File Transfer in Panel",
+        "icon": "$(layout-panel)"
       },
       {
         "command": "mpftp.openFtpEditor",
-        "title": "mpftp: Open File Browser in Editor",
+        "title": "mpftp: Open File Transfer in Editor",
         "icon": "$(window)"
       },
       {
@@ -83,7 +83,7 @@
       },
       {
         "command": "mpftp.runFile",
-        "title": "mpftp: Run Current File on Board",
+        "title": "mpftp: Run Editor Buffer",
         "icon": "$(play)"
       },
       {
@@ -151,20 +151,20 @@
       ]
     },
     "viewsContainers": {
-      "activitybar": [
+      "panel": [
         {
-          "id": "mpftp",
-          "title": "mpftp",
+          "id": "mpftp-file-transfer",
+          "title": "File Transfer",
           "icon": "resources/mpftp.svg"
         }
       ]
     },
     "views": {
-      "mpftp": [
+      "mpftp-file-transfer": [
         {
           "type": "webview",
-          "id": "mpftp.ftpView",
-          "name": "Board Files",
+          "id": "mpftp.fileTransferView",
+          "name": "File Transfer",
           "visibility": "visible"
         }
       ]
@@ -205,7 +205,7 @@
         "mpftp.openEditorOnConnect": {
           "type": "boolean",
           "default": true,
-          "description": "When a board connects, open the Board Files browser as an editor tab (instead of only focusing the sidebar view)."
+          "description": "When a board connects, open File Transfer as an editor tab (instead of only focusing the panel view)."
         },
         "mpftp.micropythonPath": {
           "type": "string",

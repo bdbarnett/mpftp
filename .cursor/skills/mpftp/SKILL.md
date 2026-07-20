@@ -154,7 +154,7 @@ build; flash is supported for `esp32`, `rp2`, `samd`.
   `app partition is too small … (overflow …)` error, grows the app partition to
   fit (into `esp32_partitions/<board>.csv`), and rebuilds once. `--no-autosize`
   disables it.
-- UI: **Firmware** button in the Board Files toolbar, or `mpftp: Build & Flash
+- UI: **Firmware** button in the File Transfer toolbar, or `mpftp: Build & Flash
   Firmware`. Same operations over Agent RPC as `firmware_*` methods
   (`firmware_list`, `firmware_build`, `firmware_flash`, `firmware_partitions`, …).
 

@@ -27,6 +27,10 @@ function shortDeviceName(device: string): string {
   return s;
 }
 
+function isWebviewDisposedError(e: unknown): boolean {
+  return /disposed/i.test(String((e as Error)?.message || e));
+}
+
 /** Skip VCS/env/bytecode noise: .git, .venv, __pycache__, *.pyc, etc. */
 function shouldSkipTransferEntry(name: string): boolean {
   if (!name || name === "." || name === "..") {
@@ -132,9 +136,11 @@ class TransferMonitor {
 }
 
 export class FtpViewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = "mpftp.ftpView";
+  /** Fresh ids — old mpftp.ftpView / mpftp-panel locations were stuck in the sidebar. */
+  public static readonly viewType = "mpftp.fileTransferView";
+  public static readonly panelContainerId = "mpftp-file-transfer";
 
-  private view?: vscode.WebviewView;
+  private panelView?: vscode.WebviewView;
   private editorPanel: vscode.WebviewPanel | undefined;
   private readonly webviews = new Set<vscode.Webview>();
   private localPath: string;
@@ -142,6 +148,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
   private transferBusy = false;
   private bridgeEventsBound = false;
   private deviceInfo = "";
+  private statusSettleTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -159,22 +166,44 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
     _context: vscode.WebviewViewResolveContext,
     _token: vscode.CancellationToken
   ): void {
-    this.view = webviewView;
-    this.attachWebview(webviewView.webview);
+    this.panelView = webviewView;
+    // Capture before dispose — reading .webview after dispose throws.
+    const webview = webviewView.webview;
+    this.attachWebview(webview, "panel");
     this.updateTitles();
     webviewView.onDidDispose(() => {
-      this.webviews.delete(webviewView.webview);
-      if (this.view === webviewView) {
-        this.view = undefined;
+      this.webviews.delete(webview);
+      if (this.panelView === webviewView) {
+        this.panelView = undefined;
       }
     });
     this.bindBridgeEvents();
   }
 
-  /** Focus the sidebar Board Files view. */
-  async reveal(): Promise<void> {
-    await vscode.commands.executeCommand("mpftp.ftpView.focus");
+  /** Focus File Transfer in the bottom panel (Terminal / Output area). */
+  async openInPanel(): Promise<void> {
+    // Relocate into our panel container (no-op if already there / unsupported).
+    // moveViews also opens the destination container.
+    try {
+      await vscode.commands.executeCommand("vscode.moveViews", {
+        viewIds: [FtpViewProvider.viewType],
+        destinationId: FtpViewProvider.panelContainerId,
+      });
+    } catch {
+      /* ignore */
+    }
+    try {
+      await vscode.commands.executeCommand("workbench.action.focusPanel");
+    } catch {
+      /* ignore */
+    }
+    await vscode.commands.executeCommand(`${FtpViewProvider.viewType}.focus`);
     await this.pushState();
+  }
+
+  /** @deprecated Alias for openInPanel. */
+  async reveal(): Promise<void> {
+    await this.openInPanel();
   }
 
   /**
@@ -183,12 +212,20 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
    */
   openInEditor(): void {
     if (this.editorPanel) {
-      this.editorPanel.reveal(vscode.ViewColumn.Beside);
-      this.updateTitles();
-      void this.pushState();
-      return;
+      try {
+        this.editorPanel.reveal(vscode.ViewColumn.Beside);
+        this.updateTitles();
+        void this.pushState();
+        return;
+      } catch (e: unknown) {
+        // Stale panel: dispose handler used to throw on .webview and never clear.
+        if (!isWebviewDisposedError(e)) {
+          throw e;
+        }
+        this.forgetEditorPanel();
+      }
     }
-    this.editorPanel = vscode.window.createWebviewPanel(
+    const panel = vscode.window.createWebviewPanel(
       "mpftp.ftpEditor",
       this.panelTitle(),
       vscode.ViewColumn.Beside,
@@ -198,19 +235,36 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
         localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "media")],
       }
     );
-    this.editorPanel.iconPath = vscode.Uri.joinPath(this.extensionUri, "resources", "mpftp.svg");
-    this.attachWebview(this.editorPanel.webview);
-    this.editorPanel.onDidDispose(() => {
-      if (this.editorPanel) {
-        this.webviews.delete(this.editorPanel.webview);
+    panel.iconPath = vscode.Uri.joinPath(this.extensionUri, "resources", "mpftp.svg");
+    const webview = panel.webview;
+    this.editorPanel = panel;
+    this.attachWebview(webview, "editor");
+    panel.onDidDispose(() => {
+      this.webviews.delete(webview);
+      if (this.editorPanel === panel) {
+        this.editorPanel = undefined;
       }
-      this.editorPanel = undefined;
     });
     this.bindBridgeEvents();
     void this.pushState();
   }
 
-  /** Editor tab / sidebar title: `mpftp COM4` or `mpftp disconnected`. */
+  /** Drop a stale editor panel without touching its disposed .webview getter. */
+  private forgetEditorPanel(): void {
+    const panel = this.editorPanel;
+    this.editorPanel = undefined;
+    if (!panel) {
+      return;
+    }
+    // Best-effort prune: may already be gone from the set via dispose handler.
+    try {
+      this.webviews.delete(panel.webview);
+    } catch {
+      /* disposed — leave set; postAll will prune on next post */
+    }
+  }
+
+  /** Editor tab / view title: `mpftp COM4` or `mpftp disconnected`. */
   private panelTitle(): string {
     const device = this.bridge.connectedDevice;
     return device ? `mpftp ${shortDeviceName(device)}` : "mpftp disconnected";
@@ -219,19 +273,35 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
   private updateTitles(): void {
     const title = this.panelTitle();
     if (this.editorPanel) {
-      this.editorPanel.title = title;
+      try {
+        this.editorPanel.title = title;
+      } catch (e: unknown) {
+        if (isWebviewDisposedError(e)) {
+          this.forgetEditorPanel();
+        } else {
+          throw e;
+        }
+      }
     }
-    if (this.view) {
-      this.view.title = title;
+    if (this.panelView) {
+      try {
+        this.panelView.title = title;
+      } catch (e: unknown) {
+        if (isWebviewDisposedError(e)) {
+          this.panelView = undefined;
+        } else {
+          throw e;
+        }
+      }
     }
   }
 
-  private attachWebview(webview: vscode.Webview): void {
+  private attachWebview(webview: vscode.Webview, surface: "panel" | "editor"): void {
     webview.options = {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "media")],
     };
-    webview.html = this.getHtml(webview);
+    webview.html = this.getHtml(webview, surface);
     this.webviews.add(webview);
     webview.onDidReceiveMessage(async (msg) => {
       try {
@@ -249,12 +319,16 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
     this.bridgeEventsBound = true;
     this.bridge.on("connected", () => {
       this.updateTitles();
-      void this.refreshDeviceInfo().then(() => this.pushState());
+      void this.refreshDeviceInfo().then(() => {
+        void this.pushState();
+        this.showIdleStatus();
+      });
     });
     this.bridge.on("disconnected", () => {
       this.deviceInfo = "";
       this.updateTitles();
       void this.pushState();
+      this.showIdleStatus();
     });
   }
 
@@ -309,21 +383,21 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
   }
 
   private postAll(msg: Record<string, unknown>): void {
-    // Sidebar and editor tabs share this set; a disposed view (e.g. closed
-    // sidebar) must be pruned or postMessage surfaces "Webview is disposed".
+    // Panel and editor tabs share this set; a disposed view must be pruned or
+    // postMessage surfaces "Webview is disposed".
     for (const webview of [...this.webviews]) {
       try {
         const result = webview.postMessage(msg);
         void Promise.resolve(result).then(
           () => undefined,
           (e: unknown) => {
-            if (/disposed/i.test(String((e as Error)?.message || e))) {
+            if (isWebviewDisposedError(e)) {
               this.webviews.delete(webview);
             }
           }
         );
       } catch (e: unknown) {
-        if (/disposed/i.test(String((e as Error)?.message || e))) {
+        if (isWebviewDisposedError(e)) {
           this.webviews.delete(webview);
           continue;
         }
@@ -333,13 +407,40 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
   }
 
   private status(text: string, phase: TransferPhase = "idle"): void {
+    if (this.statusSettleTimer) {
+      clearTimeout(this.statusSettleTimer);
+      this.statusSettleTimer = undefined;
+    }
     this.postAll({ type: "status", text, phase });
+    // Keep active/stalled visible; ephemeral notes settle back to connection idle.
+    if (phase === "active" || phase === "stalled") {
+      return;
+    }
+    const delay = phase === "done" ? 2500 : 2000;
+    this.statusSettleTimer = setTimeout(() => this.showIdleStatus(), delay);
+  }
+
+  /** Idle footer: connection state (not a generic "Ready"). */
+  private showIdleStatus(): void {
+    if (this.statusSettleTimer) {
+      clearTimeout(this.statusSettleTimer);
+      this.statusSettleTimer = undefined;
+    }
+    if (this.transferBusy) {
+      return;
+    }
+    const device = this.bridge.connectedDevice || "";
+    const text = this.bridge.connected
+      ? `Connected · ${shortDeviceName(device)}`
+      : "Disconnected";
+    this.postAll({ type: "status", text, phase: "idle" });
   }
 
   private async handleMessage(msg: any): Promise<void> {
     switch (msg.type) {
       case "ready":
         await this.pushState();
+        this.showIdleStatus();
         break;
       case "connect":
         await this.onConnect();
@@ -515,6 +616,42 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
         await this.pushState();
         break;
       }
+      case "localNewFile": {
+        const name = await vscode.window.showInputBox({
+          prompt: "New local file name",
+          placeHolder: "main.py",
+        });
+        if (!name) {
+          return;
+        }
+        if (name.includes("/") || name.includes("\\")) {
+          this.status("Name cannot contain path separators");
+          return;
+        }
+        const dest = path.join(this.localPath, name);
+        if (fs.existsSync(dest)) {
+          this.status(`Already exists: ${name}`);
+          return;
+        }
+        fs.writeFileSync(dest, "", { flag: "wx" });
+        this.status(`Created ${dest}`);
+        await this.pushState();
+        break;
+      }
+      case "openLocal": {
+        const local = String(msg.path || "");
+        if (!local) {
+          return;
+        }
+        if (!fs.existsSync(local) || fs.statSync(local).isDirectory()) {
+          this.status(`Not a file: ${local}`);
+          return;
+        }
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(local));
+        await vscode.window.showTextDocument(doc, { preview: false });
+        this.status(`Editing ${local}`);
+        break;
+      }
       case "rm":
         await this.rmMany(msg.remotePaths || []);
         await this.pushState();
@@ -622,7 +759,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
       try {
         remoteEntries = await this.listRemote(this.remotePath);
       } catch (e: any) {
-        this.status(`remote list failed: ${e.message}`);
+        this.status(`remote list failed: ${e.message}`, "stalled");
       }
     }
     const connected = this.bridge.connected;
@@ -933,7 +1070,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
     this.status("Deleted");
   }
 
-  private getHtml(webview: vscode.Webview): string {
+  private getHtml(webview: vscode.Webview, surface: "panel" | "editor"): string {
     const css = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "media", "ftp.css"));
     const js = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "media", "ftp.js"));
     const codicons = webview.asWebviewUri(
@@ -956,22 +1093,62 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
   <link rel="stylesheet" href="${css}" />
   <title>mpftp</title>
 </head>
-<body>
+<body data-surface="${surface}">
   <div id="app">
     <div class="toolbar">
       <button id="btnMore" class="secondary icon-btn more-btn" title="mpftp commands" aria-label="mpftp commands">
         <i class="codicon codicon-ellipsis"></i>
       </button>
-      <button id="btnConnect">Connect</button>
-      <button id="btnRepl" class="secondary" disabled>REPL</button>
-      <button id="btnFirmware" class="secondary" title="Build & flash firmware">Firmware</button>
+      <button id="btnConnect" class="secondary icon-btn tool-btn" title="Connect" aria-label="Connect">
+        <i id="btnConnectIcon" class="codicon codicon-plug"></i>
+      </button>
+      <button id="btnInterrupt" class="secondary icon-btn tool-btn" disabled title="Interrupt (Ctrl+C)" aria-label="Interrupt">
+        <i class="codicon codicon-debug-stop"></i>
+      </button>
+      <button id="btnSoftReset" class="secondary icon-btn tool-btn" disabled title="Soft Reset (skip main.py)" aria-label="Soft Reset">
+        <i class="codicon codicon-debug-rerun"></i>
+      </button>
+      <button id="btnHardReset" class="secondary icon-btn tool-btn" disabled title="Hard Reset" aria-label="Hard Reset">
+        <i class="codicon codicon-debug-restart"></i>
+      </button>
+      <button id="btnRepl" class="secondary tool-label-btn" disabled title="Open REPL" aria-label="REPL">
+        <i class="codicon codicon-terminal"></i><span>REPL</span>
+      </button>
+      <button id="btnFirmware" class="secondary tool-label-btn" title="Build & flash firmware" aria-label="Firmware">
+        <i class="codicon codicon-chip"></i><span>Firmware</span>
+      </button>
     </div>
     <div class="panes">
       <section class="pane" id="localPane">
-        <div class="pane-header"><span>Local</span><button id="btnPickLocal" class="secondary">Browse…</button></div>
+        <div class="pane-header">
+          <span>Local</span>
+          <div class="pane-actions">
+            <button id="btnLocalMkdir" class="secondary icon-btn" title="New folder" aria-label="New local folder">
+              <i class="codicon codicon-new-folder"></i>
+            </button>
+            <button id="btnLocalNewFile" class="secondary icon-btn" title="New file" aria-label="New local file">
+              <i class="codicon codicon-new-file"></i>
+            </button>
+            <button id="btnLocalRun" class="secondary icon-btn" disabled title="Upload & Run" aria-label="Upload and run local Python file">
+              <i class="codicon codicon-play"></i>
+            </button>
+            <button id="btnLocalOpen" class="secondary icon-btn" disabled title="Open in Editor" aria-label="Open local file in editor">
+              <i class="codicon codicon-go-to-file"></i>
+            </button>
+            <button id="btnLocalRename" class="secondary icon-btn" disabled title="Rename" aria-label="Rename local item">
+              <i class="codicon codicon-edit"></i>
+            </button>
+            <button id="btnLocalDelete" class="secondary icon-btn" disabled title="Delete" aria-label="Delete local selection">
+              <i class="codicon codicon-trash"></i>
+            </button>
+          </div>
+        </div>
         <div class="pathbar">
           <button id="btnRefreshLocal" class="secondary icon-btn" title="Refresh"><i class="codicon codicon-refresh"></i></button>
           <input id="localPath" spellcheck="false" />
+          <button id="btnLocalBrowse" class="secondary icon-btn" title="Browse…" aria-label="Browse local folder">
+            <i class="codicon codicon-folder-opened"></i>
+          </button>
         </div>
         <div class="listing" id="localListing"></div>
       </section>
@@ -980,7 +1157,29 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
         <button id="btnXferDown" disabled title="Download"><i class="codicon codicon-arrow-left"></i></button>
       </div>
       <section class="pane" id="remotePane">
-        <div class="pane-header"><span>Board</span></div>
+        <div class="pane-header">
+          <span>Board</span>
+          <div class="pane-actions">
+            <button id="btnRemoteMkdir" class="secondary icon-btn" disabled title="New folder" aria-label="New board folder">
+              <i class="codicon codicon-new-folder"></i>
+            </button>
+            <button id="btnRemoteNewFile" class="secondary icon-btn" disabled title="New file" aria-label="New board file">
+              <i class="codicon codicon-new-file"></i>
+            </button>
+            <button id="btnRemoteRun" class="secondary icon-btn" disabled title="Run board file" aria-label="Run board Python file">
+              <i class="codicon codicon-play"></i>
+            </button>
+            <button id="btnRemoteOpen" class="secondary icon-btn" disabled title="Open in Editor" aria-label="Open board file in editor">
+              <i class="codicon codicon-go-to-file"></i>
+            </button>
+            <button id="btnRemoteRename" class="secondary icon-btn" disabled title="Rename" aria-label="Rename board item">
+              <i class="codicon codicon-edit"></i>
+            </button>
+            <button id="btnRemoteDelete" class="secondary icon-btn" disabled title="Delete" aria-label="Delete board selection">
+              <i class="codicon codicon-trash"></i>
+            </button>
+          </div>
+        </div>
         <div class="pathbar">
           <button id="btnRefreshRemote" class="secondary icon-btn" disabled title="Refresh"><i class="codicon codicon-refresh"></i></button>
           <input id="remotePath" spellcheck="false" />
@@ -988,7 +1187,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
         <div class="listing" id="remoteListing"></div>
       </section>
     </div>
-    <div class="footer" id="footer">Ready</div>
+    <div class="footer" id="footer">Disconnected</div>
   </div>
   <div id="ctxMenu" class="ctx-menu" hidden></div>
   <script src="${js}"></script>

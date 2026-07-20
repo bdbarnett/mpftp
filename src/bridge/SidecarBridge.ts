@@ -278,7 +278,7 @@ export class SidecarBridge extends EventEmitter {
     await vscode.commands.executeCommand("setContext", "mpftp.connected", true);
     this.activity?.event("connected", { message: device, data: { device } });
     // `silent` reconnects (e.g. after detect/flash) restore the link without
-    // firing user-facing side effects such as auto-opening the file browser.
+    // firing user-facing side effects such as auto-opening File Transfer.
     this.emit("connected", device, { silent: !!opts?.silent });
   }
 

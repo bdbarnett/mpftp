@@ -86,10 +86,36 @@ body {
   background: var(--hover);
 }
 
-.toolbar .more-btn .codicon {
+.toolbar .more-btn .codicon,
+.toolbar .tool-btn .codicon {
   font-size: 16px;
   line-height: 1;
   display: block;
+}
+
+/* Session controls (Interrupt, Hard reset, Connect): compact icon buttons */
+.toolbar .tool-btn {
+  width: 28px;
+  height: 24px;
+  min-width: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+
+.toolbar .tool-label-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  line-height: 1;
+}
+
+.toolbar .tool-label-btn .codicon {
+  font-size: 14px;
+  line-height: 1;
 }
 
 button,
@@ -159,6 +185,28 @@ button:disabled {
   font-weight: 400;
 }
 
+.pane-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.pane-actions .icon-btn {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+}
+
+.pane-actions .icon-btn:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--fg);
+}
+
+.pane-actions .icon-btn:disabled {
+  opacity: 0.35;
+}
+
 .pathbar {
   display: flex;
   gap: 4px;
@@ -182,6 +230,10 @@ button:disabled {
 
 .pathbar input:focus {
   border-color: var(--vscode-focusBorder, var(--accent));
+}
+
+.pathbar .icon-btn {
+  flex-shrink: 0;
 }
 
 .listing {
