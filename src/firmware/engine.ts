@@ -90,6 +90,7 @@ export class FirmwareEngine {
     return new Promise<T>((resolve, reject) => {
       const proc = spawn(this.buildPython(), [this.script(), ...argv], {
         env: { ...process.env, PYTHONUNBUFFERED: "1" },
+        windowsHide: true,
       });
       let out = "";
       let err = "";
@@ -119,6 +120,7 @@ export class FirmwareEngine {
     const proc = spawn(this.buildPython(), [this.script(), ...argv], {
       env: { ...process.env, PYTHONUNBUFFERED: "1" },
       detached: true, // own process group so cancel kills make/esptool too
+      windowsHide: true, // Windows: detached otherwise opens an empty console
     });
     proc.stdout.setEncoding("utf8");
     proc.stderr.setEncoding("utf8");

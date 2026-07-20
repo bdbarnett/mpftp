@@ -1,9 +1,9 @@
 {
   "name": "mpftp",
-  "displayName": "mpftp - MicroPython Board",
-  "description": "FTP-style file transfer and ANSI REPL for MicroPython boards over USB serial (Linux, Windows, WSL via mpremote.exe).",
+  "displayName": "mpftp — MicroPython Board Tools",
+  "description": "Connect to MicroPython boards over USB serial: dual-pane file transfer, ANSI REPL, and guided firmware download/build/flash. Works on Linux, Windows, and WSL (COM ports via Windows Python).",
   "version": "0.1.0",
-  "publisher": "bdbarnett",
+  "publisher": "pydevices",
   "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
@@ -18,7 +18,9 @@
     "repl",
     "serial",
     "ftp",
-    "embedded"
+    "embedded",
+    "esp32",
+    "firmware"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -207,20 +209,25 @@
           "default": true,
           "description": "When a board connects, open File Transfer as an editor tab (instead of only focusing the panel view)."
         },
+        "mpftp.workspacePath": {
+          "type": "string",
+          "default": "",
+          "description": "Firmware workspace: folder that contains micropython/ (or is the MicroPython tree). Port SDKs may live here as directories or symlinks, or via environment variables."
+        },
         "mpftp.micropythonPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the MicroPython checkout used by the Firmware builder (the folder containing ports/ and py/). Leave empty to auto-discover."
+          "description": "Override path to the MicroPython checkout (ports/ + py/). Leave empty to resolve from the firmware workspace, MP_DIR, or ~/micropython."
         },
         "mpftp.idfPath": {
           "type": "string",
           "default": "",
-          "description": "Path to ESP-IDF (folder containing export.sh) for esp32 builds. Leave empty to auto-discover (IDF_PATH / common locations)."
+          "description": "Override path to ESP-IDF (export.sh). Leave empty to use IDF_PATH / IDF_DIR or an esp-idf directory/symlink under the firmware workspace."
         },
         "mpftp.emsdkPath": {
           "type": "string",
           "default": "",
-          "description": "Path to emsdk (folder containing emsdk_env.sh) for webassembly builds. Leave empty to auto-discover."
+          "description": "Override path to emsdk (emsdk_env.sh). Leave empty to use EMSDK / EMSDK_DIR or an emsdk directory/symlink under the firmware workspace."
         },
         "mpftp.toolchainBins": {
           "type": "array",
@@ -271,7 +278,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/bdbarnett/mpftp.git"
+    "url": "https://github.com/PyDevices/mpftp.git"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

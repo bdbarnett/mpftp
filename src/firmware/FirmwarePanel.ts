@@ -162,12 +162,82 @@ export class FirmwarePanel {
   // Engine path args
   // ---------------------------------------------------------------------- //
 
-  private mpDir(): string {
+  /** VS Code / Cursor workspace folders (editor open roots). */
+  private editorWorkspaces(): string[] {
+    return (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+  }
+
+  /** True if path is a MicroPython tree (ports/ + py/). */
+  private isMpTree(dir: string): boolean {
     return (
-      getConfig().micropythonPath ||
-      (this.discovery.micropython as string) ||
-      ""
+      !!dir &&
+      fs.existsSync(path.join(dir, "ports")) &&
+      fs.existsSync(path.join(dir, "py"))
     );
+  }
+
+  /** Resolve MicroPython under a firmware workspace folder. */
+  private mpUnderWorkspace(root: string): string {
+    if (this.isMpTree(root)) {
+      return root;
+    }
+    const nested = path.join(root, "micropython");
+    return this.isMpTree(nested) ? nested : "";
+  }
+
+  /** Firmware workspace used for modules/stubs (setting, discovery, or MP parent). */
+  private firmwareWorkspace(): string {
+    const cfg = getConfig();
+    if (cfg.workspacePath && fs.existsSync(cfg.workspacePath)) {
+      return cfg.workspacePath;
+    }
+    const discovered =
+      (this.discovery.workspace as string) ||
+      (this.cmods.workspaceDir as string) ||
+      "";
+    if (discovered && fs.existsSync(discovered)) {
+      return discovered;
+    }
+    const mp = this.mpDir();
+    return mp ? path.dirname(mp) : "";
+  }
+
+  private mpDir(): string {
+    const cfg = getConfig();
+    if (cfg.micropythonPath && this.isMpTree(cfg.micropythonPath)) {
+      return cfg.micropythonPath;
+    }
+    if (cfg.workspacePath) {
+      const under = this.mpUnderWorkspace(cfg.workspacePath);
+      if (under) {
+        return under;
+      }
+    }
+    if (this.discovery.micropython) {
+      return this.discovery.micropython as string;
+    }
+    for (const root of this.editorWorkspaces()) {
+      const under = this.mpUnderWorkspace(root);
+      if (under) {
+        return under;
+      }
+    }
+    return "";
+  }
+
+  /** Roots passed to the engine: configured workspace first, then open folders. */
+  private workspaceArg(): string {
+    const cfg = getConfig();
+    const roots: string[] = [];
+    if (cfg.workspacePath) {
+      roots.push(cfg.workspacePath);
+    }
+    for (const f of this.editorWorkspaces()) {
+      if (!roots.includes(f)) {
+        roots.push(f);
+      }
+    }
+    return roots.join(path.delimiter);
   }
 
   private pathArgs(): Record<string, string> {
@@ -176,6 +246,10 @@ export class FirmwarePanel {
     const mp = this.mpDir();
     if (mp) {
       args.mp = mp;
+    }
+    const ws = this.workspaceArg();
+    if (ws) {
+      args.workspace = ws;
     }
     if (cfg.idfPath) {
       args.idf = cfg.idfPath;
@@ -226,6 +300,12 @@ export class FirmwarePanel {
         break;
       case "changePath":
         await this.changePath();
+        break;
+      case "chooseWorkspace":
+        await this.chooseWorkspace();
+        break;
+      case "createWorkspaceStubs":
+        await this.createWorkspaceStubs();
         break;
       case "select":
         this.selection = {
@@ -316,6 +396,30 @@ export class FirmwarePanel {
     } catch (e: any) {
       this.log(`[mpftp] discover failed: ${e?.message || e}`);
     }
+
+    // Persist a firmware workspace when discover found MicroPython under an
+    // open folder / setting and the user has not pinned one yet.
+    const cfg = getConfig();
+    if (!cfg.workspacePath && this.discovery.workspace) {
+      const ws = String(this.discovery.workspace);
+      if (this.mpUnderWorkspace(ws) || this.isMpTree(ws)) {
+        await vscode.workspace
+          .getConfiguration("mpftp")
+          .update("workspacePath", ws, vscode.ConfigurationTarget.Global);
+      } else {
+        const mp = this.discovery.micropython as string | undefined;
+        if (mp && this.isMpTree(mp)) {
+          await vscode.workspace
+            .getConfiguration("mpftp")
+            .update(
+              "workspacePath",
+              path.dirname(mp),
+              vscode.ConfigurationTarget.Global
+            );
+        }
+      }
+    }
+
     try {
       const f = await this.engine.run<{ flashers: Record<string, string> }>("flashers");
       this.flashers = f.flashers || {};
@@ -406,6 +510,8 @@ export class FirmwarePanel {
             break;
           }
         }
+        // Detect ran before scrape; re-apply P4 Wi-Fi variant from MP hints.
+        this.reapplyWifiVariantFromHints(info.variants);
       }
       // Prefill Flash offset from upstream board.json (e.g. P4 → 0x2000).
       if (typeof info.flashOffset === "string" && info.flashOffset) {
@@ -666,6 +772,29 @@ export class FirmwarePanel {
     }
   }
 
+  /**
+   * After download-list scrapes MP variants (C6_WIFI, …), pick Wi-Fi variant
+   * from Detect's MicroPython hints if Target still has the default image.
+   */
+  private reapplyWifiVariantFromHints(variants: string[]): void {
+    if (this.selection.variant) {
+      return;
+    }
+    const mp = ((this.lastDetect as any)?.mp || {}) as Record<string, unknown>;
+    const blob = ["build", "machine", "version", "platform"]
+      .map((k) => String(mp[k] || ""))
+      .join(" ")
+      .toUpperCase();
+    for (const w of ["C6_WIFI", "C5_WIFI"]) {
+      if (blob.includes(w) && (variants.length === 0 || variants.includes(w))) {
+        this.selection = { ...this.selection, variant: w };
+        this.savePrefs();
+        this.log(`[mpftp] Target variant → ${w} (from running firmware)`);
+        return;
+      }
+    }
+  }
+
   /** Select a port node, picking a GENERIC board when the board is unknown. */
   private selectPort(port: string, board = "", variant = ""): void {
     let b = board;
@@ -776,7 +905,7 @@ export class FirmwarePanel {
       type: "state",
       host: detectHost(),
       micropython: this.mpDir(),
-      workspace: this.discovery.workspace || null,
+      workspace: this.firmwareWorkspace() || this.discovery.workspace || null,
       tree: this.tree,
       cmods: this.cmods,
       flashers: this.flashers,
@@ -791,9 +920,62 @@ export class FirmwarePanel {
   }
 
   // ---------------------------------------------------------------------- //
-  // Change MicroPython path
+  // Firmware workspace / MicroPython path
   // ---------------------------------------------------------------------- //
 
+  /** Quick-pick open folders + Browse… when MicroPython is not resolved. */
+  private async chooseWorkspace(): Promise<void> {
+    type Item = vscode.QuickPickItem & { id: string; folder?: string };
+    const items: Item[] = this.editorWorkspaces().map((f) => ({
+      id: "folder",
+      folder: f,
+      label: path.basename(f),
+      description: this.mpUnderWorkspace(f) ? "has MicroPython" : "no MicroPython yet",
+      detail: f,
+    }));
+    items.push({
+      id: "browse",
+      label: "Browse…",
+      description: "Pick a firmware workspace folder",
+    });
+    const pick = await vscode.window.showQuickPick(items, {
+      title: "Select firmware workspace",
+      placeHolder: "Folder containing micropython/ (or the MicroPython tree itself)",
+    });
+    if (!pick) {
+      return;
+    }
+    let root = pick.folder || "";
+    if (pick.id === "browse") {
+      const uris = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        openLabel: "Select firmware workspace",
+        title: "Select the firmware workspace (contains micropython/)",
+      });
+      if (!uris?.[0]) {
+        return;
+      }
+      root = uris[0].fsPath;
+    }
+    const mp = this.mpUnderWorkspace(root);
+    if (!mp) {
+      void vscode.window.showErrorMessage(
+        "That folder has no MicroPython tree (need micropython/ with ports/ and py/, or the tree itself)."
+      );
+      return;
+    }
+    const cfg = vscode.workspace.getConfiguration("mpftp");
+    await cfg.update("workspacePath", root, vscode.ConfigurationTarget.Global);
+    // Clear a stale MP override so the workspace wins.
+    if (cfg.get<string>("micropythonPath")) {
+      await cfg.update("micropythonPath", "", vscode.ConfigurationTarget.Global);
+    }
+    await this.refreshAll();
+  }
+
+  /** Advanced override: pin an explicit MicroPython checkout. */
   private async changePath(): Promise<void> {
     const uris = await vscode.window.showOpenDialog({
       canSelectFiles: false,
@@ -806,15 +988,94 @@ export class FirmwarePanel {
       return;
     }
     const p = uris[0].fsPath;
-    if (!fs.existsSync(path.join(p, "ports")) || !fs.existsSync(path.join(p, "py"))) {
+    if (!this.isMpTree(p)) {
       void vscode.window.showErrorMessage(
         "That folder is not a MicroPython tree (missing ports/ or py/)."
       );
       return;
     }
-    await vscode.workspace
-      .getConfiguration("mpftp")
-      .update("micropythonPath", p, vscode.ConfigurationTarget.Global);
+    const cfg = vscode.workspace.getConfiguration("mpftp");
+    await cfg.update("micropythonPath", p, vscode.ConfigurationTarget.Global);
+    const parent = path.dirname(p);
+    if (!cfg.get<string>("workspacePath")) {
+      await cfg.update("workspacePath", parent, vscode.ConfigurationTarget.Global);
+    }
+    await this.refreshAll();
+  }
+
+  /** Write bundled micropython.cmake + manifest.py into the firmware workspace. */
+  private async createWorkspaceStubs(): Promise<void> {
+    const workspace = this.firmwareWorkspace();
+    if (!workspace) {
+      void vscode.window.showErrorMessage(
+        "Firmware workspace not set. Choose a workspace that contains MicroPython first."
+      );
+      return;
+    }
+    if (!fs.existsSync(workspace)) {
+      void vscode.window.showErrorMessage(`Workspace folder not found: ${workspace}`);
+      return;
+    }
+
+    const templatesDir = path.join(this.extensionPath, "resources", "templates");
+    const stubs: Array<{ name: string; dest: string }> = [
+      {
+        name: "micropython.cmake",
+        dest: path.join(workspace, "micropython.cmake"),
+      },
+      { name: "manifest.py", dest: path.join(workspace, "manifest.py") },
+    ];
+
+    const toWrite: Array<{ name: string; dest: string; src: string }> = [];
+    const skipped: string[] = [];
+    for (const s of stubs) {
+      const src = path.join(templatesDir, s.name);
+      if (!fs.existsSync(src)) {
+        void vscode.window.showErrorMessage(
+          `mpftp template missing: resources/templates/${s.name}`
+        );
+        return;
+      }
+      if (fs.existsSync(s.dest)) {
+        skipped.push(s.name);
+        continue;
+      }
+      toWrite.push({ ...s, src });
+    }
+
+    if (!toWrite.length) {
+      void vscode.window.showInformationMessage(
+        `Workspace already has ${skipped.join(" and ")}.`
+      );
+      return;
+    }
+
+    const names = toWrite.map((t) => t.name).join(" + ");
+    const ok = await vscode.window.showInformationMessage(
+      `Create ${names} in ${workspace}?` +
+        (skipped.length ? ` (keep existing ${skipped.join(", ")})` : ""),
+      { modal: true },
+      "Create"
+    );
+    if (ok !== "Create") {
+      return;
+    }
+
+    try {
+      for (const t of toWrite) {
+        fs.copyFileSync(t.src, t.dest);
+        this.log(`[mpftp] created ${t.dest}`);
+      }
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(
+        `Failed to create workspace stubs: ${e?.message || e}`
+      );
+      return;
+    }
+
+    void vscode.window.showInformationMessage(
+      `Created ${names}. Add sibling modules with their own micropython.cmake to include them in builds.`
+    );
     await this.refreshAll();
   }
 
@@ -1019,6 +1280,8 @@ export class FirmwarePanel {
         this.selection.port = result.port;
       }
       this.phase("ready", "Downloaded");
+      const path = String(result.artifact || "");
+      this.log(`[mpftp] downloaded → ${path}`);
       this.post({ type: "artifact", artifact: this.downloadedArtifact });
       if (typeof result.flashOffset === "string" && result.flashOffset) {
         this.post({

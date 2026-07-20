@@ -203,6 +203,14 @@ def release_sidecar_pid() -> None:
             pass
 
 
+# MicroPython inisetup / _boot spam when the vfs partition is corrupt.
+_FS_CORRUPT_MARKERS = (
+    b"filesystem appears to be corrupted",
+    b"factory reprogramming of MicroPython",
+    b"fs_corrupted",
+)
+
+
 class Session:
     def __init__(self) -> None:
         self.transport = None
@@ -214,6 +222,9 @@ class Session:
         self._repl_stop = threading.Event()
         self._repl_thread: Optional[threading.Thread] = None
         self._mounted_path: Optional[str] = None
+        # Set when connect had to skip raw soft-reset because boot loops on a
+        # corrupt filesystem (soft-reset would never re-enter raw REPL).
+        self.filesystem_warning: Optional[str] = None
 
     def list_ports(self) -> list[dict[str, Any]]:
         import serial.tools.list_ports
@@ -258,6 +269,7 @@ class Session:
         with self._lock:
             self.disconnect()
             self.baud = baud
+            self.filesystem_warning = None
             last_probe_err: Optional[Exception] = None
             for attempt in range(1, max(1, attempts) + 1):
                 last = attempt >= max(1, attempts)
@@ -303,6 +315,8 @@ class Session:
                     result["rtc"] = rtc
                 if attempt > 1:
                     result["retries"] = attempt - 1
+                if self.filesystem_warning:
+                    result["filesystem_warning"] = self.filesystem_warning
                 return result
             # Unreachable: the loop always returns or raises on the last attempt.
             raise RuntimeError(
@@ -329,6 +343,8 @@ class Session:
                 }
                 if rtc is not None:
                     result["rtc"] = rtc
+                if self.filesystem_warning:
+                    result["filesystem_warning"] = self.filesystem_warning
                 return result
         return self.connect(device, baud if baud is not None else self.baud)
 
@@ -399,6 +415,10 @@ class Session:
         except Exception:
             return b""
 
+    @staticmethod
+    def _serial_shows_fs_corrupt(data: bytes) -> bool:
+        return any(m in data for m in _FS_CORRUPT_MARKERS)
+
     def _take_control(
         self, t: Any, *, clean: bool = True, timeout_overall: float = 20.0
     ) -> None:
@@ -407,12 +427,24 @@ class Session:
         Always sends Ctrl-C (Thonny-style interrupt-on-connect). When ``clean``
         is True, soft-resets *while in raw REPL* so ``main.py`` does not run
         (MicroPython skips auto-start after a raw soft-reset).
+
+        Exception: a corrupt on-board filesystem makes soft-reset re-run
+        ``_boot``/``inisetup``, which loops printing the corruption banner and
+        never returns to raw REPL. In that case we interrupt + enter raw
+        without soft-reset and set ``filesystem_warning``.
         """
         import time
 
         serial = getattr(t, "serial", None)
         if serial is None:
             raise RuntimeError("transport has no serial port")
+
+        saw_fs_corrupt = False
+
+        def note_bytes(data: bytes) -> None:
+            nonlocal saw_fs_corrupt
+            if data and self._serial_shows_fs_corrupt(data):
+                saw_fs_corrupt = True
 
         def ctrl_c() -> None:
             try:
@@ -428,17 +460,50 @@ class Session:
                     time.sleep(delay)
                 ctrl_c()
             time.sleep(0.05)
-            self._serial_flush(serial)
+            try:
+                n = serial.inWaiting()
+                if n:
+                    note_bytes(serial.read(n))
+            except Exception:
+                pass
 
         # If a prior esptool session left the chip in ROM download mode, reboot
         # into firmware before trying the raw-REPL handshake.
         peek = self._serial_peek(serial, 0.2)
+        note_bytes(peek)
         if b"waiting for download" in peek or b"DOWNLOAD(" in peek:
             self._reset_esp_to_app(serial)
+            note_bytes(self._serial_peek(serial, 0.3))
 
         interrupt_storm()
 
+        def try_raw(soft_reset: bool, per: float) -> bool:
+            try:
+                t.enter_raw_repl(soft_reset=soft_reset, timeout_overall=per)
+                return True
+            except Exception:
+                try:
+                    n = serial.inWaiting()
+                    if n:
+                        note_bytes(serial.read(n))
+                except Exception:
+                    pass
+                raise
+
         last_err: Optional[Exception] = None
+        # Corrupt FS: soft-reset never recovers — interrupt and enter raw only.
+        if clean and saw_fs_corrupt:
+            try:
+                if try_raw(False, 5.0):
+                    self.filesystem_warning = (
+                        "On-board filesystem is corrupted. Connect succeeded without "
+                        "soft-reset; erase flash and reflash MicroPython (Firmware > "
+                        "Erase) to restore a usable filesystem."
+                    )
+                    return
+            except Exception as e:
+                last_err = e
+
         # Two short tries, then one app-mode reset (covers silent download mode
         # where the banner was already drained), then two more tries.
         schedule = [
@@ -451,11 +516,31 @@ class Session:
         for action, per in schedule:
             if action == "reset":
                 self._reset_esp_to_app(serial)
+                note_bytes(self._serial_peek(serial, 0.3))
                 interrupt_storm()
-                continue
+                # After reset the board may start the corrupt-FS boot loop.
+                if clean and saw_fs_corrupt:
+                    try:
+                        if try_raw(False, 5.0):
+                            self.filesystem_warning = (
+                                "On-board filesystem is corrupted. Connect succeeded "
+                                "without soft-reset; erase flash and reflash MicroPython "
+                                "(Firmware > Erase) to restore a usable filesystem."
+                            )
+                            return
+                    except Exception as e:
+                        last_err = e
+                    continue
+            use_soft = bool(clean) and not saw_fs_corrupt
             try:
-                t.enter_raw_repl(soft_reset=clean, timeout_overall=per)
-                return
+                if try_raw(use_soft, per):
+                    if saw_fs_corrupt and not use_soft:
+                        self.filesystem_warning = (
+                            "On-board filesystem is corrupted. Connect succeeded without "
+                            "soft-reset; erase flash and reflash MicroPython (Firmware > "
+                            "Erase) to restore a usable filesystem."
+                        )
+                    return
             except Exception as e:
                 last_err = e
                 try:
@@ -465,15 +550,38 @@ class Session:
                 for _ in range(4):
                     ctrl_c()
                     time.sleep(0.08)
-                self._serial_flush(serial)
+                try:
+                    n = serial.inWaiting()
+                    if n:
+                        note_bytes(serial.read(n))
+                except Exception:
+                    pass
                 try:
                     serial.write(b"\r\x01")  # poke raw REPL (Thonny)
                 except Exception:
                     pass
                 time.sleep(0.1)
 
+        # Last resort: even without a banner match, soft-reset may be the
+        # failure mode (banner drained / binary noise). Try interrupt-only.
+        if clean:
+            interrupt_storm()
+            try:
+                if try_raw(False, 5.0):
+                    if saw_fs_corrupt:
+                        self.filesystem_warning = (
+                            "On-board filesystem is corrupted. Connect succeeded without "
+                            "soft-reset; erase flash and reflash MicroPython (Firmware > "
+                            "Erase) to restore a usable filesystem."
+                        )
+                    return
+            except Exception as e:
+                last_err = e
+
         detail = str(last_err.args[0] if last_err and getattr(last_err, "args", None) else last_err)
-        raise RuntimeError(self._friendly_take_control_error(detail)) from last_err
+        raise RuntimeError(
+            self._friendly_take_control_error(detail, fs_corrupt=saw_fs_corrupt)
+        ) from last_err
 
     @staticmethod
     def _friendly_port_open_error(device: str, exc: BaseException) -> str:
@@ -497,7 +605,16 @@ class Session:
         return f"failed to access {device}: {raw}"
 
     @staticmethod
-    def _friendly_take_control_error(detail: str) -> str:
+    def _friendly_take_control_error(detail: str, *, fs_corrupt: bool = False) -> str:
+        if fs_corrupt or any(
+            s in detail.lower()
+            for s in ("filesystem appears to be corrupted", "fs_corrupted")
+        ):
+            return (
+                f"could not take control of MicroPython: on-board filesystem is corrupted "
+                f"({detail}). Erase flash and reflash MicroPython "
+                f"(Firmware panel > Erase), then Connect again."
+            )
         return (
             f"could not take control of MicroPython (interrupt/raw REPL failed): {detail}\n"
             f"Device is busy or does not respond. Your options:\n"
@@ -511,6 +628,8 @@ class Session:
     @staticmethod
     def _friendly_probe_error(device: str, exc: BaseException) -> str:
         detail = str(exc.args[0] if getattr(exc, "args", None) else exc)
+        if "filesystem is corrupted" in detail.lower():
+            return f"{device}: {detail}"
         base = (
             f"{device} is not responding as MicroPython "
             f"(likely bootloader/UF2 mode, wrong port, or busy REPL): {detail}"

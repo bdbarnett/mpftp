@@ -213,6 +213,21 @@ class MatchTests(unittest.TestCase):
         m = self._match(P4_FLASH_ID, {"build": "ESP32_GENERIC_P4-C6_WIFI"})
         self.assertEqual(m["variant"], "C6_WIFI")
 
+    def test_p4_c6_wifi_from_hints_without_tree_variants(self):
+        # Download mode: catalog boards have no variants until the page scrape.
+        f = self.eng.parse_esptool_flash_id(P4_FLASH_ID)
+        family = self.eng.family_from_chip(f["chip"])
+        tree = [{"port": "esp32", "boards": [{"board": "ESP32_GENERIC_P4", "variants": []}]}]
+        m = self.eng.match_esp_target(
+            family,
+            f["psram"],
+            f["flashMb"],
+            {"build": "ESP32_GENERIC_P4-C6_WIFI", "machine": "ESP32-P4"},
+            tree,
+        )
+        self.assertEqual(m["variant"], "C6_WIFI")
+        self.assertIn("C6_WIFI", m["variantOptions"])
+
     def test_s3_no_psram_default(self):
         m = self._match(S3_NO_PSRAM)
         self.assertEqual(m["board"], "ESP32_GENERIC_S3")

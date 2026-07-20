@@ -269,9 +269,12 @@ export class SidecarBridge extends EventEmitter {
     device: string,
     baud?: number,
     opts?: { silent?: boolean }
-  ): Promise<void> {
+  ): Promise<{ filesystem_warning?: string } | void> {
     const cfg = getConfig();
-    await this.request("connect", { device, baud: baud ?? cfg.defaultBaud });
+    const res = await this.request<{
+      device?: string;
+      filesystem_warning?: string;
+    }>("connect", { device, baud: baud ?? cfg.defaultBaud });
     this._connectedDevice = device;
     this._lastDevice = device;
     await this.persistLastDevice(device);
@@ -280,6 +283,7 @@ export class SidecarBridge extends EventEmitter {
     // `silent` reconnects (e.g. after detect/flash) restore the link without
     // firing user-facing side effects such as auto-opening File Transfer.
     this.emit("connected", device, { silent: !!opts?.silent });
+    return res;
   }
 
   /** Reconnect to the last device (after hard-reset / port flicker / reload). */

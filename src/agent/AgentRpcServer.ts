@@ -177,6 +177,38 @@ export class AgentRpcServer {
     if (mp) {
       pathArgs.mp = mp;
     }
+    const roots: string[] = [];
+    if (cfg.workspacePath) {
+      roots.push(cfg.workspacePath);
+    }
+    for (const f of vscode.workspace.workspaceFolders || []) {
+      const p = f.uri.fsPath;
+      if (!roots.includes(p)) {
+        roots.push(p);
+      }
+    }
+    if (roots.length) {
+      pathArgs.workspace = roots.join(path.delimiter);
+    }
+    if (!pathArgs.mp) {
+      for (const root of roots) {
+        const nested = path.join(root, "micropython");
+        if (
+          fs.existsSync(path.join(nested, "ports")) &&
+          fs.existsSync(path.join(nested, "py"))
+        ) {
+          pathArgs.mp = nested;
+          break;
+        }
+        if (
+          fs.existsSync(path.join(root, "ports")) &&
+          fs.existsSync(path.join(root, "py"))
+        ) {
+          pathArgs.mp = root;
+          break;
+        }
+      }
+    }
     if (cfg.idfPath) {
       pathArgs.idf = cfg.idfPath;
     }

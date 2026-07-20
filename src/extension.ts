@@ -102,9 +102,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
 
     try {
-      await bridge.connect(device);
+      const connected = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `mpftp: connecting ${device}…`,
+        },
+        async () => bridge.connect(device)
+      );
       updateStatus();
-      void vscode.window.showInformationMessage(`mpftp connected: ${device}`);
+      const fsWarn =
+        connected && typeof connected === "object"
+          ? connected.filesystem_warning
+          : undefined;
+      if (fsWarn) {
+        void vscode.window.showWarningMessage(`mpftp connected: ${device} — ${fsWarn}`);
+      } else {
+        void vscode.window.showInformationMessage(`mpftp connected: ${device}`);
+      }
     } catch (e: any) {
       void vscode.window.showErrorMessage(`mpftp connect failed: ${e.message || e}`);
       log.appendLine(String(e));

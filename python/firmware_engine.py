@@ -38,6 +38,15 @@ import shutil
 import subprocess
 import sys
 import time
+
+
+def _no_window_kwargs() -> dict:
+    """Avoid flashing a blank console on Windows when spawning esptool/make."""
+    if os.name != "nt":
+        return {}
+    # CREATE_NO_WINDOW = 0x08000000 (Python 3.7+ exposes it as an attribute).
+    flag = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    return {"creationflags": flag}
 from pathlib import Path
 from typing import Any, Optional
 
@@ -136,101 +145,120 @@ def save_state(patch: dict) -> None:
 
 # --------------------------------------------------------------------------- #
 # Path discovery
+#
+# MicroPython: settings hint → MP_DIR → ~/micropython → workspace candidates
+# (configured firmware workspace + editor open folders). No personal layouts.
+#
+# Port SDK trees (ESP-IDF, emsdk, …): settings → env → <workspace>/<name>.
+# Same contract for every tree; no well-known home paths for individual SDKs.
 # --------------------------------------------------------------------------- #
 
 def _is_mp_tree(p: Path) -> bool:
     return (p / "ports").is_dir() and (p / "py").is_dir()
 
 
-def find_micropython(hint: Optional[str]) -> Optional[Path]:
-    """Resolve the MicroPython tree: hint -> MP_DIR env -> search -> saved."""
+def _workspace_roots(workspace: Optional[str]) -> list[Path]:
+    """Split an os.pathsep-joined list of workspace / editor folder roots."""
+    if not workspace:
+        return []
+    out: list[Path] = []
+    seen: set[str] = set()
+    for part in str(workspace).split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        key = os.path.normcase(os.path.abspath(os.path.expanduser(part)))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(Path(part).expanduser())
+    return out
+
+
+def _first_existing(candidates: list[Path], ok) -> Optional[Path]:
+    for c in candidates:
+        try:
+            if c and ok(c):
+                return c.resolve()
+        except Exception:
+            continue
+    return None
+
+
+def find_micropython(
+    hint: Optional[str], workspace: Optional[str] = None
+) -> Optional[Path]:
+    """Resolve the MicroPython tree.
+
+    Order: explicit hint → MP_DIR → ~/micropython → each workspace root
+    (firmware workspace and editor folders) as the tree itself or …/micropython.
+    """
     candidates: list[Path] = []
     if hint:
         candidates.append(Path(hint).expanduser())
     env = os.environ.get("MP_DIR")
     if env:
         candidates.append(Path(env).expanduser())
+    candidates.append(HOME / "micropython")
+    for root in _workspace_roots(workspace):
+        candidates.append(root)
+        candidates.append(root / "micropython")
     saved = load_state().get("micropythonPath")
     if saved:
-        candidates.append(Path(saved).expanduser())
-
-    # Common cmods-style layouts and workspace neighbours.
-    search_roots = [
-        HOME / "gh" / "pydevices" / "cmods",
-        HOME / "github" / "cmods",
-        HOME / "gh" / "pydevices",
-        Path.cwd(),
-        Path.cwd().parent,
-    ]
-    for root in search_roots:
-        candidates.append(root / "micropython")
-
-    for c in candidates:
-        try:
-            if c and _is_mp_tree(c):
-                return c.resolve()
-        except Exception:
-            continue
-
-    # Shallow scan of a couple of roots for any */micropython.
-    for root in [HOME / "gh" / "pydevices", HOME / "github", HOME / "gh"]:
-        try:
-            if not root.is_dir():
-                continue
-            for child in sorted(root.iterdir()):
-                mp = child / "micropython"
-                if _is_mp_tree(mp):
-                    return mp.resolve()
-        except Exception:
-            continue
-    return None
+        candidates.append(Path(str(saved)).expanduser())
+    return _first_existing(candidates, _is_mp_tree)
 
 
-def find_idf(hint: Optional[str], workspace: Optional[Path]) -> Optional[Path]:
+def find_sdk_tree(
+    *,
+    hint: Optional[str],
+    env_keys: tuple[str, ...],
+    workspace: Optional[Path],
+    dirname: str,
+    marker_file: str,
+    saved_key: Optional[str] = None,
+) -> Optional[Path]:
+    """Resolve a port dependency tree: hint → env → workspace/<dirname>."""
+
+    def ok(p: Path) -> bool:
+        return (p / marker_file).is_file()
+
     candidates: list[Path] = []
     if hint:
         candidates.append(Path(hint).expanduser())
-    for key in ("IDF_DIR", "IDF_PATH"):
+    for key in env_keys:
         v = os.environ.get(key)
         if v:
             candidates.append(Path(v).expanduser())
-    saved = load_state().get("idfPath")
-    if saved:
-        candidates.append(Path(saved).expanduser())
+    if saved_key:
+        saved = load_state().get(saved_key)
+        if saved:
+            candidates.append(Path(str(saved)).expanduser())
     if workspace:
-        candidates.append(workspace.parent.parent / "other" / "esp-idf")
-        candidates.append(workspace / "esp-idf")
-    candidates += [
-        HOME / "esp" / "esp-idf",
-        HOME / "esp-idf",
-        HOME / ".espressif" / "esp-idf",
-    ]
-    for c in candidates:
-        try:
-            if c and (c / "export.sh").is_file():
-                return c.resolve()
-        except Exception:
-            continue
-    return None
+        candidates.append(workspace / dirname)
+    return _first_existing(candidates, ok)
+
+
+def find_idf(hint: Optional[str], workspace: Optional[Path]) -> Optional[Path]:
+    return find_sdk_tree(
+        hint=hint,
+        env_keys=("IDF_DIR", "IDF_PATH"),
+        workspace=workspace,
+        dirname="esp-idf",
+        marker_file="export.sh",
+        saved_key="idfPath",
+    )
 
 
 def find_emsdk(hint: Optional[str], workspace: Optional[Path]) -> Optional[Path]:
-    candidates: list[Path] = []
-    if hint:
-        candidates.append(Path(hint).expanduser())
-    v = os.environ.get("EMSDK_DIR") or os.environ.get("EMSDK")
-    if v:
-        candidates.append(Path(v).expanduser())
-    if workspace:
-        candidates.append(workspace.parent.parent / "other" / "emsdk")
-    candidates.append(HOME / "emsdk")
-    for c in candidates:
-        try:
-            if c and (c / "emsdk_env.sh").is_file():
-                return c.resolve()
-        except Exception:
-            continue
-    return None
+    return find_sdk_tree(
+        hint=hint,
+        env_keys=("EMSDK_DIR", "EMSDK"),
+        workspace=workspace,
+        dirname="emsdk",
+        marker_file="emsdk_env.sh",
+        saved_key="emsdkPath",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -250,7 +278,12 @@ _TC_IDF = {
     "label": "ESP-IDF",
     "kind": "dir",
     "configKey": "idfPath",
-    "hint": "Locate the ESP-IDF folder (contains export.sh), or set mpftp.idfPath / IDF_PATH.",
+    "hint": (
+        "Required tree not found. Set IDF_PATH / IDF_DIR, add an esp-idf symlink "
+        "under the firmware workspace, set mpftp.idfPath, or Locate… the folder "
+        "(must contain export.sh)."
+    ),
+    # Fallback only — prefer idf_docs_url() from ports/esp32/README.md.
     "url": "https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/",
 }
 _TC_EMSDK = {
@@ -258,7 +291,11 @@ _TC_EMSDK = {
     "label": "Emscripten SDK (emsdk)",
     "kind": "dir",
     "configKey": "emsdkPath",
-    "hint": "Locate the emsdk folder (contains emsdk_env.sh), or set mpftp.emsdkPath / EMSDK.",
+    "hint": (
+        "Required tree not found. Set EMSDK / EMSDK_DIR, add an emsdk symlink "
+        "under the firmware workspace, set mpftp.emsdkPath, or Locate… the folder "
+        "(must contain emsdk_env.sh)."
+    ),
     "url": "https://emscripten.org/docs/getting_started/downloads.html",
 }
 _TC_MINGW = {
@@ -386,6 +423,46 @@ def idf_version(idf: Path) -> Optional[str]:
     return None
 
 
+_RE_IDF_RECOMMENDED = re.compile(
+    r"recommended version of ESP-IDF for MicroPython is (v?\d+\.\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_RE_IDF_CLONE_BRANCH = re.compile(
+    r"git clone -b (v?\d+\.\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def recommended_idf_version(port_dir: Path) -> Optional[str]:
+    """Recommended ESP-IDF tag from ports/esp32/README.md (e.g. 'v5.5.2').
+
+    Prefers the explicit "recommended version … is vX.Y.Z" line; falls back to
+    the ``git clone -b`` example in the same README.
+    """
+    try:
+        txt = (port_dir / "README.md").read_text("utf-8", "replace")
+    except Exception:
+        return None
+    m = _RE_IDF_RECOMMENDED.search(txt)
+    if not m:
+        m = _RE_IDF_CLONE_BRANCH.search(txt)
+    if not m:
+        return None
+    ver = m.group(1)
+    return ver if ver.startswith("v") else f"v{ver}"
+
+
+def idf_docs_url(version: Optional[str] = None) -> str:
+    """Espressif Getting Started URL for a specific IDF tag (not latest/stable)."""
+    if version:
+        ver = version if version.startswith("v") else f"v{version}"
+        # Docs are published per tag: …/en/v5.5.2/esp32/get-started/
+        return (
+            f"https://docs.espressif.com/projects/esp-idf/en/{ver}/esp32/get-started/"
+        )
+    return str(_TC_IDF["url"])
+
+
 def supported_idf_minors(port_dir: Path) -> set[str]:
     """Parse supported ESP-IDF major.minor versions from the esp32 port README."""
     minors: set[str] = set()
@@ -396,6 +473,21 @@ def supported_idf_minors(port_dir: Path) -> set[str]:
     except Exception:
         pass
     return minors
+
+
+def idf_need_toolchain(port_dir: Optional[Path] = None) -> dict:
+    """needToolchain payload for a missing ESP-IDF, versioned from the MP port."""
+    need = dict(_TC_IDF)
+    ver = recommended_idf_version(port_dir) if port_dir else None
+    need["url"] = idf_docs_url(ver)
+    if ver:
+        need["label"] = f"ESP-IDF {ver}"
+        need["hint"] = (
+            f"Required tree not found (MicroPython recommends {ver}). "
+            f"Set IDF_PATH / IDF_DIR, symlink esp-idf under the firmware workspace, "
+            f"set mpftp.idfPath, or Locate… a checkout with export.sh."
+        )
+    return need
 
 
 def idf_version_mismatch(idf: Path, port_dir: Path) -> Optional[dict]:
@@ -413,6 +505,7 @@ def idf_version_mismatch(idf: Path, port_dir: Path) -> Optional[dict]:
     if minor in supported:
         return None
     want = ", ".join("v" + s for s in sorted(supported))
+    rec = recommended_idf_version(port_dir)
     return {
         "id": "esp-idf-version",
         "label": f"a supported ESP-IDF (found {ver})",
@@ -421,10 +514,32 @@ def idf_version_mismatch(idf: Path, port_dir: Path) -> Optional[dict]:
         "bin": None,
         "hint": (
             f"This ESP-IDF is {ver}, but MicroPython's esp32 port supports {want}. "
-            "Locate a supported ESP-IDF checkout, or set mpftp.idfPath / IDF_PATH."
+            + (f"Recommended: {rec}. " if rec else "")
+            + "Locate a supported ESP-IDF checkout, or set mpftp.idfPath / IDF_PATH."
         ),
-        "url": "https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/",
+        "url": idf_docs_url(rec),
     }
+
+
+def _esp32_port_dir(
+    ns: argparse.Namespace, workspace: Optional[Path]
+) -> Optional[Path]:
+    """Resolve ports/esp32 under the active MicroPython tree."""
+    mp: Optional[Path] = None
+    if getattr(ns, "mp", None):
+        try:
+            mp = Path(ns.mp).expanduser().resolve()
+        except Exception:
+            mp = Path(ns.mp).expanduser()
+    if not mp or not _is_mp_tree(mp):
+        ws = getattr(ns, "workspace", None)
+        if workspace is not None and not ws:
+            ws = str(workspace)
+        mp = find_micropython(None, workspace=ws)
+    if not mp:
+        return None
+    port_dir = mp / "ports" / "esp32"
+    return port_dir if port_dir.is_dir() else None
 
 
 def resolve_build_toolchains(
@@ -444,11 +559,13 @@ def resolve_build_toolchains(
         if req["kind"] == "dir":
             if req["configKey"] == "idfPath":
                 found = find_idf(getattr(ns, "idf", None), workspace)
+                if not found:
+                    return idf_need_toolchain(_esp32_port_dir(ns, workspace)), extra
             elif req["configKey"] == "emsdkPath":
                 found = find_emsdk(getattr(ns, "emsdk", None), workspace)
+                if not found:
+                    return _need_toolchain(req), extra
             else:
-                found = None
-            if not found:
                 return _need_toolchain(req), extra
         else:  # command
             if not shutil.which(req["bin"], path=search_path):
@@ -703,6 +820,7 @@ def stream_process(cmd: list[str], cwd: Path, env: dict) -> int:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        **_no_window_kwargs(),
     )
     assert proc.stdout
     for line in proc.stdout:
@@ -804,7 +922,8 @@ def do_build(ns: argparse.Namespace) -> None:
     if port == "esp32":
         idf = find_idf(ns.idf, workspace)
         if not idf:
-            emit_result(False, error="ESP-IDF not found. Set mpftp.idfPath or IDF_PATH.")
+            need = idf_need_toolchain(port_dir)
+            emit_result(False, error=need["hint"], needToolchain=need)
             return
         emit_log(f"[mpftp] ESP-IDF: {idf}")
         mismatch = idf_version_mismatch(idf, port_dir)
@@ -1190,7 +1309,9 @@ def _read_device_partition_table(base: list[str], nbytes: int) -> Optional[bytes
         out_arg,
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60, **_no_window_kwargs()
+        )
         if r.returncode != 0 or not tmp.is_file():
             return None
         return tmp.read_bytes()
@@ -1968,12 +2089,19 @@ def match_esp_target(
 
     if family == "P4":
         # External Wi-Fi co-processor (C5/C6) is invisible to esptool: MP only.
+        # Trust MicroPython hints even when the tree/catalog has not listed
+        # variants yet (download mode scrapes C6_WIFI after Detect).
+        hint_blob = " ".join(
+            str(mp_hints.get(k) or "")
+            for k in ("build", "machine", "version", "platform")
+        ).upper()
         for w in ("C6_WIFI", "C5_WIFI"):
-            if w in build or w in machine.upper():
-                if has(w):
-                    variant = w
-                    break
+            if w in hint_blob:
+                variant = w
+                break
         variant_options = [v for v in avail if v.upper().endswith("WIFI")]
+        if variant and variant not in variant_options:
+            variant_options = [variant] + variant_options
         if not variant and variant_options:
             notes.append(
                 "P4 external Wi-Fi (C5/C6) cannot be detected from esptool alone — "
@@ -2066,7 +2194,9 @@ def _esptool_capture(ns: argparse.Namespace, sub_args: list[str], timeout: int =
     """Run one esptool subcommand, returning (rc, combined_output)."""
     cmd = _esptool_cmd(ns) + ["-p", ns.device] + sub_args
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, **_no_window_kwargs()
+        )
         return r.returncode, (r.stdout or "") + "\n" + (r.stderr or "")
     except subprocess.TimeoutExpired:
         return 124, f"esptool timed out after {timeout}s"
@@ -2190,7 +2320,8 @@ def do_detect(ns: argparse.Namespace) -> None:
 def do_discover(ns: argparse.Namespace) -> None:
     # Toolchains (ESP-IDF/emsdk/cross-gcc) are resolved at build time, not here.
     # Discovery only reports the MicroPython tree, its workspace, and the host.
-    mp = find_micropython(ns.mp)
+    ws = getattr(ns, "workspace", None)
+    mp = find_micropython(ns.mp, workspace=ws)
     workspace = workspace_of(mp) if mp else None
     result = {
         "host": HOST,
@@ -2204,7 +2335,12 @@ def do_discover(ns: argparse.Namespace) -> None:
 
 
 def do_tree(ns: argparse.Namespace) -> None:
-    mp = Path(ns.mp).expanduser().resolve() if ns.mp else find_micropython(None)
+    ws = getattr(ns, "workspace", None)
+    mp = (
+        Path(ns.mp).expanduser().resolve()
+        if ns.mp
+        else find_micropython(None, workspace=ws)
+    )
     if not mp or not _is_mp_tree(mp):
         print_json({"error": "MicroPython tree not found", "ports": []})
         return
@@ -2218,7 +2354,12 @@ def do_tree(ns: argparse.Namespace) -> None:
 
 
 def do_cmods(ns: argparse.Namespace) -> None:
-    mp = Path(ns.mp).expanduser().resolve() if ns.mp else find_micropython(None)
+    ws = getattr(ns, "workspace", None)
+    mp = (
+        Path(ns.mp).expanduser().resolve()
+        if ns.mp
+        else find_micropython(None, workspace=ws)
+    )
     if not mp:
         print_json({"error": "MicroPython tree not found", "modules": []})
         return
@@ -2323,6 +2464,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_mp(sp: argparse.ArgumentParser, required: bool = False) -> None:
         sp.add_argument("--mp", default=None, required=required, help="MicroPython tree path")
+        sp.add_argument(
+            "--workspace",
+            default=None,
+            help="Editor workspace folder(s), os.pathsep-joined; used to find micropython/",
+        )
         sp.add_argument("--idf", default=None, help="ESP-IDF path")
         sp.add_argument("--emsdk", default=None, help="emsdk path")
         sp.add_argument(

@@ -1,0 +1,94 @@
+# mpftp User Guide
+
+## What is mpftp?
+
+**mpftp** is a VS Code / Cursor extension for working with [MicroPython](https://micropython.org/) boards over USB serial. It gives you a dual-pane file transfer UI, an ANSI REPL, and a guided Firmware panel for downloading or building and flashing board images.
+
+It is maintained under the [PyDevices](https://github.com/PyDevices) organization.
+
+## What problem it solves
+
+MicroPython boards are usually driven with several separate tools: a serial terminal, `mpremote` or an FTP-like client for files, and a makefile/IDF/emsdk toolchain for firmware. Switching between them is slow, and on WSL the host often cannot see Windows `COM` ports without extra USB bridging.
+
+mpftp puts connect, files, REPL, and firmware in one extension host session, with a single serial ownership model so the UI and agents do not fight over the port.
+
+## How it works
+
+- A long-lived **Python sidecar** (`mpremote`-backed) owns the serial link and speaks JSON-lines to the extension.
+- **File Transfer** and **REPL** talk to that session.
+- **Firmware** build/flash runs as a separate host-side Python engine so compiles never hold the serial port longer than needed.
+- On **WSL**, serial and esp32 flash use **Windows Python** so `COM` ports work without `usbipd`.
+
+## Getting started
+
+### Requirements
+
+- VS Code or Cursor
+- Python 3 with [`mpremote`](https://pypi.org/project/mpremote/)
+  - **Windows / WSL:** install `mpremote` for Windows Python (`python.exe -m pip install mpremote`)
+  - **Native Linux:** `python3 -m venv .venv && .venv/bin/pip install mpremote`, or set `mpftp.pythonPath`
+
+### Install
+
+1. Install the extension from the Marketplace (`pydevices.mpftp`) or from a `.vsix` (**Extensions: Install from VSIX…**).
+2. Reload the window if prompted.
+3. Click the **mpftp** status bar item or run **mpftp: Connect to Board**.
+
+### Connect and transfer files
+
+1. Connect and pick a serial port (`COM4`, `/dev/ttyACM0`, …).
+2. Open **File Transfer** (editor tab or panel).
+3. Drag files between local and board panes, or use the header actions.
+4. Double-click a board file to edit it; save writes it back (optional SHA-256 verify).
+
+### REPL
+
+**mpftp: Open REPL** opens a terminal attached to the same session (ANSI colors supported). Interrupt / soft reset / hard reset are available as commands.
+
+### Firmware workspace (Build)
+
+Official **Download** mode needs no local checkout.
+
+**Build** mode needs a **firmware workspace**: a folder that contains `micropython/` (directory or symlink) or that *is* the MicroPython tree (`ports/` and `py/`).
+
+Optional in that workspace:
+
+- `micropython.cmake` / `manifest.py` — user C modules and frozen Python (Create stubs… if missing)
+- Any **port dependency** trees you need (for example `esp-idf`, `emsdk`) as directories or symlinks
+
+Dependencies that are not in the workspace must be provided via their environment variables (for example `IDF_PATH`, `EMSDK`) or the Locate… prompt when you build.
+
+Discovery order for MicroPython: settings → `MP_DIR` → `~/micropython` → editor open folders → Choose workspace….
+
+### Download vs Build
+
+| Mode | Use when |
+|------|----------|
+| **Download** | You want an official micropython.org binary (Thonny catalog) |
+| **Build** | You have a MicroPython tree and want a custom firmware (user modules, partitions, …) |
+
+**Detect** uses esptool first (works on a bare board), then optionally enriches from a live MicroPython session.
+
+## Settings (high level)
+
+| Setting | Purpose |
+|---------|---------|
+| `mpftp.workspacePath` | Firmware workspace (MicroPython + optional SDK symlinks) |
+| `mpftp.micropythonPath` | Optional override of the MicroPython tree |
+| `mpftp.idfPath` / `mpftp.emsdkPath` | Optional SDK overrides |
+| `mpftp.pythonPath` | Serial/sidecar Python (on WSL, leave empty for Windows `python.exe`) |
+| `mpftp.buildPythonPath` | Native Python for the build engine |
+| `mpftp.verifyTransfers` | SHA-256 after transfers |
+| `mpftp.autoReconnectAfterReset` | Reconnect after hard reset |
+
+## Troubleshooting
+
+- **Listing ports then nothing / connect fails:** another tool may hold the port; close it. After a bad flash, the filesystem may be corrupt — erase and reflash.
+- **WSL cannot see COM ports:** ensure Windows Python + `mpremote` are installed; mpftp should not need `usbipd`.
+- **Build missing a tree:** set the env var, symlink the repo under the firmware workspace, or use Locate….
+- **ESP-IDF version mismatch:** Install instructions follow the version recommended in `ports/esp32/README.md` for your checkout.
+
+## More
+
+- [Developers guide](developers-guide.md) — architecture, discovery contract, packaging
+- [Firmware fixtures](firmware-fixtures.md) — offline catalog fixtures for tests

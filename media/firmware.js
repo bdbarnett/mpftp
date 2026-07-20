@@ -130,16 +130,16 @@
 
   function renderNoMp() {
     const c = el("div", "card empty");
-    c.appendChild(el("h2", null, "MicroPython not found"));
+    c.appendChild(el("h2", null, "Firmware workspace not set"));
     c.appendChild(
       el(
         "p",
         "muted",
-        "Select the folder that contains your MicroPython checkout (with ports/ and py/). User C modules and a frozen manifest are auto-discovered from its parent workspace."
+        "Choose a folder that contains micropython/ (or is the MicroPython tree). Port SDKs can live there as directories or symlinks, or via environment variables."
       )
     );
-    const b = el("button", "btn primary", "Select MicroPython folder…");
-    b.onclick = () => vscode.postMessage({ type: "changePath" });
+    const b = el("button", "btn primary", "Choose workspace…");
+    b.onclick = () => vscode.postMessage({ type: "chooseWorkspace" });
     c.appendChild(b);
     return c;
   }
@@ -151,11 +151,11 @@
       el(
         "p",
         "muted",
-        "Select a MicroPython checkout to build, or switch Select to Download for official firmware."
+        "Choose a firmware workspace with MicroPython, or switch Select to Download for official firmware."
       )
     );
-    const b = el("button", "btn primary", "Select MicroPython folder…");
-    b.onclick = () => vscode.postMessage({ type: "changePath" });
+    const b = el("button", "btn primary", "Choose workspace…");
+    b.onclick = () => vscode.postMessage({ type: "chooseWorkspace" });
     card.appendChild(b);
     return card;
   }
@@ -397,8 +397,8 @@
     const sourceRow = el("div", "source-row");
     const seg = el("div", "seg");
     for (const [id, label] of [
-      ["build", "Build"],
       ["download", "Download"],
+      ["build", "Build"],
     ]) {
       const btn = el(
         "button",
@@ -426,17 +426,20 @@
       );
     } else {
       const pathRow = el("div", "path-row");
-      pathRow.appendChild(el("span", "hdr-label", "MicroPython repo"));
-      pathRow.appendChild(el("i", "codicon codicon-repo"));
+      pathRow.appendChild(el("span", "hdr-label", "Workspace"));
+      pathRow.appendChild(el("i", "codicon codicon-root-folder"));
       const pathText = el(
         "span",
         "path-text",
-        model.micropython || "No MicroPython found"
+        model.workspace || model.micropython || "No workspace set"
       );
-      pathText.title = model.micropython || "";
+      pathText.title =
+        (model.workspace || "") +
+        (model.micropython ? "\nMicroPython: " + model.micropython : "");
       pathRow.appendChild(pathText);
       const change = el("button", "btn ghost sm", "Change…");
-      change.onclick = () => vscode.postMessage({ type: "changePath" });
+      change.title = "Choose firmware workspace (open folder or Browse…)";
+      change.onclick = () => vscode.postMessage({ type: "chooseWorkspace" });
       pathRow.appendChild(change);
       card.appendChild(pathRow);
       card.appendChild(renderModules());
@@ -563,16 +566,20 @@
     }
     const cm = model.cmods || {};
     const list = cm.modules || [];
+    const needAggregator = cm.hasAggregator !== true;
+    const needManifest = cm.hasManifest !== true;
+    const needStubs = needAggregator || needManifest;
+
     if (!list.length) {
-      card.appendChild(
-        el(
-          "p",
-          "muted",
-          cm.hasAggregator === false
-            ? "No user C modules found in the workspace. Add micropython.cmake / micropython.mk modules beside the MicroPython checkout to include them."
-            : "No user C modules discovered."
-        )
-      );
+      let msg;
+      if (needAggregator) {
+        msg =
+          "No micropython.cmake aggregator in the workspace. Create stubs to enable USER_C_MODULES, then add sibling modules with their own micropython.cmake / micropython.mk.";
+      } else {
+        msg =
+          "Aggregator present — no sibling C modules discovered yet. Add folders with micropython.cmake / micropython.mk beside the MicroPython checkout.";
+      }
+      card.appendChild(el("p", "muted", msg));
     } else {
       const chips = el("div", "chips");
       for (const c of list) {
@@ -584,13 +591,32 @@
       }
       card.appendChild(chips);
     }
+
+    if (needStubs && (model.workspace || model.micropython)) {
+      const row = el("div", "actions");
+      const create = el(
+        "button",
+        "btn ghost sm",
+        needAggregator && needManifest
+          ? "Create stubs…"
+          : needAggregator
+            ? "Create aggregator…"
+            : "Create manifest…"
+      );
+      create.title =
+        "Write micropython.cmake and/or manifest.py into the workspace from mpftp templates";
+      create.onclick = () => vscode.postMessage({ type: "createWorkspaceStubs" });
+      row.appendChild(create);
+      card.appendChild(row);
+    }
+
     const flags = el("div", "flags");
     if (cm.hasAggregator) {
       flags.appendChild(
         pill(
           "USER_C_MODULES",
           "ok",
-          "A micropython.cmake / micropython.mk aggregator was found in the workspace — the discovered C modules are compiled into the firmware via USER_C_MODULES."
+          "A micropython.cmake aggregator was found in the workspace — sibling C modules are compiled into the firmware via USER_C_MODULES."
         )
       );
     }
@@ -665,9 +691,17 @@
       info.appendChild(el("i", "codicon codicon-cloud-download"));
       const details = el("div", "artifact-details");
       const full = model.artifact.artifact || "";
-      const name = full.split(/[/\\]/).pop();
+      const parts = full.split(/[/\\]/);
+      const name = parts.pop() || full;
       details.appendChild(el("div", "artifact-name", name));
+      const dir = parts.join(full.includes("\\") ? "\\" : "/");
+      if (dir) {
+        const dirEl = el("div", "artifact-dir muted sm", dir);
+        dirEl.title = full;
+        details.appendChild(dirEl);
+      }
       const meta = [
+        model.artifact.variant ? String(model.artifact.variant) : "default",
         model.artifact.version ? "v" + String(model.artifact.version).replace(/^v/, "") : "",
         humanSize(model.artifact.size),
         model.artifact.source === "local" ? "local file" : "cached",
