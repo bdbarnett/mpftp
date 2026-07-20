@@ -1064,25 +1064,67 @@ _BOOTLOADER_OFFSET_BY_MCU = {
 }
 
 
-def esp32_flash_offset(port_dir: Path, board: str) -> str:
+def esp32_flash_offset_for_family(family: str) -> str:
+    """Bootloader offset from MCU family string (e.g. Thonny catalog ``family``)."""
+    mcu = (family or "").lower().replace("-", "")
+    return _BOOTLOADER_OFFSET_BY_MCU.get(mcu, "0x0")
+
+
+def esp32_flash_offset(port_dir: Path, board: str, family: str = "") -> str:
     """Resolve the esp32 flash offset for ``board``.
 
-    Prefers ``board.json``'s ``deploy_options.flash_offset``; when that is
-    absent, infers the bootloader offset from the chip family (``board.json``
-    ``mcu``) — classic/S2 at 0x1000, P4 at 0x2000, newer parts at 0x0.
+    Prefers ``board.json``'s ``deploy_options.flash_offset`` from:
+      1. local MicroPython tree (``port_dir/boards/<board>/board.json``)
+      2. upstream GitHub copy of the same file (download mode / no checkout)
+    When that is absent, infers from ``board.json`` ``mcu`` / catalog ``family``
+    — classic/S2 at 0x1000, P4 at 0x2000, newer parts at 0x0.
     """
+    if board and port_dir:
+        bj = port_dir / "boards" / board / "board.json"
+        try:
+            data = json.loads(bj.read_text("utf-8"))
+            explicit = data.get("deploy_options", {}).get("flash_offset")
+            if explicit is not None and str(explicit).strip() != "":
+                try:
+                    from firmware_download import normalize_flash_offset
+
+                    return normalize_flash_offset(explicit)
+                except Exception:
+                    return str(explicit)
+            mcu = str(data.get("mcu", "")).lower()
+            if mcu:
+                return _BOOTLOADER_OFFSET_BY_MCU.get(mcu, "0x0")
+        except Exception:
+            pass
+    if board:
+        try:
+            from firmware_download import resolve_remote_flash_offset
+
+            # Catalog / UI port is esp32 for all Espressif families; GitHub path
+            # is always ports/esp32/boards/<BOARD>/board.json.
+            remote = resolve_remote_flash_offset(board, port="esp32")
+            if remote:
+                return remote
+            # board.json without deploy_options.flash_offset — use its mcu.
+            from firmware_download import fetch_board_json
+
+            data = fetch_board_json(board, port="esp32")
+            if data:
+                mcu = str(data.get("mcu", "")).lower()
+                if mcu:
+                    return _BOOTLOADER_OFFSET_BY_MCU.get(mcu, "0x0")
+        except Exception:
+            pass
+    if family:
+        return esp32_flash_offset_for_family(family)
     if not board:
         return "0x0"
-    bj = port_dir / "boards" / board / "board.json"
-    try:
-        data = json.loads(bj.read_text("utf-8"))
-    except Exception:
-        return "0x0"
-    explicit = data.get("deploy_options", {}).get("flash_offset")
-    if explicit:
-        return str(explicit)
-    mcu = str(data.get("mcu", "")).lower()
-    return _BOOTLOADER_OFFSET_BY_MCU.get(mcu, "0x0")
+    # Guess from board name when no tree / family (e.g. ESP32_GENERIC_S3).
+    name = board.upper()
+    for key in ("ESP32P4", "ESP32C6", "ESP32C5", "ESP32C3", "ESP32C2", "ESP32S3", "ESP32S2", "ESP32"):
+        if key in name.replace("_", ""):
+            return esp32_flash_offset_for_family(key.lower())
+    return "0x0"
 
 
 def _wslpath_w(p: str) -> str:
@@ -1122,6 +1164,12 @@ def _esptool_cmd(ns: argparse.Namespace) -> list[str]:
 _PARTITION_TABLE_OFFSET = 0x8000
 
 
+def _esptool_reset_mode(value: str, default: str) -> str:
+    """Normalize esptool v5 reset-mode names (hyphens; accept legacy underscores)."""
+    v = (value or "").strip().replace("_", "-")
+    return v or default
+
+
 def _read_device_partition_table(base: list[str], nbytes: int) -> Optional[bytes]:
     """Read the on-device partition-table region, or None if it can't be read.
 
@@ -1131,8 +1179,16 @@ def _read_device_partition_table(base: list[str], nbytes: int) -> Optional[bytes
     import tempfile
     tmp = Path(tempfile.gettempdir()) / f"mpftp_pt_{os.getpid()}.bin"
     out_arg = _wslpath_w(str(tmp)) if HOST == "wsl" else str(tmp)
-    cmd = base + ["--before", "default_reset", "--after", "no_reset",
-                  "read_flash", hex(_PARTITION_TABLE_OFFSET), hex(nbytes), out_arg]
+    cmd = base + [
+        "--before",
+        "default-reset",
+        "--after",
+        "no-reset",
+        "read-flash",
+        hex(_PARTITION_TABLE_OFFSET),
+        hex(nbytes),
+        out_arg,
+    ]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if r.returncode != 0 or not tmp.is_file():
@@ -1166,10 +1222,11 @@ def _esp32_layout_changed(base: list[str], artifact: Path) -> Optional[bool]:
     return got[: len(want)] != want
 
 
-def flash_esp32(ns: argparse.Namespace, mp: Path, artifact: Path) -> None:
-    port_dir = mp / "ports" / ns.port
+def flash_esp32(ns: argparse.Namespace, mp: Optional[Path], artifact: Path) -> None:
+    port_dir = (mp / "ports" / ns.port) if mp else Path(".")
+    family = getattr(ns, "family", "") or ""
     offset = (getattr(ns, "offset", "") or "").strip() or esp32_flash_offset(
-        port_dir, ns.board or ""
+        port_dir, ns.board or "", family=family
     )
     emit_log(f"[mpftp] flash offset {offset}")
     fw = str(artifact)
@@ -1191,14 +1248,13 @@ def flash_esp32(ns: argparse.Namespace, mp: Path, artifact: Path) -> None:
 
     if erase:
         emit_log("[mpftp] erasing flash…")
-        rc = stream_process(base + ["erase_flash"], Path.cwd(), dict(os.environ))
+        rc = stream_process(base + ["erase-flash"], Path.cwd(), dict(os.environ))
         if rc != 0:
-            emit_result(False, error=f"erase_flash failed (exit {rc})")
+            emit_result(False, error=f"erase-flash failed (exit {rc})")
             return
-    before = getattr(ns, "before", "") or "default_reset"
-    after = getattr(ns, "after", "") or "hard_reset"
-    full = base + ["--before", before, "--after", after,
-                   "write_flash", offset, fw]
+    before = _esptool_reset_mode(getattr(ns, "before", "") or "", "default-reset")
+    after = _esptool_reset_mode(getattr(ns, "after", "") or "", "hard-reset")
+    full = base + ["--before", before, "--after", after, "write-flash", offset, fw]
     rc = stream_process(full, Path.cwd(), dict(os.environ))
     if rc != 0:
         emit_result(False, error=f"esptool failed (exit {rc})")
@@ -1279,16 +1335,21 @@ def _looks_like_mount(dev: str) -> bool:
 
 
 def do_flash(ns: argparse.Namespace) -> None:
-    mp = Path(ns.mp).expanduser().resolve()
     port = ns.port
     board = ns.board or ""
     variant = ns.variant or ""
     if port not in FLASHERS:
         emit_result(False, error=f"Flashing not supported for port '{port}'.")
         return
+    mp: Optional[Path] = None
+    if getattr(ns, "mp", None):
+        mp = Path(ns.mp).expanduser().resolve()
     if ns.artifact:
         artifact = Path(ns.artifact).expanduser()
     else:
+        if not mp:
+            emit_result(False, error="No artifact path and no MicroPython tree for last build.")
+            return
         info = artifact_info(mp, port, board, variant)
         if not info["ready"]:
             emit_result(False, error="No build found for this selection. Build first.")
@@ -2034,11 +2095,15 @@ def do_detect(ns: argparse.Namespace) -> None:
         if _is_mp_tree(mp):
             tree = build_tree(mp)
 
-    rc, fout = _esptool_capture(ns, ["flash_id"])
+    # Always hard-reset after probing. esptool's default download-mode entry
+    # otherwise leaves the chip in "waiting for download" and Connect fails
+    # until a button reset (seen on ESP32-P4 + USB-UART bridges).
+    _esp_probe = ["--before", "default-reset", "--after", "hard-reset"]
+    rc, fout = _esptool_capture(ns, _esp_probe + ["flash-id"])
     flash = parse_esptool_flash_id(fout)
     sec = {"available": False, "secureBoot": "", "flashEncryption": ""}
     if flash.get("chip"):
-        _src, srout = _esptool_capture(ns, ["get_security_info"])
+        _src, srout = _esptool_capture(ns, _esp_probe + ["get-security-info"])
         sec = parse_esptool_security(srout)
 
     esp_from_mp = _mp_indicates_esp(mp_hints)
@@ -2165,6 +2230,89 @@ def do_artifact(ns: argparse.Namespace) -> None:
     print_json(artifact_info(mp, ns.port, ns.board or "", ns.variant or ""))
 
 
+def do_download_tree(ns: argparse.Namespace) -> None:
+    from firmware_download import catalog_tree
+
+    force = bool(getattr(ns, "force", False))
+    print_json(catalog_tree(force=force))
+
+
+def do_download_list(ns: argparse.Namespace) -> None:
+    from firmware_download import list_board
+
+    board = ns.board or ""
+    if not board:
+        print_json({"error": "board required"})
+        raise SystemExit(1)
+    try:
+        print_json(
+            list_board(
+                board,
+                mp_variant=getattr(ns, "variant", None) or "",
+                include_preview_probe=bool(getattr(ns, "preview", False)),
+                force=bool(getattr(ns, "force", False)),
+            )
+        )
+    except Exception as e:  # noqa: BLE001
+        print_json({"error": str(e)})
+        raise SystemExit(1)
+
+
+def do_download(ns: argparse.Namespace) -> None:
+    from firmware_download import download_file, find_variant, load_catalog, pick_download
+
+    board = ns.board or ""
+    if not board:
+        emit_result(False, error="board required")
+        return
+    try:
+        def progress(done: int, total: int) -> None:
+            if total:
+                pct = int(100 * done / total)
+                emit_log(f"[mpftp] download {pct}% ({done}/{total})")
+
+        force = bool(getattr(ns, "force", False))
+        mp_variant = getattr(ns, "variant", None) or ""
+        catalog = load_catalog(force=force)
+        variant = find_variant(board, catalog=catalog)
+        if not variant:
+            raise RuntimeError(f"board not in download catalog: {board}")
+        chosen = pick_download(
+            variant,
+            version=getattr(ns, "version", None) or None,
+            preview=bool(getattr(ns, "preview", False)),
+            mp_variant=mp_variant,
+        )
+        emit_log(f"[mpftp] downloading {chosen['url']}")
+        path = download_file(chosen["url"], progress=progress)
+        st = path.stat()
+        from firmware_download import resolve_remote_flash_offset
+
+        flash_offset = resolve_remote_flash_offset(
+            variant["board"], port=variant["port"] or "esp32"
+        )
+        emit_result(
+            True,
+            ready=True,
+            artifact=str(path),
+            size=st.st_size,
+            mtime=st.st_mtime,
+            source="download",
+            board=variant["board"],
+            variant=mp_variant,
+            version=chosen["version"],
+            family=variant["family"],
+            port=variant["port"],
+            url=chosen["url"],
+            info_url=variant["info_url"],
+            vendor=variant["vendor"],
+            model=variant["model"],
+            flashOffset=flash_offset or None,
+        )
+    except Exception as e:  # noqa: BLE001
+        emit_result(False, error=str(e))
+
+
 def do_flashers(_ns: argparse.Namespace) -> None:
     print_json({"flashers": FLASHERS})
 
@@ -2221,24 +2369,60 @@ def build_parser() -> argparse.ArgumentParser:
     cl.set_defaults(func=do_clean)
 
     f = sub.add_parser("flash")
-    add_mp(f, required=True)
+    add_mp(f, required=False)  # optional when --artifact is a downloaded file
     f.add_argument("--port", required=True)
     f.add_argument("--board", default="")
     f.add_argument("--variant", default="")
+    f.add_argument("--family", default="", help="MCU family for flash offset (download mode)")
     f.add_argument("--device", default="")
     f.add_argument("--artifact", default="")
     f.add_argument("--baud", type=int, default=460800)
     f.add_argument("--offset", default="",
                    help="esp32 flash offset override (default: board.json / chip family)")
     f.add_argument("--erase", action="store_true")
-    f.add_argument("--before", default="default_reset",
-                   choices=["default_reset", "no_reset", "usb_reset"],
-                   help="esp32 reset mode before flashing")
-    f.add_argument("--after", default="hard_reset",
-                   choices=["hard_reset", "soft_reset", "no_reset"],
-                   help="esp32 reset mode after flashing")
+    f.add_argument(
+        "--before",
+        default="default-reset",
+        type=lambda s: str(s).replace("_", "-"),
+        choices=["default-reset", "no-reset", "usb-reset"],
+        help="esp32 reset mode before flashing (esptool --before)",
+    )
+    f.add_argument(
+        "--after",
+        default="hard-reset",
+        type=lambda s: str(s).replace("_", "-"),
+        choices=["hard-reset", "soft-reset", "no-reset"],
+        help="esp32 reset mode after flashing (esptool --after)",
+    )
     f.add_argument("--esptool", default=None, help="esptool interpreter/executable")
     f.set_defaults(func=do_flash)
+
+    dlt = sub.add_parser("download-tree", help="Official firmware catalog (Thonny JSON)")
+    dlt.add_argument("--force", action="store_true", help="refresh catalog cache")
+    dlt.set_defaults(func=do_download_tree)
+
+    dll = sub.add_parser("download-list", help="List downloadable versions for a board")
+    dll.add_argument("--board", required=True)
+    dll.add_argument(
+        "--variant",
+        default="",
+        help="MP board variant (e.g. C6_WIFI for ESP32_GENERIC_P4)",
+    )
+    dll.add_argument("--preview", action="store_true", help="probe board page for latest preview")
+    dll.add_argument("--force", action="store_true")
+    dll.set_defaults(func=do_download_list)
+
+    dld = sub.add_parser("download", help="Download official firmware for a board")
+    dld.add_argument("--board", required=True)
+    dld.add_argument(
+        "--variant",
+        default="",
+        help="MP board variant (e.g. C6_WIFI for ESP32_GENERIC_P4)",
+    )
+    dld.add_argument("--version", default="", help="release version (e.g. 1.28.0)")
+    dld.add_argument("--preview", action="store_true", help="latest preview build")
+    dld.add_argument("--force", action="store_true", help="refresh catalog cache")
+    dld.set_defaults(func=do_download)
 
     fl = sub.add_parser("flashers")
     fl.set_defaults(func=do_flashers)
@@ -2277,7 +2461,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     except BrokenPipeError:
         pass
     except Exception as e:  # noqa: BLE001
-        if ns.cmd in ("build", "clean", "flash"):
+        if ns.cmd in ("build", "clean", "flash", "download"):
             emit_result(False, error=str(e))
         else:
             print_json({"error": str(e)})

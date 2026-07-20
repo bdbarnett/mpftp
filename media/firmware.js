@@ -10,7 +10,16 @@
     cmods: { modules: [], hasAggregator: false, hasManifest: false },
     flashers: {},
     selection: { port: "", board: "", variant: "" },
-    prefs: { reconnectAfterFlash: false, alsoFlashAfterBuild: false, device: "" },
+    prefs: {
+      reconnectAfterFlash: false,
+      alsoFlashAfterBuild: false,
+      device: "",
+      firmwareSource: "build",
+      downloadVersion: "",
+      downloadPreview: false,
+    },
+    downloadVersions: [],
+    downloadFamily: "",
     connectedDevice: "",
     devices: [],
     detect: null,
@@ -19,8 +28,8 @@
     artifact: { ready: false },
     flashOffset: "",
     flashBaud: "460800",
-    flashBefore: "default_reset",
-    flashAfter: "hard_reset",
+    flashBefore: "default-reset",
+    flashAfter: "hard-reset",
     flashErase: false,
     flashStatus: null,
     flashing: false,
@@ -30,6 +39,10 @@
     busy: false,
     cleanBuild: false,
   };
+
+  function isDownloadMode() {
+    return model.prefs.firmwareSource === "download";
+  }
 
   const $ = (sel, root) => (root || document).querySelector(sel);
   const el = (tag, cls, txt) => {
@@ -63,18 +76,19 @@
 
     app.appendChild(renderHeader());
 
-    if (!model.micropython) {
-      app.appendChild(renderNoMp());
-      app.appendChild(renderLog());
-      return;
-    }
-
-    app.appendChild(renderModules());
-    app.appendChild(renderDeviceInfo());
-
     const grid = el("div", "grid");
+    const detect = renderDetect();
+    detect.classList.add("step-span");
+    grid.appendChild(detect);
+    grid.appendChild(renderSource());
     grid.appendChild(renderTarget());
-    grid.appendChild(renderBuild());
+    if (isDownloadMode()) {
+      grid.appendChild(renderDownload());
+    } else if (model.micropython) {
+      grid.appendChild(renderBuild());
+    } else {
+      grid.appendChild(renderBuildNeedsMp());
+    }
     grid.appendChild(renderFlash());
     app.appendChild(grid);
     app.appendChild(renderLog());
@@ -98,19 +112,12 @@
 
     const below = el("div", "hdr-below");
     below.appendChild(
-      el("p", "subtitle", "Build MicroPython once, then flash one or many boards.")
+      el(
+        "p",
+        "subtitle",
+        "Detect the board, choose Build or Download, pick a target, then build or download firmware and flash."
+      )
     );
-    const pathRow = el("div", "path-row");
-    pathRow.appendChild(el("span", "hdr-label", "MicroPython repo"));
-    const icon = el("i", "codicon codicon-repo");
-    pathRow.appendChild(icon);
-    const pathText = el("span", "path-text", model.micropython || "No MicroPython found");
-    pathText.title = model.micropython || "";
-    pathRow.appendChild(pathText);
-    const change = el("button", "btn ghost sm", "Change…");
-    change.onclick = () => vscode.postMessage({ type: "changePath" });
-    pathRow.appendChild(change);
-    below.appendChild(pathRow);
     h.appendChild(below);
     return h;
   }
@@ -137,7 +144,23 @@
     return c;
   }
 
-  // Device Info — esptool-first Detect
+  function renderBuildNeedsMp() {
+    const card = el("section", "card step");
+    card.appendChild(stepHead("4", "Build", "no checkout"));
+    card.appendChild(
+      el(
+        "p",
+        "muted",
+        "Select a MicroPython checkout to build, or switch Select to Download for official firmware."
+      )
+    );
+    const b = el("button", "btn primary", "Select MicroPython folder…");
+    b.onclick = () => vscode.postMessage({ type: "changePath" });
+    card.appendChild(b);
+    return card;
+  }
+
+  // Step 1 — Detect (esptool-first)
   function mpMachine(d) {
     const mp = (d && d.mp) || {};
     return mp.machine || mp.platform || "";
@@ -193,16 +216,17 @@
     return parts.join(" · ");
   }
 
-  function renderDeviceInfo() {
-    const card = el("section", "card device-card");
-    const head = el("div", "info-head");
-    head.appendChild(el("span", "step-title", "Device Info"));
+  function renderDetect() {
+    const card = el("section", "card step");
     const btn = el("button", "btn accent sm", model.detecting ? "Detecting…" : "Detect");
     btn.disabled = model.busy || model.detecting || model.flashing;
     btn.title = "Probe the selected device with esptool (bare board OK)";
     btn.onclick = () => vscode.postMessage({ type: "detect" });
-    head.appendChild(btn);
-    card.appendChild(head);
+    const chip = model.prefs.device
+      ? model.prefs.device +
+        (model.detect && model.detect.chip ? " · " + model.detect.chip : "")
+      : "no device";
+    card.appendChild(stepHead("1", "Detect", chip, btn));
 
     const ds = model.detectStatus;
     if (ds && ds.state === "failed") {
@@ -337,10 +361,10 @@
     return String(freq);
   }
 
-  // Step 1 — Target
+  // Step 3 — Target
   function renderTarget() {
     const card = el("section", "card step");
-    card.appendChild(stepHead("1", "Target", chipText()));
+    card.appendChild(stepHead("3", "Target", chipText()));
 
     const search = el("input", "search");
     search.placeholder = "Filter ports and boards…";
@@ -360,7 +384,64 @@
   function chipText() {
     const s = model.selection;
     if (!s.port) return "none selected";
+    // Download mode also has MP variants (e.g. ESP32_GENERIC_P4 / C6_WIFI).
     return [s.port, s.board || null, s.variant || "default"].filter(Boolean).join(" / ");
+  }
+
+  // Step 2 — Select Build or Download
+  function renderSource() {
+    const card = el("section", "card step");
+    const mode = isDownloadMode() ? "Download" : "Build";
+    card.appendChild(stepHead("2", "Select", mode));
+
+    const sourceRow = el("div", "source-row");
+    const seg = el("div", "seg");
+    for (const [id, label] of [
+      ["build", "Build"],
+      ["download", "Download"],
+    ]) {
+      const btn = el(
+        "button",
+        "seg-btn" + (model.prefs.firmwareSource === id ? " active" : ""),
+        label
+      );
+      btn.onclick = () => {
+        if (model.prefs.firmwareSource === id) return;
+        model.prefs.firmwareSource = id;
+        vscode.postMessage({ type: "setSource", source: id });
+        render();
+      };
+      seg.appendChild(btn);
+    }
+    sourceRow.appendChild(seg);
+    card.appendChild(sourceRow);
+
+    if (isDownloadMode()) {
+      card.appendChild(
+        el(
+          "p",
+          "muted sm",
+          "Official builds via Thonny’s catalog → micropython.org (no local checkout required)."
+        )
+      );
+    } else {
+      const pathRow = el("div", "path-row");
+      pathRow.appendChild(el("span", "hdr-label", "MicroPython repo"));
+      pathRow.appendChild(el("i", "codicon codicon-repo"));
+      const pathText = el(
+        "span",
+        "path-text",
+        model.micropython || "No MicroPython found"
+      );
+      pathText.title = model.micropython || "";
+      pathRow.appendChild(pathText);
+      const change = el("button", "btn ghost sm", "Change…");
+      change.onclick = () => vscode.postMessage({ type: "changePath" });
+      pathRow.appendChild(change);
+      card.appendChild(pathRow);
+      card.appendChild(renderModules());
+    }
+    return card;
   }
 
   function matches(text) {
@@ -439,7 +520,7 @@
       node.appendChild(kids);
       return node;
     }
-    return renderLeaf(port.port, b.board, "", b.board);
+    return renderLeaf(port.port, b.board, "", b.label || b.board);
   }
 
   function renderLeaf(port, board, variant, label) {
@@ -465,12 +546,12 @@
     render();
   }
 
-  // Modules — discovery only (not a numbered step). The C-module set is scanned
-  // from the workspace (parent of the MicroPython checkout); repoint via the
-  // header's Change… control.
+  // Modules — discovery sub-card inside Select when Build is chosen.
+  // Scanned from the workspace (parent of the MicroPython checkout); repoint
+  // via Select's Change… control.
   function renderModules() {
-    const card = el("section", "card step");
-    card.appendChild(stepHead("", "Modules", ""));
+    const card = el("div", "sub-card");
+    card.appendChild(el("div", "sub-card-title", "Modules"));
     const from = model.workspace || model.micropython;
     if (from) {
       const src = el("p", "discovered-from");
@@ -526,10 +607,98 @@
     return card;
   }
 
+  // Step 2 — Download (official firmware)
+  function renderDownload() {
+    const card = el("section", "card step");
+    card.appendChild(stepHead("4", "Download", chipText()));
+
+    const statusRow = el("div", "status-row");
+    statusRow.appendChild(phasePill());
+    card.appendChild(statusRow);
+
+    if (!model.selection.board) {
+      card.appendChild(
+        el("p", "muted", "Select a board in Target. Detect can suggest one from the chip.")
+      );
+      return card;
+    }
+
+    const verRow = el("div", "field-row");
+    verRow.appendChild(el("label", null, "Version"));
+    const sel = document.createElement("select");
+    const latest = document.createElement("option");
+    latest.value = "";
+    latest.textContent = "Latest release";
+    sel.appendChild(latest);
+    const prev = document.createElement("option");
+    prev.value = "__preview__";
+    prev.textContent = "Latest preview";
+    sel.appendChild(prev);
+    for (const d of model.downloadVersions || []) {
+      if (d.channel === "preview") continue;
+      const o = document.createElement("option");
+      o.value = d.version;
+      o.textContent = d.version;
+      sel.appendChild(o);
+    }
+    if (model.prefs.downloadPreview) {
+      sel.value = "__preview__";
+    } else {
+      sel.value = model.prefs.downloadVersion || "";
+    }
+    sel.onchange = () => {
+      if (sel.value === "__preview__") {
+        model.prefs.downloadPreview = true;
+        model.prefs.downloadVersion = "";
+        vscode.postMessage({ type: "setPref", key: "downloadPreview", value: true });
+      } else {
+        model.prefs.downloadPreview = false;
+        model.prefs.downloadVersion = sel.value;
+        vscode.postMessage({ type: "setPref", key: "downloadVersion", value: sel.value });
+      }
+    };
+    verRow.appendChild(sel);
+    card.appendChild(verRow);
+
+    if (model.artifact && model.artifact.ready) {
+      const info = el("div", "artifact");
+      info.appendChild(el("i", "codicon codicon-cloud-download"));
+      const details = el("div", "artifact-details");
+      const full = model.artifact.artifact || "";
+      const name = full.split(/[/\\]/).pop();
+      details.appendChild(el("div", "artifact-name", name));
+      const meta = [
+        model.artifact.version ? "v" + String(model.artifact.version).replace(/^v/, "") : "",
+        humanSize(model.artifact.size),
+        model.artifact.source === "local" ? "local file" : "cached",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      details.appendChild(el("div", "muted sm", meta));
+      info.appendChild(details);
+      card.appendChild(info);
+    } else {
+      card.appendChild(el("p", "muted", "Not downloaded yet for this selection."));
+    }
+
+    const actions = el("div", "actions");
+    const dl = el("button", "btn primary", model.busy ? "Working…" : "Download");
+    dl.disabled =
+      model.busy || model.detecting || model.flashing || !model.selection.board;
+    dl.onclick = () => vscode.postMessage({ type: "download" });
+    actions.appendChild(dl);
+    const browse = el("button", "btn ghost", "Browse local…");
+    browse.disabled = model.busy || model.flashing;
+    browse.onclick = () => vscode.postMessage({ type: "browseArtifact" });
+    actions.appendChild(browse);
+    card.appendChild(actions);
+    return card;
+  }
+
   // Step 2 — Build
   function renderBuild() {
     const card = el("section", "card step");
-    card.appendChild(stepHead("2", "Build", chipText()));
+    card.appendChild(stepHead("4", "Build", chipText()));
 
     const statusRow = el("div", "status-row");
     statusRow.appendChild(phasePill());
@@ -595,10 +764,10 @@
     return card;
   }
 
-  // Step 3 — Firmware (flash)
+  // Step 5 — Flash
   function renderFlash() {
     const card = el("section", "card step");
-    card.appendChild(stepHead("3", "Firmware", ""));
+    card.appendChild(stepHead("5", "Flash", ""));
 
     const fp = flashPill();
     if (fp) {
@@ -646,6 +815,7 @@
 
     const ready = model.artifact && model.artifact.ready;
     const needsDevice = port === "esp32" && !model.prefs.device;
+    // flash tip uses ready below
 
     // esp32 only: editable flash offset + baud, between the device row and Flash.
     if (port === "esp32") {
@@ -695,24 +865,24 @@
         selectRow(
           "Reset before",
           [
-            ["default_reset", "default_reset"],
-            ["no_reset", "no_reset"],
-            ["usb_reset", "usb_reset"],
+            ["default-reset", "default-reset"],
+            ["no-reset", "no-reset"],
+            ["usb-reset", "usb-reset"],
           ],
           model.flashBefore,
           (v) => {
             model.flashBefore = v;
           },
-          "esptool --before: how the chip enters the bootloader. Use no_reset when you've manually put the board in download mode."
+          "esptool --before: how the chip enters the bootloader. Use no-reset when you've manually put the board in download mode."
         )
       );
       opts.appendChild(
         selectRow(
           "Reset after",
           [
-            ["hard_reset", "hard_reset"],
-            ["soft_reset", "soft_reset"],
-            ["no_reset", "no_reset"],
+            ["hard-reset", "hard-reset"],
+            ["soft-reset", "soft-reset"],
+            ["no-reset", "no-reset"],
           ],
           model.flashAfter,
           (v) => {
@@ -743,8 +913,11 @@
     const flash = el("button", "btn accent", model.flashing ? "Flashing…" : "Flash");
     flash.disabled =
       model.busy || model.detecting || model.flashing || !ready || needsDevice;
-    if (!ready) flash.title = "Build this board first";
-    else if (needsDevice) flash.title = "Select a device";
+    if (!ready) {
+      flash.title = isDownloadMode()
+        ? "Download firmware first"
+        : "Build this board first";
+    } else if (needsDevice) flash.title = "Select a device";
     flash.onclick = () =>
       vscode.postMessage({
         type: "flash",
@@ -789,11 +962,15 @@
     return card;
   }
 
-  function stepHead(n, title, chip) {
+  function stepHead(n, title, chip, trailing) {
     const h = el("div", "step-head");
     if (n) h.appendChild(el("span", "step-num", n));
     h.appendChild(el("span", "step-title", title));
     if (chip) h.appendChild(el("span", "sel-chip", chip));
+    if (trailing) {
+      trailing.classList.add("step-trailing");
+      h.appendChild(trailing);
+    }
     return h;
   }
 
@@ -953,7 +1130,9 @@
           cmods: msg.cmods || {},
           flashers: msg.flashers || {},
           selection: msg.selection || model.selection,
-          prefs: msg.prefs || model.prefs,
+          prefs: Object.assign({}, model.prefs, msg.prefs || {}),
+          downloadVersions: msg.downloadVersions || [],
+          downloadFamily: msg.downloadFamily || "",
           connectedDevice: msg.connectedDevice || "",
           detect: msg.detect !== undefined ? msg.detect : model.detect,
           busy: msg.busy,
@@ -963,7 +1142,7 @@
       case "detectStatus":
         model.detectStatus = { state: msg.state, text: msg.text || "" };
         // Latch "detecting" on start; cleared by the later "detect" message so
-        // the Detect button stays disabled until Device Info is populated.
+        // the Detect button stays disabled until Detect results are populated.
         if (msg.state === "detecting") {
           model.detecting = true;
         }
@@ -983,6 +1162,17 @@
         // user edits it (empty === "use default").
         if (!model.flashOffset && model.artifact.flashOffset) {
           model.flashOffset = model.artifact.flashOffset;
+        }
+        render();
+        break;
+      case "flashOffsetDefault":
+        if (msg.flashOffset) {
+          // Always refresh from board.json when Target changes; user edits to
+          // the field are wiped on select (model.flashOffset = "").
+          model.flashOffset = String(msg.flashOffset);
+          if (model.artifact) {
+            model.artifact.flashOffset = model.flashOffset;
+          }
         }
         render();
         break;

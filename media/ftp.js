@@ -473,11 +473,6 @@
 
   function updateChrome() {
     const on = state.connected;
-    const info = on && state.deviceInfo ? ` — ${state.deviceInfo}` : "";
-    $("status").textContent = on
-      ? `Connected: ${state.device}${info}`
-      : "Not connected";
-    $("status").title = on && state.deviceInfo ? state.deviceInfo : "";
     $("btnConnect").textContent = on ? "Disconnect" : "Connect";
     $("btnXferUp").disabled = !on;
     $("btnXferDown").disabled = !on;

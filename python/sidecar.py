@@ -219,7 +219,10 @@ class Session:
         import serial.tools.list_ports
 
         ports = []
-        for p in sorted(serial.tools.list_ports.comports(), key=lambda x: x.device):
+        for p in serial.tools.list_ports.comports():
+            iface = getattr(p, "interface", None) or ""
+            # CircuitPython CDC2 is the data interface, not the REPL.
+            repl = "CircuitPython CDC2" not in iface
             ports.append(
                 {
                     "device": p.device,
@@ -229,8 +232,13 @@ class Session:
                     "manufacturer": p.manufacturer,
                     "product": p.product,
                     "description": p.description,
+                    "interface": iface or None,
+                    "hwid": getattr(p, "hwid", None) or None,
+                    "repl": repl,
                 }
             )
+        # REPL-capable first, then by device name; CDC2 (repl=false) last.
+        ports.sort(key=lambda x: (0 if x.get("repl", True) else 1, x["device"] or ""))
         return ports
 
     def connect(
@@ -260,12 +268,12 @@ class Session:
                     if not last:
                         time.sleep(retry_delay)
                         continue
-                    raise RuntimeError(str(e.args[0] if e.args else e)) from e
+                    raise RuntimeError(self._friendly_port_open_error(device, e)) from e
                 except OSError as e:
                     if not last:
                         time.sleep(retry_delay)
                         continue
-                    raise RuntimeError(f"failed to access {device}: {e}") from e
+                    raise RuntimeError(self._friendly_port_open_error(device, e)) from e
                 # Opening the COM port succeeds in UF2/bootloader mode too — require a
                 # MicroPython raw-REPL handshake before we report connected.
                 try:
@@ -282,8 +290,7 @@ class Session:
                         continue
                     self.device = None
                     raise RuntimeError(
-                        f"{device} is not responding as MicroPython "
-                        f"(likely bootloader/UF2 mode, wrong port, or busy REPL): {e}"
+                        self._friendly_probe_error(device, e)
                     ) from e
                 self.device = device
                 self.last_device = device
@@ -357,6 +364,41 @@ class Session:
         except Exception:
             pass
 
+    def _reset_esp_to_app(self, serial: Any) -> None:
+        """Pulse EN while IO0 is released so the chip boots firmware (not ROM download).
+
+        esptool Detect/flash leave many ESP boards in ``waiting for download``;
+        Connect must recover without requiring a physical RESET button.
+        """
+        import time
+
+        try:
+            serial.dtr = False  # IO0 released (not held for download)
+            serial.rts = True  # EN low
+            time.sleep(0.1)
+            serial.rts = False  # EN high → boot app
+            time.sleep(0.05)
+        except Exception:
+            try:
+                serial.setDTR(False)
+                serial.setRTS(True)
+                time.sleep(0.1)
+                serial.setRTS(False)
+            except Exception:
+                pass
+        time.sleep(1.6)  # USB-UART boards need time for ROM + MP boot banner
+        self._serial_flush(serial)
+
+    def _serial_peek(self, serial: Any, wait: float = 0.15) -> bytes:
+        import time
+
+        time.sleep(wait)
+        try:
+            n = serial.inWaiting()
+            return serial.read(n) if n else b""
+        except Exception:
+            return b""
+
     def _take_control(
         self, t: Any, *, clean: bool = True, timeout_overall: float = 20.0
     ) -> None:
@@ -378,18 +420,39 @@ class Session:
             except Exception:
                 pass
 
-        # Thorough interrupt before raw mode (see micropython#7867 / Thonny pipkin).
-        for delay in (0.0, 0.1, 0.1, 0.2):
-            if delay:
-                time.sleep(delay)
-            ctrl_c()
-        time.sleep(0.05)
-        self._serial_flush(serial)
+        def interrupt_storm() -> None:
+            # Thorough interrupt (see micropython#7867 / Thonny pipkin).
+            # Busy timer/display loops (common on P4 boards) need a longer storm.
+            for delay in (0.0, 0.05, 0.05, 0.1, 0.1, 0.15, 0.2):
+                if delay:
+                    time.sleep(delay)
+                ctrl_c()
+            time.sleep(0.05)
+            self._serial_flush(serial)
+
+        # If a prior esptool session left the chip in ROM download mode, reboot
+        # into firmware before trying the raw-REPL handshake.
+        peek = self._serial_peek(serial, 0.2)
+        if b"waiting for download" in peek or b"DOWNLOAD(" in peek:
+            self._reset_esp_to_app(serial)
+
+        interrupt_storm()
 
         last_err: Optional[Exception] = None
-        attempts = 4
-        per = max(5.0, float(timeout_overall) / attempts)
-        for attempt in range(attempts):
+        # Two short tries, then one app-mode reset (covers silent download mode
+        # where the banner was already drained), then two more tries.
+        schedule = [
+            ("try", 3.5),
+            ("try", 3.5),
+            ("reset", 0.0),
+            ("try", 5.0),
+            ("try", 5.0),
+        ]
+        for action, per in schedule:
+            if action == "reset":
+                self._reset_esp_to_app(serial)
+                interrupt_storm()
+                continue
             try:
                 t.enter_raw_repl(soft_reset=clean, timeout_overall=per)
                 return
@@ -399,9 +462,9 @@ class Session:
                     t.in_raw_repl = False
                 except Exception:
                     pass
-                ctrl_c()
-                ctrl_c()
-                time.sleep(0.15 + 0.1 * attempt)
+                for _ in range(4):
+                    ctrl_c()
+                    time.sleep(0.08)
                 self._serial_flush(serial)
                 try:
                     serial.write(b"\r\x01")  # poke raw REPL (Thonny)
@@ -410,9 +473,62 @@ class Session:
                 time.sleep(0.1)
 
         detail = str(last_err.args[0] if last_err and getattr(last_err, "args", None) else last_err)
-        raise RuntimeError(
-            f"could not take control of MicroPython (interrupt/raw REPL failed): {detail}"
-        ) from last_err
+        raise RuntimeError(self._friendly_take_control_error(detail)) from last_err
+
+    @staticmethod
+    def _friendly_port_open_error(device: str, exc: BaseException) -> str:
+        raw = str(exc.args[0] if getattr(exc, "args", None) else exc)
+        low = raw.lower()
+        locked = (
+            "exclusively lock" in low
+            or "exclusive" in low and "lock" in low
+            or "permissionerror" in low
+            or "access is denied" in low
+            or "permission denied" in low
+            or "failed to access" in low
+            or "busy" in low
+        )
+        if locked:
+            return (
+                f"failed to open {device}: port is busy or locked. "
+                f"Close Thonny, a serial monitor, another mpftp session, or any tool "
+                f"holding the port, then try again. ({raw})"
+            )
+        return f"failed to access {device}: {raw}"
+
+    @staticmethod
+    def _friendly_take_control_error(detail: str) -> str:
+        return (
+            f"could not take control of MicroPython (interrupt/raw REPL failed): {detail}\n"
+            f"Device is busy or does not respond. Your options:\n"
+            f"  - wait until it completes current work;\n"
+            f"  - hard-reset the board and try again;\n"
+            f"  - check for a runaway main.py (rename/remove it if it blocks the REPL);\n"
+            f"  - confirm firmware is MicroPython (not bootloader/UF2);\n"
+            f"  - close other serial tools holding the port."
+        )
+
+    @staticmethod
+    def _friendly_probe_error(device: str, exc: BaseException) -> str:
+        detail = str(exc.args[0] if getattr(exc, "args", None) else exc)
+        base = (
+            f"{device} is not responding as MicroPython "
+            f"(likely bootloader/UF2 mode, wrong port, or busy REPL): {detail}"
+        )
+        # Take-control failures already include the checklist.
+        if "could not take control" in detail or "Your options:" in detail:
+            return base
+        return (
+            f"{base}\n"
+            f"  - wait / hard-reset / check main.py / confirm MicroPython / close other tools."
+        )
+
+    def _sync_remote_fs(self, t: Any) -> None:
+        """Flush on-board filesystem after writes (mpremote fs_writefile does not sync)."""
+        try:
+            t.exec("import os\nif hasattr(os, 'sync'):\n os.sync()")
+        except Exception:
+            pass
 
     def _probe_micropython(self, t: Any) -> Optional[list[int]]:
         """Take control (interrupt + raw soft-reset), set RTC, leave raw REPL.
@@ -542,6 +658,7 @@ class Session:
 
         def op(t):
             t.fs_writefile(path, data)
+            self._sync_remote_fs(t)
             return {"path": path, "size": len(data)}
 
         return self.with_raw(op)
@@ -1125,6 +1242,8 @@ print(repr(rows))
                 if hx != host_sha256(data):
                     raise RuntimeError(f"hash mismatch after upload: {final}")
                 verified.append(final)
+        if copied:
+            self._sync_remote_fs(t)
 
     def _cp_remote_to_local(
         self, t, src: str, dest: str, verify: bool, copied: list[str], verified: list[str]

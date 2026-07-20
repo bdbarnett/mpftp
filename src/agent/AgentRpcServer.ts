@@ -223,10 +223,44 @@ export class AgentRpcServer {
           {
             ...pathArgs,
             ...sel,
+            family: (params.family as string) || undefined,
             device: (params.device as string) || "",
             artifact: (params.artifact as string) || undefined,
             erase: !!params.erase,
             esptool: this.firmware.esptoolCommand() || undefined,
+          },
+          (line) => {
+            if (log.length < 4000) {
+              log.push(line);
+            }
+          }
+        );
+        const result = await handle.done;
+        return { ...result, log };
+      }
+      case "download_tree":
+      case "download-tree":
+        return this.firmware.run("download-tree", {
+          force: params.force ? true : undefined,
+        });
+      case "download_list":
+      case "download-list":
+        return this.firmware.run("download-list", {
+          board: (params.board as string) || sel.board,
+          variant: (params.variant as string) || sel.variant || undefined,
+          preview: params.preview ? true : undefined,
+          force: params.force ? true : undefined,
+        });
+      case "download": {
+        const log: string[] = [];
+        const handle = this.firmware.stream(
+          "download",
+          {
+            board: (params.board as string) || sel.board,
+            variant: (params.variant as string) || sel.variant || undefined,
+            version: (params.version as string) || undefined,
+            preview: params.preview ? true : undefined,
+            force: params.force ? true : undefined,
           },
           (line) => {
             if (log.length < 4000) {
