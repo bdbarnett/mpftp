@@ -131,6 +131,7 @@ export class AgentRpcServer {
       return {
         connected: this.bridge.connected,
         device: this.bridge.connectedDevice || null,
+        runtime: this.bridge.runtime || null,
         rpc: this.path,
         activityLog: this.activity.activityPath,
         replLog: this.activity.replPath,
@@ -149,12 +150,21 @@ export class AgentRpcServer {
       if (!device) {
         throw new Error("device required");
       }
-      await this.bridge.connect(device, params.baud as number | undefined);
-      return { device, baud: params.baud ?? 115200 };
+      const res = await this.bridge.connect(device, params.baud as number | undefined);
+      return {
+        device,
+        baud: params.baud ?? 115200,
+        runtime: this.bridge.runtime || null,
+        ...(res && typeof res === "object" ? res : {}),
+      };
     }
     if (method === "resume") {
       await this.bridge.resume(params.baud as number | undefined);
-      return { device: this.bridge.connectedDevice, resumed: true };
+      return {
+        device: this.bridge.connectedDevice,
+        resumed: true,
+        runtime: this.bridge.runtime || null,
+      };
     }
     if (method === "disconnect") {
       await this.bridge.disconnect();

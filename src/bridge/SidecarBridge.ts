@@ -49,6 +49,7 @@ export class SidecarBridge extends EventEmitter {
   private starting: Promise<void> | undefined;
   private _connectedDevice: string | undefined;
   private _lastDevice: string | undefined;
+  private _runtime: "micropython" | "circuitpython" | undefined;
 
   constructor(
     private readonly extensionPath: string,
@@ -69,6 +70,11 @@ export class SidecarBridge extends EventEmitter {
 
   get connected(): boolean {
     return !!this._connectedDevice;
+  }
+
+  /** Detected board runtime from the last successful connect/resume. */
+  get runtime(): "micropython" | "circuitpython" | undefined {
+    return this._runtime;
   }
 
   /** Seed in-memory last device from globalState (after window reload). */
@@ -156,6 +162,7 @@ export class SidecarBridge extends EventEmitter {
       });
       this.proc = undefined;
       this._connectedDevice = undefined;
+      this._runtime = undefined;
       for (const [, p] of this.pending) {
         p.reject(new Error("sidecar exited"));
       }
@@ -269,20 +276,33 @@ export class SidecarBridge extends EventEmitter {
     device: string,
     baud?: number,
     opts?: { silent?: boolean }
-  ): Promise<{ filesystem_warning?: string } | void> {
+  ): Promise<{ filesystem_warning?: string; runtime?: string } | void> {
     const cfg = getConfig();
     const res = await this.request<{
       device?: string;
       filesystem_warning?: string;
+      runtime?: string;
+      micropython?: boolean;
     }>("connect", { device, baud: baud ?? cfg.defaultBaud });
     this._connectedDevice = device;
     this._lastDevice = device;
+    this._runtime =
+      res.runtime === "circuitpython"
+        ? "circuitpython"
+        : res.runtime === "micropython"
+          ? "micropython"
+          : res.micropython === false
+            ? "circuitpython"
+            : "micropython";
     await this.persistLastDevice(device);
     await vscode.commands.executeCommand("setContext", "mpftp.connected", true);
-    this.activity?.event("connected", { message: device, data: { device } });
+    this.activity?.event("connected", {
+      message: device,
+      data: { device, runtime: this._runtime },
+    });
     // `silent` reconnects (e.g. after detect/flash) restore the link without
     // firing user-facing side effects such as auto-opening File Transfer.
-    this.emit("connected", device, { silent: !!opts?.silent });
+    this.emit("connected", device, { silent: !!opts?.silent, runtime: this._runtime });
     return res;
   }
 
@@ -295,7 +315,11 @@ export class SidecarBridge extends EventEmitter {
       return;
     }
     const cfg = getConfig();
-    const res = await this.request<{ device: string }>("resume", {
+    const res = await this.request<{
+      device: string;
+      runtime?: string;
+      micropython?: boolean;
+    }>("resume", {
       baud: baud ?? cfg.defaultBaud,
     });
     const device = res.device || this._lastDevice;
@@ -304,10 +328,21 @@ export class SidecarBridge extends EventEmitter {
     }
     this._connectedDevice = device;
     this._lastDevice = device;
+    this._runtime =
+      res.runtime === "circuitpython"
+        ? "circuitpython"
+        : res.runtime === "micropython"
+          ? "micropython"
+          : res.micropython === false
+            ? "circuitpython"
+            : "micropython";
     await this.persistLastDevice(device);
     await vscode.commands.executeCommand("setContext", "mpftp.connected", true);
-    this.activity?.event("connected", { message: `resume ${device}`, data: { device } });
-    this.emit("connected", device);
+    this.activity?.event("connected", {
+      message: `resume ${device}`,
+      data: { device, runtime: this._runtime },
+    });
+    this.emit("connected", device, { runtime: this._runtime });
   }
 
   /**
@@ -362,6 +397,7 @@ export class SidecarBridge extends EventEmitter {
   async disconnect(): Promise<void> {
     const wasConnected = !!this._connectedDevice;
     this._connectedDevice = undefined;
+    this._runtime = undefined;
     await vscode.commands.executeCommand("setContext", "mpftp.connected", false);
     if (wasConnected) {
       this.activity?.event("disconnected", { message: "disconnected" });
@@ -413,6 +449,7 @@ export class SidecarBridge extends EventEmitter {
     this.proc?.kill();
     this.proc = undefined;
     this._connectedDevice = undefined;
+    this._runtime = undefined;
     this.removeAllListeners();
   }
 }

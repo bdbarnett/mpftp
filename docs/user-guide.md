@@ -2,21 +2,31 @@
 
 ## What is mpftp?
 
-**mpftp** is a VS Code / Cursor extension for working with [MicroPython](https://micropython.org/) boards over USB serial. It gives you a dual-pane file transfer UI, an ANSI REPL, and a guided Firmware panel for downloading or building and flashing board images.
+**mpftp** is a VS Code / Cursor extension for working with
+[MicroPython](https://micropython.org/) and [CircuitPython](https://circuitpython.org/)
+boards over USB serial. It gives you a dual-pane file transfer UI, an ANSI REPL,
+runtime-aware package install (`mip` / `circup`), and a guided Firmware panel for
+downloading or building and flashing **MicroPython** board images (firmware is
+MicroPython-only).
 
 It is maintained under the [PyDevices](https://github.com/PyDevices) organization.
 
 ## What problem it solves
 
-MicroPython boards are usually driven with several separate tools: a serial terminal, `mpremote` or an FTP-like client for files, and a makefile/IDF/emsdk toolchain for firmware. Switching between them is slow, and on WSL the host often cannot see Windows `COM` ports without extra USB bridging.
+MicroPython and CircuitPython boards are usually driven with several separate tools:
+a serial terminal, `mpremote` / MSC / `circup`, and a makefile/IDF/emsdk toolchain for
+firmware. Switching between them is slow, and on WSL the host often cannot see Windows
+`COM` ports without extra USB bridging.
 
-mpftp puts connect, files, REPL, and firmware in one extension host session, with a single serial ownership model so the UI and agents do not fight over the port.
+mpftp puts connect, files, REPL, and MicroPython firmware in one extension host session,
+with a single serial ownership model so the UI and agents do not fight over the port.
 
 ## How it works
 
 - A long-lived **Python sidecar** (`mpremote`-backed) owns the serial link and speaks JSON-lines to the extension.
+- Connect detects **`micropython`** vs **`circuitpython`** and adjusts soft-reset / package install.
 - **File Transfer** and **REPL** talk to that session.
-- **Firmware** build/flash runs as a separate host-side Python engine so compiles never hold the serial port longer than needed.
+- **Firmware** build/flash runs as a separate host-side Python engine so compiles never hold the serial port longer than needed (MicroPython only).
 - On **WSL**, serial and esp32 flash use **Windows Python** so `COM` ports work without `usbipd`.
 
 ## Getting started
@@ -25,8 +35,10 @@ mpftp puts connect, files, REPL, and firmware in one extension host session, wit
 
 - VS Code or Cursor
 - Python 3 with [`mpremote`](https://pypi.org/project/mpremote/)
-  - **Windows / WSL:** install `mpremote` for Windows Python (`python.exe -m pip install mpremote`)
+  - **Windows / WSL:** install for Windows Python (`python.exe -m pip install mpremote`)
   - **Native Linux:** `python3 -m venv .venv && .venv/bin/pip install mpremote`, or set `mpftp.pythonPath`
+- For CircuitPython libraries: [`circup`](https://pypi.org/project/circup/) on the **same** interpreter
+  (`python.exe -m pip install circup` on WSL/Windows)
 
 ### Install
 
@@ -36,10 +48,19 @@ mpftp puts connect, files, REPL, and firmware in one extension host session, wit
 
 ### Connect and transfer files
 
-1. Connect and pick a serial port (`COM4`, `/dev/ttyACM0`, …).
+1. Connect and pick a serial port (`COM4`, `/dev/ttyACM0`, …). Prefer the CircuitPython **REPL** CDC interface (CDC2 data is filtered).
 2. Open **File Transfer** (editor tab or panel).
 3. Drag files between local and board panes, or use the header actions.
 4. Double-click a board file to edit it; save writes it back (optional SHA-256 verify).
+
+### Soft reset and packages
+
+| Runtime | Soft Reset | Install Package |
+|---------|------------|-----------------|
+| MicroPython | Raw soft-reset (skips `main.py`) | **mip** (host download → board) |
+| CircuitPython | Friendly↔raw toggle (does **not** run `code.py`) | **circup** — CIRCUITPY `--path` when mounted, else Web Workflow if writable, else USB staging |
+
+Use **mpftp: Install Package** in the UI, or CLI `mpftp mip …` / `mpftp circup …`.
 
 ### REPL
 
@@ -47,10 +68,9 @@ mpftp puts connect, files, REPL, and firmware in one extension host session, wit
 
 ### Firmware workspace (Build)
 
-Official **Download** mode needs no local checkout.
+Firmware download/build/flash is **MicroPython-only**. Official **Download** mode needs no local checkout.
 
 **Build** mode needs a **firmware workspace**: a folder that contains `micropython/` (directory or symlink) or that *is* the MicroPython tree (`ports/` and `py/`).
-
 Optional in that workspace:
 
 - `micropython.cmake` / `manifest.py` — aggregators for user modules and frozen Python (Create stubs… if missing); see [aggregator.md](aggregator.md)

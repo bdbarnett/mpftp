@@ -1,9 +1,12 @@
-# AGENTS.md — using mpftp with MicroPython boards
+# AGENTS.md — using mpftp with MicroPython / CircuitPython boards
 
 This document is for **coding agents** (and humans driving the same CLI) that need
-to talk to a board, push Python, rebuild firmware with user C modules, or flash
-for recovery. Prefer the **extension TCP RPC** so you share the UI’s serial
+to talk to a board, push Python, rebuild MicroPython firmware with user C modules,
+or flash for recovery. Prefer the **extension TCP RPC** so you share the UI’s serial
 session and do not open a second connection on the same port.
+
+**Serial** works for both MicroPython and CircuitPython. **Firmware**
+download/build/flash stays MicroPython-only.
 
 ## Session model
 
@@ -16,10 +19,12 @@ session and do not open a second connection on the same port.
 
 The Cursor/VS Code window must have **mpftp loaded** for the socket to exist.
 On WSL, serial and esp32 flash use **Windows Python** so `COM` ports work.
+Install host packages on that interpreter: `mpremote`, and **`circup`** for
+CircuitPython library installs (`python.exe -m pip install mpremote circup`).
 
 ```bash
 chmod +x scripts/mpftp
-./scripts/mpftp status          # rpc up? connected device?
+./scripts/mpftp status          # rpc up? connected device? runtime?
 ./scripts/mpftp watch           # follow activity.log
 ```
 
@@ -38,14 +43,25 @@ while the UI is connected.
 ./scripts/mpftp resume              # last device
 ```
 
-Connect **interrupts** any running program and enters raw REPL with a **soft
-reset that skips `main.py`**. If connect fails with a filesystem-corruption
-banner, the board may need erase + reflash (see Troubleshooting).
+Connect **interrupts** any running program and enters raw REPL. Runtime is
+detected from `sys.implementation.name` and returned as `runtime`
+(`micropython` | `circuitpython`).
 
-### MicroPython `.py` on the board
+| Runtime | Clean / Soft Reset |
+|---------|-------------------|
+| MicroPython | Raw soft-reset — skips `main.py` |
+| CircuitPython | Friendly↔raw toggle — **does not** Ctrl-D (that would run `code.py`) |
+
+CircuitPython may show “Press any key to enter the REPL…”; mpftp sends a key
+before raw. Prefer CDC REPL ports (CDC2 data interfaces are filtered).
+
+If connect fails with a filesystem-corruption banner (MicroPython), the board may
+need erase + reflash (see Troubleshooting).
+
+### Board filesystem & REPL
 
 Treat the board like a small filesystem. Prefer verified transfers for anything
-that must land intact.
+that must land intact. Startup script is usually `main.py` (MP) or `code.py` (CP).
 
 ```bash
 ./scripts/mpftp ls /
@@ -59,14 +75,40 @@ that must land intact.
 ./scripts/mpftp exec 'import main'
 ./scripts/mpftp run ./script.py             # local file via exec
 ./scripts/mpftp interrupt                   # Ctrl-C; no reset
-./scripts/mpftp soft-reset                  # fresh heap; does not run main.py
+./scripts/mpftp soft-reset                  # see table above
 ./scripts/mpftp hard-reset
-./scripts/mpftp mip github:org/repo         # host-side mip install onto board
+./scripts/mpftp mip github:org/repo         # MicroPython only
+./scripts/mpftp circup adafruit_display_text  # CircuitPython only → /lib over serial
 ```
+
+**Packages**
+
+| | MicroPython | CircuitPython |
+|---|---|---|
+| CLI | `mpftp mip …` | `mpftp circup …` |
+| Host dep | `mpremote` | `circup` on the sidecar Python |
+| Transport | serial (host download → board write) | **Web Workflow preferred** (`circup --host` when Wi‑Fi + `CIRCUITPY_WEB_API_PASSWORD` are set); else host stage → serial put / CIRCUITPY MSC |
+
+`mount` / `umount` / `romfs` remain **MicroPython-only**. CIRCUITPY USB MSC is
+not the preferred transport.
+
+**CircuitPython packages (no ``boot.py`` required)**
+
+With Wi‑Fi in `/settings.toml` (`CIRCUITPY_WIFI_*`, `CIRCUITPY_WEB_API_PASSWORD`),
+`mpftp circup` picks the fastest available transport:
+
+1. **CIRCUITPY mounted** → `circup --path` (USB disk; no board edits)
+2. **Web Workflow writable** → `circup --host` (Wi‑Fi; needs MSC *not* locking the FS)
+3. Else host stage + serial / MSC copy
+
+While USB mass storage is enabled in firmware, CircuitPython keeps the FS
+read-only for the device — host “Eject” is not enough for Wi‑Fi writes. Prefer
+a mounted CIRCUITPY drive, or optionally `storage.disable_usb_drive()` in
+`boot.py` if you want Web Workflow with the cable plugged in.
 
 **Rules of thumb**
 
-- Debug with `exec` / `eval` / `run` before rewriting `main.py`.
+- Debug with `exec` / `eval` / `run` before rewriting `main.py` / `code.py`.
 - Soft-reset after bad imports; hard-reset if the port is wedged.
 - Dotfiles / `__pycache__` are skipped by the File Transfer UI; CLI `put` of a
   single path does what you ask.
@@ -76,9 +118,9 @@ that must land intact.
 
 ## Firmware: diagnose, download, build, flash
 
-Firmware commands are **host-side** (separate from the sidecar). They do not
-hold the serial lock for the whole build.
-
+Firmware commands are **host-side** and **MicroPython-only**. They do not
+hold the serial lock for the whole build. CircuitPython firmware is out of scope
+for mpftp.
 ### Detect (troubleshooting first step)
 
 Works on a bare board (no MicroPython). Releases a live session briefly if needed.

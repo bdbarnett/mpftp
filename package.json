@@ -1,8 +1,8 @@
 {
   "name": "mpftp",
-  "displayName": "mpftp — MicroPython Board Tools",
-  "description": "Connect to MicroPython boards over USB serial: dual-pane file transfer, ANSI REPL, and guided firmware download/build/flash. Works on Linux, Windows, and WSL (COM ports via Windows Python).",
-  "version": "0.1.0",
+  "displayName": "mpftp — MicroPython / CircuitPython Board Tools",
+  "description": "Connect to MicroPython and CircuitPython boards over USB serial: dual-pane file transfer, ANSI REPL, mip/circup packages, and guided MicroPython firmware download/build/flash. Works on Linux, Windows, and WSL (COM ports via Windows Python).",
+  "version": "0.1.1",
   "publisher": "pydevices",
   "license": "MIT",
   "engines": {
@@ -14,7 +14,9 @@
   ],
   "keywords": [
     "micropython",
+    "circuitpython",
     "mpremote",
+    "circup",
     "repl",
     "serial",
     "ftp",
@@ -73,7 +75,7 @@
       },
       {
         "command": "mpftp.softReset",
-        "title": "mpftp: Soft Reset (skip main.py)"
+        "title": "mpftp: Soft Reset"
       },
       {
         "command": "mpftp.hardReset",
@@ -105,8 +107,16 @@
         "title": "mpftp: Set RTC from Host"
       },
       {
+        "command": "mpftp.installPackage",
+        "title": "mpftp: Install Package"
+      },
+      {
         "command": "mpftp.mipInstall",
         "title": "mpftp: mip Install Package"
+      },
+      {
+        "command": "mpftp.circupInstall",
+        "title": "mpftp: circup Install Package"
       },
       {
         "command": "mpftp.df",
@@ -149,6 +159,14 @@
         {
           "command": "mpftp.disconnect",
           "when": "mpftp.connected"
+        },
+        {
+          "command": "mpftp.mipInstall",
+          "when": "false"
+        },
+        {
+          "command": "mpftp.circupInstall",
+          "when": "false"
         }
       ]
     },
@@ -177,7 +195,7 @@
         "mpftp.pythonPath": {
           "type": "string",
           "default": "",
-          "description": "Python interpreter that has mpremote installed. On WSL, leave empty to auto-use Windows python.exe so COM ports work."
+          "description": "Python interpreter that has mpremote (and circup for CircuitPython packages) installed. On WSL, leave empty to auto-use Windows python.exe so COM ports work."
         },
         "mpftp.mpremotePath": {
           "type": "string",

@@ -6,6 +6,7 @@
     connected: false,
     device: "",
     deviceInfo: "",
+    runtime: "",
     localPath: "",
     remotePath: "/",
     localEntries: [],
@@ -531,6 +532,12 @@
     $("btnRefreshRemote").disabled = !on;
     $("btnInterrupt").disabled = !on;
     $("btnSoftReset").disabled = !on;
+    const softTitle =
+      state.runtime === "circuitpython"
+        ? "Soft Reset (friendly↔raw; does not run code.py)"
+        : "Soft Reset (skip main.py)";
+    $("btnSoftReset").title = softTitle;
+    $("btnSoftReset").setAttribute("aria-label", softTitle);
     $("btnHardReset").disabled = !on;
     $("btnRepl").disabled = !on;
     $("remotePath").disabled = !on;
@@ -554,7 +561,7 @@
         { command: "mpftp.resume", title: "Resume Last Device" },
         { command: "mpftp.refreshPorts", title: "Refresh Serial Ports" },
         { command: "mpftp.interrupt", title: "Interrupt (Ctrl+C)", needsConnected: true },
-        { command: "mpftp.softReset", title: "Soft Reset (skip main.py)", needsConnected: true },
+        { command: "mpftp.softReset", title: "Soft Reset", needsConnected: true },
         { command: "mpftp.hardReset", title: "Hard Reset", needsConnected: true },
         { command: "mpftp.openRepl", title: "Open REPL" },
         { command: "mpftp.runFile", title: "Run Editor Buffer", needsConnected: true },
@@ -577,11 +584,11 @@
         { command: "mpftp.bootloader", title: "Enter Bootloader", needsConnected: true },
         { command: "mpftp.rtcGet", title: "Get RTC", needsConnected: true },
         { command: "mpftp.rtcSet", title: "Set RTC from Host", needsConnected: true },
-        { command: "mpftp.mipInstall", title: "mip Install Package", needsConnected: true },
+        { command: "mpftp.installPackage", title: "Install Package", needsConnected: true },
         { command: "mpftp.df", title: "Disk Free (df)", needsConnected: true },
-        { command: "mpftp.mount", title: "Mount Local Folder (/remote)", needsConnected: true },
-        { command: "mpftp.umount", title: "Unmount /remote", needsConnected: true },
-        { command: "mpftp.romfsQuery", title: "ROMFS Query", needsConnected: true },
+        { command: "mpftp.mount", title: "Mount Local Folder (/remote)", needsConnected: true, runtime: "micropython" },
+        { command: "mpftp.umount", title: "Unmount /remote", needsConnected: true, runtime: "micropython" },
+        { command: "mpftp.romfsQuery", title: "ROMFS Query", needsConnected: true, runtime: "micropython" },
         { command: "mpftp.hashRemote", title: "Hash Board File", needsConnected: true },
       ],
     },
@@ -601,6 +608,9 @@
       for (const c of group.items) {
         // Mirror palette: Disconnect only when connected (commandPalette when clause).
         if (c.command === "mpftp.disconnect" && !state.connected) {
+          continue;
+        }
+        if (c.runtime && state.runtime && c.runtime !== state.runtime) {
           continue;
         }
         // Only offer opening the other host surface.
@@ -765,6 +775,7 @@
         state.connected = !!msg.connected;
         state.device = msg.device || "";
         state.deviceInfo = msg.deviceInfo || "";
+        state.runtime = msg.runtime || "";
         if (msg.localPath != null) state.localPath = msg.localPath;
         state.remotePath = msg.remotePath != null ? msg.remotePath : state.remotePath;
         if (msg.localEntries) {

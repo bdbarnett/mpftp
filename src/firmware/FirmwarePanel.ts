@@ -708,9 +708,8 @@ export class FirmwarePanel {
       "import json as _j",
       "_d = {}",
       "try:\n import sys\n _d['platform']=sys.platform\n _d['impl']=sys.implementation.name\n _d['build']=getattr(sys.implementation,'_build','')\nexcept Exception: pass",
-      // Rebuild the boot banner exactly: uname.version is "<git-tag> on <date>"
-      // and uname.machine is the "<board> with <mcu>" (or unix) suffix.
-      "try:\n import os as _os\n _u=_os.uname()\n _d['machine']=_u.machine\n _d['version']='MicroPython '+_u.version+'; '+_u.machine\nexcept Exception: pass",
+      // Rebuild the boot banner: prefix from implementation name (MP or CP).
+      "try:\n import os as _os\n _u=_os.uname()\n _d['machine']=_u.machine\n _impl=_d.get('impl') or 'MicroPython'\n _name='CircuitPython' if str(_impl).lower().startswith('circuit') else 'MicroPython'\n _d['version']=_name+' '+_u.version+' on '+_u.machine\nexcept Exception: pass",
       "try:\n import machine as _m\n _d['freq']=_m.freq()\nexcept Exception: pass",
       "try:\n import gc as _g\n _d['memfree']=_g.mem_free()\nexcept Exception: pass",
       "try:\n import esp as _e\n _d['flash']=_e.flash_size()\nexcept Exception: pass",

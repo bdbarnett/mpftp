@@ -1,8 +1,10 @@
 # mpftp
 
-**MicroPython board tools for VS Code and Cursor**
+**MicroPython and CircuitPython board tools for VS Code and Cursor**
 
-Connect over USB serial, transfer files in a dual-pane UI, use a full ANSI REPL, and download or build/flash firmware — on Linux, Windows, and WSL (COM ports via Windows Python).
+Connect over USB serial, transfer files in a dual-pane UI, use a full ANSI REPL,
+install packages (`mip` / `circup`), and download or build/flash **MicroPython**
+firmware — on Linux, Windows, and WSL (COM ports via Windows Python).
 
 Published as **`pydevices.mpftp`** under [PyDevices](https://github.com/PyDevices).
 
@@ -18,11 +20,11 @@ Published as **`pydevices.mpftp`** under [PyDevices](https://github.com/PyDevice
 - Dual-pane local ↔ board file transfer (upload, download, mkdir, new file, delete, rename, drag-and-drop)
 - Edit board files in the editor (save writes back); optional SHA-256 verify
 - Integrated ANSI REPL sharing the same serial session
-- Connect probes MicroPython raw REPL and sets RTC from the host
+- Connect detects MicroPython or CircuitPython, probes raw REPL, and sets RTC from the host
 - Hard-reset auto-reconnect; Resume last device
-- mpremote-backed ops: eval/exec/run, soft/hard reset, bootloader, mip, df, mount, romfs, …
+- mpremote-backed ops: eval/exec/run, soft/hard reset, bootloader, mip, circup, df, …
 - Agent CLI + local TCP RPC sharing the UI session
-- **Firmware panel:** Detect (esptool-first), Download (official catalog) or Build (local MicroPython tree), flash esp32 / rp2 / samd, partition autosize for esp32
+- **Firmware panel (MicroPython only):** Detect (esptool-first), Download (official catalog) or Build (local MicroPython tree), flash esp32 / rp2 / samd, partition autosize for esp32
 
 ## Requirements
 
@@ -30,6 +32,7 @@ Published as **`pydevices.mpftp`** under [PyDevices](https://github.com/PyDevice
 - Python 3 with [`mpremote`](https://pypi.org/project/mpremote/)
   - WSL / Windows serial: Windows Python + `pip install mpremote`
   - Native Linux: venv or `mpftp.pythonPath`
+- For CircuitPython packages: [`circup`](https://pypi.org/project/circup/) on the **same** Python (`pip install circup`)
 
 ## Install
 
@@ -53,7 +56,8 @@ npm install && npm run compile
 
 1. **mpftp: Connect to Board** — pick a port
 2. Open **File Transfer** — move files; open **REPL** for the shell
-3. **Firmware** — Detect a board, then Download an official image or Build from a firmware workspace
+3. **Install Package** — mip (MicroPython) or circup (CircuitPython) by detected runtime
+4. **Firmware** — Detect a board, then Download an official MicroPython image or Build from a firmware workspace
 
 A **firmware workspace** is a folder that contains `micropython/` (or *is* the MicroPython tree). Port SDKs go in that workspace as directories/symlinks, or via environment variables — see the [user guide](docs/user-guide.md).
 
@@ -61,13 +65,13 @@ A **firmware workspace** is a folder that contains `micropython/` (or *is* the M
 
 | Command | Action |
 |---------|--------|
-| `mpftp: Connect to Board` | Port picker; interrupt + raw soft-reset |
+| `mpftp: Connect to Board` | Port picker; interrupt + runtime-aware clean |
 | `mpftp: Resume Last Device` | Reconnect previous port |
 | `mpftp: Open File Transfer in Panel / Editor` | Dual-pane UI |
 | `mpftp: Open REPL` | ANSI terminal |
-| `mpftp: Build & Flash Firmware…` | Firmware panel |
+| `mpftp: Build & Flash Firmware…` | MicroPython firmware panel |
 | `mpftp: Interrupt` / Soft Reset / Hard Reset | Board control |
-| `mpftp: mip Install Package` | Host-side mip onto the board |
+| `mpftp: Install Package` | mip or circup by runtime |
 
 ## Settings (selection)
 

@@ -15,7 +15,10 @@ import hashlib
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 from pathlib import Path
@@ -31,6 +34,97 @@ def split_fs_path(path: str) -> tuple[bool, str]:
 
 def host_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def normalize_runtime_name(name: Any) -> str:
+    """Map ``sys.implementation.name`` to ``micropython`` | ``circuitpython``."""
+    n = str(name or "").strip().lower()
+    if n in ("circuitpython", "circuit"):
+        return "circuitpython"
+    return "micropython"
+
+
+# CircuitPython "Press any key…" banners (Thonny cirpy_back._ENTER_REPL_PHRASES).
+# Substring match — localization variants share distinctive fragments.
+_CP_ENTER_REPL_MARKERS = (
+    b"Press any key to enter the REPL",
+    b"Appuyez sur n'importe quelle touche pour utiliser le REPL",
+    b"Presiona cualquier tecla para entrar al REPL",
+    b"Dr\xc3\xbccke eine beliebige Taste um REPL",
+    b"Druk een willekeurige toets om de REPL",
+    b"Tekan sembarang tombol untuk masuk ke REPL",
+    b"Pressione qualquer tecla para entrar no REPL",
+    b"Tryck p\xc3\xa5 valfri tangent f\xc3\xb6r att g\xc3\xa5 in i REPL",
+    "Нажмите любую клавишу чтобы зайти в REPL".encode("utf-8"),
+)
+
+
+def data_has_enter_repl_prompt(data: bytes) -> bool:
+    """True if UART output is waiting for a key to enter the friendly REPL."""
+    if not data:
+        return False
+    return any(m in data for m in _CP_ENTER_REPL_MARKERS)
+
+
+def circup_boot_out_text(*, cpy_version: str, board_id: str = "unknown") -> str:
+    """Minimal boot_out.txt so circup --path can resolve board/version."""
+    ver = (cpy_version or "9.0.0").strip()
+    bid = (board_id or "unknown").strip() or "unknown"
+    return (
+        f"Adafruit CircuitPython {ver} on 2020-01-01; "
+        f"{bid} with unknown\n"
+        f"Board ID:{bid}\n"
+    )
+
+
+def build_circup_argv(
+    *,
+    circup_exe: str,
+    stage_path: str,
+    packages: list[str],
+    cpy_version: str,
+    board_id: str = "unknown",
+    py: bool = False,
+) -> list[str]:
+    """CLI argv for host-side circup install into a staging directory."""
+    argv = [
+        circup_exe,
+        "--path",
+        stage_path,
+        "--board-id",
+        board_id or "unknown",
+        "--cpy-version",
+        cpy_version or "9.0.0",
+        "install",
+    ]
+    if py:
+        argv.append("--py")
+    argv.extend(packages)
+    return argv
+
+
+def build_circup_web_argv(
+    *,
+    circup_exe: str,
+    host: str,
+    password: str,
+    packages: list[str],
+    py: bool = False,
+) -> list[str]:
+    """CLI argv for circup install over CircuitPython Web Workflow."""
+    argv = [
+        circup_exe,
+        "--host",
+        host,
+        "--password",
+        password,
+        "install",
+    ]
+    if py:
+        argv.append("--py")
+    argv.extend(packages)
+    return argv
+
 
 # Ensure UTF-8 stdio on Windows
 if hasattr(sys.stdout, "reconfigure"):
@@ -222,6 +316,8 @@ class Session:
         self._repl_stop = threading.Event()
         self._repl_thread: Optional[threading.Thread] = None
         self._mounted_path: Optional[str] = None
+        # "micropython" | "circuitpython" — set on successful probe/connect.
+        self.runtime: Optional[str] = None
         # Set when connect had to skip raw soft-reset because boot loops on a
         # corrupt filesystem (soft-reset would never re-enter raw REPL).
         self.filesystem_warning: Optional[str] = None
@@ -306,22 +402,38 @@ class Session:
                     ) from e
                 self.device = device
                 self.last_device = device
-                result: dict[str, Any] = {
-                    "device": device,
-                    "baud": baud,
-                    "micropython": True,
-                }
-                if rtc is not None:
-                    result["rtc"] = rtc
-                if attempt > 1:
-                    result["retries"] = attempt - 1
-                if self.filesystem_warning:
-                    result["filesystem_warning"] = self.filesystem_warning
-                return result
+                return self._connect_result(device, baud, rtc, retries=attempt - 1)
             # Unreachable: the loop always returns or raises on the last attempt.
             raise RuntimeError(
                 f"{device} could not be connected: {last_probe_err}"
             )
+
+    def _connect_result(
+        self,
+        device: str,
+        baud: int,
+        rtc: Optional[list[int]],
+        *,
+        retries: int = 0,
+        resumed: bool = False,
+    ) -> dict[str, Any]:
+        runtime = self.runtime or "micropython"
+        result: dict[str, Any] = {
+            "device": device,
+            "baud": baud,
+            "runtime": runtime,
+            # Legacy bool kept for older UI/agents.
+            "micropython": runtime == "micropython",
+        }
+        if rtc is not None:
+            result["rtc"] = rtc
+        if retries > 0:
+            result["retries"] = retries
+        if resumed:
+            result["resumed"] = True
+        if self.filesystem_warning:
+            result["filesystem_warning"] = self.filesystem_warning
+        return result
 
     def resume(self, baud: Optional[int] = None) -> dict[str, Any]:
         """Reconnect to the last device without requiring the caller to re-pick a port."""
@@ -334,18 +446,12 @@ class Session:
                 try:
                     rtc = self._probe_micropython(self.transport)
                 except Exception as e:
-                    raise RuntimeError(f"resume failed (still connected but not MicroPython): {e}") from e
-                result: dict[str, Any] = {
-                    "device": device,
-                    "baud": self.baud,
-                    "micropython": True,
-                    "resumed": True,
-                }
-                if rtc is not None:
-                    result["rtc"] = rtc
-                if self.filesystem_warning:
-                    result["filesystem_warning"] = self.filesystem_warning
-                return result
+                    raise RuntimeError(
+                        f"resume failed (still connected but board not responding): {e}"
+                    ) from e
+                return self._connect_result(
+                    device, self.baud, rtc, resumed=True
+                )
         return self.connect(device, baud if baud is not None else self.baud)
 
     def _host_rtc_tuple(self) -> tuple[int, ...]:
@@ -367,7 +473,15 @@ class Session:
 
     def _apply_rtc(self, t: Any) -> list[int]:
         tup = self._host_rtc_tuple()
-        t.exec(f"import machine; machine.RTC().datetime({tup})")
+        # MicroPython: machine.RTC; CircuitPython often exposes rtc.RTC as well.
+        t.exec(
+            "try:\n"
+            " import machine\n"
+            f" machine.RTC().datetime({tup})\n"
+            "except Exception:\n"
+            " import rtc\n"
+            f" rtc.RTC().datetime({tup})\n"
+        )
         return list(tup)
 
     @staticmethod
@@ -425,13 +539,16 @@ class Session:
         """Interrupt any running program and enter raw REPL.
 
         Always sends Ctrl-C (Thonny-style interrupt-on-connect). When ``clean``
-        is True, soft-resets *while in raw REPL* so ``main.py`` does not run
-        (MicroPython skips auto-start after a raw soft-reset).
+        is True:
+
+        - MicroPython: soft-reset *while in raw REPL* so ``main.py`` does not run.
+        - CircuitPython: friendly↔raw toggle (no Ctrl-D). CP runs ``code.py`` after
+          a raw soft-reboot; switching REPL modes refreshes the VM instead.
 
         Exception: a corrupt on-board filesystem makes soft-reset re-run
         ``_boot``/``inisetup``, which loops printing the corruption banner and
         never returns to raw REPL. In that case we interrupt + enter raw
-        without soft-reset and set ``filesystem_warning``.
+        without soft-reset and set ``filesystem_warning`` (MicroPython only).
         """
         import time
 
@@ -452,6 +569,21 @@ class Session:
             except Exception:
                 pass
 
+        def poke_enter_repl_key(data: bytes) -> None:
+            # CircuitPython waits for any key before showing the friendly REPL.
+            if data_has_enter_repl_prompt(data):
+                try:
+                    serial.write(b"\r")
+                except Exception:
+                    pass
+                time.sleep(0.15)
+                try:
+                    n = serial.inWaiting()
+                    if n:
+                        note_bytes(serial.read(n))
+                except Exception:
+                    pass
+
         def interrupt_storm() -> None:
             # Thorough interrupt (see micropython#7867 / Thonny pipkin).
             # Busy timer/display loops (common on P4 boards) need a longer storm.
@@ -463,7 +595,9 @@ class Session:
             try:
                 n = serial.inWaiting()
                 if n:
-                    note_bytes(serial.read(n))
+                    data = serial.read(n)
+                    note_bytes(data)
+                    poke_enter_repl_key(data)
             except Exception:
                 pass
 
@@ -471,9 +605,12 @@ class Session:
         # into firmware before trying the raw-REPL handshake.
         peek = self._serial_peek(serial, 0.2)
         note_bytes(peek)
+        poke_enter_repl_key(peek)
         if b"waiting for download" in peek or b"DOWNLOAD(" in peek:
             self._reset_esp_to_app(serial)
-            note_bytes(self._serial_peek(serial, 0.3))
+            after = self._serial_peek(serial, 0.3)
+            note_bytes(after)
+            poke_enter_repl_key(after)
 
         interrupt_storm()
 
@@ -485,13 +622,16 @@ class Session:
                 try:
                     n = serial.inWaiting()
                     if n:
-                        note_bytes(serial.read(n))
+                        data = serial.read(n)
+                        note_bytes(data)
+                        poke_enter_repl_key(data)
                 except Exception:
                     pass
                 raise
 
         last_err: Optional[Exception] = None
-        # Corrupt FS: soft-reset never recovers — interrupt and enter raw only.
+        # Always enter raw *without* soft-reset first so CircuitPython does not
+        # auto-run code.py. Clean behavior is applied after runtime detect.
         if clean and saw_fs_corrupt:
             try:
                 if try_raw(False, 5.0):
@@ -500,6 +640,7 @@ class Session:
                         "soft-reset; erase flash and reflash MicroPython (Firmware > "
                         "Erase) to restore a usable filesystem."
                     )
+                    self._finish_clean_after_raw(t, saw_fs_corrupt=True)
                     return
             except Exception as e:
                 last_err = e
@@ -516,7 +657,9 @@ class Session:
         for action, per in schedule:
             if action == "reset":
                 self._reset_esp_to_app(serial)
-                note_bytes(self._serial_peek(serial, 0.3))
+                after = self._serial_peek(serial, 0.3)
+                note_bytes(after)
+                poke_enter_repl_key(after)
                 interrupt_storm()
                 # After reset the board may start the corrupt-FS boot loop.
                 if clean and saw_fs_corrupt:
@@ -527,19 +670,16 @@ class Session:
                                 "without soft-reset; erase flash and reflash MicroPython "
                                 "(Firmware > Erase) to restore a usable filesystem."
                             )
+                            self._finish_clean_after_raw(t, saw_fs_corrupt=True)
                             return
                     except Exception as e:
                         last_err = e
                     continue
-            use_soft = bool(clean) and not saw_fs_corrupt
             try:
-                if try_raw(use_soft, per):
-                    if saw_fs_corrupt and not use_soft:
-                        self.filesystem_warning = (
-                            "On-board filesystem is corrupted. Connect succeeded without "
-                            "soft-reset; erase flash and reflash MicroPython (Firmware > "
-                            "Erase) to restore a usable filesystem."
-                        )
+                if try_raw(False, per):
+                    self._finish_clean_after_raw(
+                        t, saw_fs_corrupt=saw_fs_corrupt, want_clean=clean
+                    )
                     return
             except Exception as e:
                 last_err = e
@@ -553,7 +693,9 @@ class Session:
                 try:
                     n = serial.inWaiting()
                     if n:
-                        note_bytes(serial.read(n))
+                        data = serial.read(n)
+                        note_bytes(data)
+                        poke_enter_repl_key(data)
                 except Exception:
                     pass
                 try:
@@ -562,8 +704,7 @@ class Session:
                     pass
                 time.sleep(0.1)
 
-        # Last resort: even without a banner match, soft-reset may be the
-        # failure mode (banner drained / binary noise). Try interrupt-only.
+        # Last resort: interrupt-only enter raw.
         if clean:
             interrupt_storm()
             try:
@@ -574,6 +715,9 @@ class Session:
                             "soft-reset; erase flash and reflash MicroPython (Firmware > "
                             "Erase) to restore a usable filesystem."
                         )
+                    self._finish_clean_after_raw(
+                        t, saw_fs_corrupt=saw_fs_corrupt, want_clean=clean
+                    )
                     return
             except Exception as e:
                 last_err = e
@@ -583,6 +727,67 @@ class Session:
             self._friendly_take_control_error(detail, fs_corrupt=saw_fs_corrupt)
         ) from last_err
 
+    def _detect_runtime(self, t: Any) -> str:
+        """Read ``sys.implementation.name`` while already in raw REPL."""
+        try:
+            t.exec("import sys")
+            name = t.eval("sys.implementation.name")
+            runtime = normalize_runtime_name(name)
+        except Exception:
+            runtime = self.runtime or "micropython"
+        self.runtime = runtime
+        return runtime
+
+    def _finish_clean_after_raw(
+        self,
+        t: Any,
+        *,
+        saw_fs_corrupt: bool = False,
+        want_clean: bool = True,
+    ) -> None:
+        """After raw REPL is open: detect runtime and apply clean semantics."""
+        runtime = self._detect_runtime(t)
+        if not want_clean:
+            return
+        if runtime == "circuitpython":
+            # Thonny CP clear_repl: exit raw → enter raw (no Ctrl-D soft-reboot).
+            try:
+                if t.in_raw_repl:
+                    t.exit_raw_repl()
+            except Exception:
+                pass
+            try:
+                t.in_raw_repl = False
+            except Exception:
+                pass
+            t.enter_raw_repl(soft_reset=False, timeout_overall=10.0)
+            try:
+                t.exec(
+                    "try:\n"
+                    " import supervisor\n"
+                    " if hasattr(supervisor, 'disable_autoreload'):\n"
+                    "  supervisor.disable_autoreload()\n"
+                    " elif hasattr(supervisor, 'runtime'):\n"
+                    "  supervisor.runtime.autoreload = False\n"
+                    "except Exception:\n"
+                    " pass\n"
+                )
+            except Exception:
+                pass
+            return
+        # MicroPython: raw soft-reset skips main.py (unless corrupt FS).
+        if saw_fs_corrupt:
+            return
+        try:
+            if t.in_raw_repl:
+                t.exit_raw_repl()
+        except Exception:
+            pass
+        try:
+            t.in_raw_repl = False
+        except Exception:
+            pass
+        t.enter_raw_repl(soft_reset=True, timeout_overall=10.0)
     @staticmethod
     def _friendly_port_open_error(device: str, exc: BaseException) -> str:
         raw = str(exc.args[0] if getattr(exc, "args", None) else exc)
@@ -611,17 +816,17 @@ class Session:
             for s in ("filesystem appears to be corrupted", "fs_corrupted")
         ):
             return (
-                f"could not take control of MicroPython: on-board filesystem is corrupted "
-                f"({detail}). Erase flash and reflash MicroPython "
-                f"(Firmware panel > Erase), then Connect again."
+                f"could not take control of the board: on-board filesystem is corrupted "
+                f"({detail}). Erase flash and reflash firmware "
+                f"(Firmware panel > Erase for MicroPython), then Connect again."
             )
         return (
-            f"could not take control of MicroPython (interrupt/raw REPL failed): {detail}\n"
+            f"could not take control of the board (interrupt/raw REPL failed): {detail}\n"
             f"Device is busy or does not respond. Your options:\n"
             f"  - wait until it completes current work;\n"
             f"  - hard-reset the board and try again;\n"
-            f"  - check for a runaway main.py (rename/remove it if it blocks the REPL);\n"
-            f"  - confirm firmware is MicroPython (not bootloader/UF2);\n"
+            f"  - check for a runaway main.py / code.py;\n"
+            f"  - confirm firmware is MicroPython or CircuitPython (not bootloader/UF2);\n"
             f"  - close other serial tools holding the port."
         )
 
@@ -631,7 +836,7 @@ class Session:
         if "filesystem is corrupted" in detail.lower():
             return f"{device}: {detail}"
         base = (
-            f"{device} is not responding as MicroPython "
+            f"{device} is not responding as MicroPython/CircuitPython "
             f"(likely bootloader/UF2 mode, wrong port, or busy REPL): {detail}"
         )
         # Take-control failures already include the checklist.
@@ -639,7 +844,7 @@ class Session:
             return base
         return (
             f"{base}\n"
-            f"  - wait / hard-reset / check main.py / confirm MicroPython / close other tools."
+            f"  - wait / hard-reset / check main.py or code.py / confirm firmware / close other tools."
         )
 
     def _sync_remote_fs(self, t: Any) -> None:
@@ -650,17 +855,18 @@ class Session:
             pass
 
     def _probe_micropython(self, t: Any) -> Optional[list[int]]:
-        """Take control (interrupt + raw soft-reset), set RTC, leave raw REPL.
+        """Take control, detect runtime, set RTC, leave raw REPL.
 
-        Connect never leaves ``main.py`` running: interrupt is unconditional and
-        the raw soft-reset refreshes the heap without auto-starting main.
+        Connect never leaves user code running: interrupt is unconditional.
+        MicroPython gets a raw soft-reset (skip main.py); CircuitPython gets a
+        friendly↔raw toggle (Ctrl-D would run code.py).
         """
         self._take_control(t, clean=True, timeout_overall=20.0)
         rtc: Optional[list[int]] = None
         try:
             rtc = self._apply_rtc(t)
         except Exception:
-            # Some ports lack machine.RTC; don't fail the connection for that.
+            # Some ports lack machine.RTC / rtc.RTC; don't fail the connection.
             pass
         try:
             if t.in_raw_repl:
@@ -673,6 +879,7 @@ class Session:
         with self._lock:
             self._stop_repl_reader()
             if not self.transport:
+                self.runtime = None
                 return
             try:
                 if getattr(self.transport, "mounted", False):
@@ -689,8 +896,8 @@ class Session:
                 pass
             self.transport = None
             self.device = None
+            self.runtime = None
             self._repl_mode = False
-
     def _require(self):
         if not self.transport:
             raise RuntimeError("not connected")
@@ -729,13 +936,82 @@ class Session:
 
     # --- filesystem ---
 
+    def _require_micropython(self, feature: str) -> None:
+        runtime = self.runtime or "micropython"
+        if runtime != "micropython":
+            raise RuntimeError(
+                f"{feature} is MicroPython-only (connected runtime is {runtime})"
+            )
+
+    def _board_listdir(self, t: Any, path: str) -> list[Any]:
+        """List directory entries on the board (listdir, then ilistdir).
+
+        Returns mpremote-like objects with ``.name``, ``.st_mode``, ``.st_size``.
+        Prefers ``os.listdir`` + ``os.stat`` (universal), falls back to
+        ``os.ilistdir`` when listdir is missing — Thonny's order.
+        """
+        list_path = "" if path in ("", "/", None) else path
+        # Prefer transport helper when present and working (MicroPython).
+        try:
+            return list(t.fs_listdir(list_path))
+        except Exception:
+            pass
+
+        path_lit = repr(list_path if list_path else "/")
+        code = f"""
+import os
+_p = {path_lit}
+_out = []
+_ok = False
+if hasattr(os, 'listdir'):
+ try:
+  for _n in os.listdir(_p):
+   if _n in ('.', '..'):
+    continue
+   _fp = (_p.rstrip('/') + '/' + _n) if _p not in ('', '/') else ('/' + _n)
+   try:
+    _st = os.stat(_fp)
+    _out.append((_n, _st[0], 0, _st[6] if len(_st) > 6 else 0))
+   except Exception:
+    _out.append((_n, 0x8000, 0, 0))
+  _ok = True
+ except Exception:
+  _out = []
+if not _ok:
+ for _e in os.ilistdir(_p):
+  _n = _e[0]
+  if _n in ('.', '..'):
+   continue
+  _mode = _e[1] if len(_e) > 1 else 0x8000
+  _size = _e[3] if len(_e) > 3 else 0
+  _out.append((_n, _mode, 0, _size))
+print(repr(_out))
+"""
+        out = t.exec(code)
+        text = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
+        line = text.strip().splitlines()[-1] if text.strip() else "[]"
+        import ast
+
+        rows = ast.literal_eval(line)
+
+        class _Ent:
+            __slots__ = ("name", "st_mode", "st_ino", "st_size")
+
+            def __init__(self, name: str, mode: int, ino: int, size: int) -> None:
+                self.name = name
+                self.st_mode = mode
+                self.st_ino = ino
+                self.st_size = size
+
+        return [_Ent(*r) if len(r) >= 4 else _Ent(r[0], r[1] if len(r) > 1 else 0x8000, 0, 0) for r in rows]
+
     def fs_listdir(self, path: str = "/") -> list[dict[str, Any]]:
         # mpremote uses "" for the device root; "/" also works on most ports.
         list_path = "" if path in ("", "/", None) else path
 
         def op(t):
             entries = []
-            for e in t.fs_listdir(list_path):
+            for e in self._board_listdir(t, list_path):
                 is_dir = bool(e.st_mode & 0x4000)
                 entries.append(
                     {
@@ -776,6 +1052,7 @@ class Session:
         data = base64.b64decode(data_b64)
 
         def op(t):
+            self._ensure_cp_writable(t)
             t.fs_writefile(path, data)
             self._sync_remote_fs(t)
             return {"path": path, "size": len(data)}
@@ -808,7 +1085,7 @@ class Session:
     def fs_rm_rf(self, path: str) -> dict[str, Any]:
         def _rm(t, p: str) -> None:
             if t.fs_isdir(p):
-                for e in t.fs_listdir(p):
+                for e in self._board_listdir(t, p):
                     child = p.rstrip("/") + "/" + e.name if p not in ("", ".") else e.name
                     if p == "/":
                         child = "/" + e.name
@@ -854,7 +1131,7 @@ class Session:
         def walk(t, p: str, depth: int = 0) -> list[dict[str, Any]]:
             nodes = []
             try:
-                entries = t.fs_listdir(p if p != "/" else "")
+                entries = self._board_listdir(t, p if p != "/" else "")
             except Exception:
                 return nodes
             for e in sorted(entries, key=lambda x: (not bool(x.st_mode & 0x4000), x.name.lower())):
@@ -997,11 +1274,16 @@ class Session:
             return {"ok": True}
 
     def soft_reset(self) -> dict[str, Any]:
-        """Fresh heap via raw soft-reset. Does not run main.py."""
+        """Fresh session without running user startup scripts the MP way.
+
+        MicroPython: raw soft-reset (does not run main.py).
+        CircuitPython: friendly↔raw toggle (Ctrl-D would run code.py).
+        """
         with self._lock:
             t = self._require()
             self._stop_repl_reader()
             self._take_control(t, clean=True, timeout_overall=20.0)
+            runtime = self.runtime or "micropython"
             if self._repl_mode:
                 try:
                     if t.in_raw_repl:
@@ -1009,7 +1291,11 @@ class Session:
                 except Exception:
                     pass
                 self._start_repl_reader()
-            return {"ok": True, "main_skipped": True}
+            return {
+                "ok": True,
+                "runtime": runtime,
+                "main_skipped": runtime == "micropython",
+            }
 
     def hard_reset(self) -> dict[str, Any]:
         code = "import time, machine; time.sleep_ms(100); machine.reset()"
@@ -1060,8 +1346,16 @@ class Session:
 
     def rtc_get(self) -> dict[str, Any]:
         def op(t):
-            t.exec("import machine")
-            out = t.eval("machine.RTC().datetime()")
+            t.exec(
+                "def _mpftp_rtc():\n"
+                " try:\n"
+                "  import machine\n"
+                "  return machine.RTC().datetime()\n"
+                " except Exception:\n"
+                "  import rtc\n"
+                "  return rtc.RTC().datetime()\n"
+            )
+            out = t.eval("_mpftp_rtc()")
             return {"datetime": list(out) if isinstance(out, (tuple, list)) else repr(out)}
 
         return self.with_raw(op)
@@ -1080,6 +1374,10 @@ class Session:
         index: Optional[str] = None,
     ) -> dict[str, Any]:
         """Host-side mip install via mpremote (downloads on host, writes to board)."""
+        if (self.runtime or "micropython") == "circuitpython":
+            raise RuntimeError(
+                "mip is MicroPython-only; use circup_install / mpftp circup on CircuitPython"
+            )
         from mpremote import mip as mp_mip
 
         with self._lock:
@@ -1135,34 +1433,580 @@ class Session:
                         pass
                     self._start_repl_reader()
 
-    def df(self) -> dict[str, Any]:
+    def _find_circuitpy_host_roots(self) -> list[str]:
+        """Host paths for a mounted CIRCUITPY drive (Windows letters or /media)."""
+        roots: list[str] = []
+        # Windows: query volume label via PowerShell (works from WSL too).
+        try:
+            ps = (
+                "Get-CimInstance Win32_LogicalDisk | "
+                "Where-Object { $_.VolumeName -eq 'CIRCUITPY' } | "
+                "ForEach-Object { $_.DeviceID }"
+            )
+            out = subprocess.check_output(
+                ["powershell.exe", "-NoProfile", "-Command", ps],
+                text=True,
+                timeout=15,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                letter = line.strip().rstrip("\\/")
+                if len(letter) >= 2 and letter[1] == ":":
+                    # Prefer WSL mount if present, else Windows path for Windows python.
+                    wsl = f"/mnt/{letter[0].lower()}"
+                    if Path(wsl).is_dir():
+                        roots.append(wsl)
+                    else:
+                        roots.append(letter + "\\")
+        except Exception:
+            pass
+        # Linux / macOS common mounts
+        for base in ("/media", "/Volumes", str(Path.home() / "media")):
+            try:
+                p = Path(base)
+                if not p.is_dir():
+                    continue
+                for child in p.iterdir():
+                    if child.name.upper() == "CIRCUITPY" and child.is_dir():
+                        roots.append(str(child))
+            except Exception:
+                pass
+        # Dedupe preserve order
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for r in roots:
+            if r not in seen:
+                seen.add(r)
+                uniq.append(r)
+        return uniq
+
+    def _push_lib_tree_host(self, lib_src: Path, dest_lib: Path) -> list[str]:
+        """Copy staged lib/ contents onto a host CIRCUITPY/lib tree."""
+        dest_lib.mkdir(parents=True, exist_ok=True)
+        copied: list[str] = []
+        for child in sorted(lib_src.iterdir(), key=lambda p: p.name.lower()):
+            target = dest_lib / child.name
+            if child.is_dir():
+                if target.exists():
+                    shutil.rmtree(target)
+                shutil.copytree(child, target)
+            else:
+                shutil.copy2(child, target)
+            copied.append(str(target))
+        return copied
+
+    def _ensure_cp_writable(self, t: Any) -> None:
+        """Remount CIRCUITPY root read-write when USB MSC left it read-only."""
+        if (self.runtime or "") != "circuitpython":
+            return
+        try:
+            t.exec(
+                "try:\n"
+                " import storage\n"
+                " storage.remount('/', False)\n"
+                "except Exception:\n"
+                " pass\n"
+            )
+        except Exception:
+            pass
+
+    def _resolve_circup_exe(self) -> tuple[str, bool]:
+        """Return (circup_executable_or_python, use_module_invocation)."""
+        circup_exe = shutil.which("circup") or shutil.which("circup.exe")
+        if circup_exe:
+            return circup_exe, False
+        try:
+            import circup as _circup  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError(
+                "circup is not installed for the sidecar Python. "
+                "Install with: python -m pip install circup "
+                "(on WSL use the Windows python.exe that runs the sidecar)"
+            ) from e
+        return sys.executable, True
+
+    def _run_circup(self, argv: list[str], *, use_module: bool = False) -> str:
+        del use_module  # argv is fully formed by callers
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+        out_text = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"circup failed (exit {proc.returncode}): {out_text.strip() or 'no output'}"
+            )
+        return out_text.strip()
+
+    def _cp_web_workflow_info(self, t: Any) -> dict[str, Any]:
+        """Read Wi-Fi IP + web API password from the board (no secrets logged)."""
         code = r"""
-import os,vfs
-rows=[]
+_host = None
+_pwd = None
+_ssid = None
 try:
- _ms=vfs.mount()
-except:
+ import os as _os
+ _pwd = _os.getenv('CIRCUITPY_WEB_API_PASSWORD')
+ _ssid = _os.getenv('CIRCUITPY_WIFI_SSID')
+except Exception:
+ pass
+try:
+ import wifi
+ _ip = wifi.radio.ipv4_address
+ if _ip is not None:
+  _host = str(_ip)
+except Exception:
+ pass
+print(repr((_host, bool(_pwd), _ssid)))
+"""
+        out = t.exec(code)
+        text = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
+        line = text.strip().splitlines()[-1] if text.strip() else "(None, False, None)"
+        import ast
+
+        host, has_pwd, ssid = ast.literal_eval(line)
+        password = None
+        if has_pwd:
+            # Fetch password in a second eval so we can avoid printing it in exec stdout
+            # that might land in logs; still needed for circup argv.
+            try:
+                t.exec("import os")
+                password = t.eval("os.getenv('CIRCUITPY_WEB_API_PASSWORD')")
+                if password is not None:
+                    password = str(password)
+            except Exception:
+                password = None
+        env_pwd = os.environ.get("CIRCUP_WEBWORKFLOW_PASSWORD") or os.environ.get(
+            "MPFTP_CIRCUITPY_WEB_PASSWORD"
+        )
+        if env_pwd:
+            password = env_pwd
+        return {
+            "host": host,
+            "password": password,
+            "ssid": ssid,
+            "ready": bool(host and password),
+        }
+
+    def _cp_web_remount_writable(self, host: str, password: str) -> bool:
+        """Ask Web Workflow to remount the FS writable to the device."""
+        import urllib.error
+        import urllib.request
+
+        url = f"http://{host}/fs/"
+        req = urllib.request.Request(
+            url,
+            data=b'{"writable":true}',
+            method="PUT",
+            headers={"Content-Type": "application/json"},
+        )
+        # Empty username, password as web API password (Basic auth).
+        import base64 as _b64
+
+        token = _b64.b64encode(f":{password}".encode()).decode("ascii")
+        req.add_header("Authorization", f"Basic {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode("utf-8", "replace")
+            return "USB storage active" not in body
+        except Exception:
+            return False
+
+    def _eject_circuitpy_host(self) -> bool:
+        """Best-effort eject of CIRCUITPY so web workflow can write."""
+        try:
+            ps = r"""
+$shell = New-Object -ComObject Shell.Application
+$usb = $shell.NameSpace(17)
+$n = 0
+foreach ($item in $usb.Items()) {
+  if ($item.Name -match 'CIRCUITPY') {
+    $item.InvokeVerb('Eject')
+    $n++
+  }
+}
+Write-Output $n
+"""
+            out = subprocess.check_output(
+                ["powershell.exe", "-NoProfile", "-Command", ps],
+                text=True,
+                timeout=20,
+                stderr=subprocess.DEVNULL,
+            )
+            return int((out or "0").strip().splitlines()[-1] or "0") > 0
+        except Exception:
+            return False
+
+    def _cp_prepare_web_writable(self, t: Any, host: str, password: str) -> bool:
+        """Eject CIRCUITPY on the host and remount writable for Web Workflow.
+
+        Returns True if ``/fs/`` reports writable. Host eject alone is often not
+        enough while the USB MSC *interface* is still enabled in firmware
+        (CircuitPython keeps the FS read-only until ``storage.disable_usb_drive()``
+        in boot.py, or USB is unplugged). We still try eject + remount for the
+        cases where the host held the volume open.
+        """
+        import time as _time
+
+        self._eject_circuitpy_host()
+        _time.sleep(0.8)
+        self._ensure_cp_writable(t)
+        self._cp_web_remount_writable(host, password)
+        try:
+            import base64 as _b64
+            import json as _json
+            import urllib.request
+
+            req = urllib.request.Request(
+                f"http://{host}/fs/",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": "Basic "
+                    + _b64.b64encode(f":{password}".encode()).decode("ascii"),
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read().decode("utf-8", "replace"))
+            return bool(data.get("writable"))
+        except Exception:
+            return False
+
+    def circup_install(
+        self,
+        packages: list[str],
+        *,
+        py: bool = False,
+        target: str = "/lib",
+        host: Optional[str] = None,
+        password: Optional[str] = None,
+        prefer_web: bool = True,
+    ) -> dict[str, Any]:
+        """Install packages via circup.
+
+        Preference order (no board ``boot.py`` required):
+
+        1. **CIRCUITPY mount** on the host — ``circup --path`` (fast USB disk).
+        2. **Web Workflow** — ``circup --host`` when Wi‑Fi is up *and* the FS is
+           device-writable (USB MSC not locking it).
+        3. Host stage + serial put, then MSC copy fallback.
+        """
+        if (self.runtime or "micropython") != "circuitpython":
+            raise RuntimeError(
+                "circup is CircuitPython-only; use mip_install / mpftp mip on MicroPython"
+            )
+        if not packages:
+            raise RuntimeError("circup_install: packages required")
+
+        circup_exe, use_module = self._resolve_circup_exe()
+
+        with self._lock:
+            t = self._require()
+            self._stop_repl_reader()
+            if not t.in_raw_repl:
+                t.enter_raw_repl(soft_reset=False)
+            try:
+                cpy_version, board_id = self._cp_version_and_board(t)
+                web = self._cp_web_workflow_info(t)
+                web_host = host or web.get("host")
+                web_password = password or web.get("password")
+                web_fallback_err: Optional[BaseException] = None
+
+                # --- 1. Prefer mounted CIRCUITPY (no board edits needed) ---
+                roots = self._find_circuitpy_host_roots()
+                if roots:
+                    root = roots[0]
+                    # Prefer a Windows drive path for circup.exe under WSL.
+                    path_for_circup = root
+                    if root.startswith("/mnt/") and len(root) >= 6:
+                        path_for_circup = f"{root[5].upper()}:\\"
+                    try:
+                        if use_module:
+                            argv = [
+                                circup_exe,
+                                "-c",
+                                (
+                                    "import sys; from circup import main; "
+                                    "sys.argv=['circup']+sys.argv[1:]; "
+                                    "raise SystemExit(main())"
+                                ),
+                                "--path",
+                                path_for_circup,
+                                "install",
+                            ]
+                        else:
+                            argv = [circup_exe, "--path", path_for_circup, "install"]
+                        if py:
+                            argv.append("--py")
+                        argv.extend(packages)
+                        out_text = self._run_circup(argv, use_module=use_module)
+                        return {
+                            "output": out_text,
+                            "packages": list(packages),
+                            "target": target if target.startswith("/") else "/" + target,
+                            "cpy_version": cpy_version,
+                            "board_id": board_id,
+                            "py": py,
+                            "transport": "circuitpy-path",
+                            "path": path_for_circup,
+                        }
+                    except Exception as e:
+                        web_fallback_err = e  # try web / serial next
+
+                # --- 2. Web Workflow when FS is device-writable ---
+                if prefer_web and web_host and web_password:
+                    if self._cp_prepare_web_writable(t, str(web_host), str(web_password)):
+                        if use_module:
+                            argv = [
+                                circup_exe,
+                                "-c",
+                                (
+                                    "import sys; from circup import main; "
+                                    "sys.argv=['circup']+sys.argv[1:]; "
+                                    "raise SystemExit(main())"
+                                ),
+                                "--host",
+                                str(web_host),
+                                "--password",
+                                str(web_password),
+                                "install",
+                            ]
+                            if py:
+                                argv.append("--py")
+                            argv.extend(packages)
+                        else:
+                            argv = build_circup_web_argv(
+                                circup_exe=circup_exe,
+                                host=str(web_host),
+                                password=str(web_password),
+                                packages=packages,
+                                py=py,
+                            )
+                        try:
+                            out_text = self._run_circup(argv, use_module=use_module)
+                            return {
+                                "output": out_text,
+                                "packages": list(packages),
+                                "target": target if target.startswith("/") else "/" + target,
+                                "cpy_version": cpy_version,
+                                "board_id": board_id,
+                                "py": py,
+                                "transport": "web-workflow",
+                                "host": str(web_host),
+                            }
+                        except Exception as web_err:
+                            web_fallback_err = web_err
+                    else:
+                        web_fallback_err = RuntimeError(
+                            "Web Workflow FS is not writable while USB mass storage "
+                            "is active. Mount CIRCUITPY and mpftp will use circup "
+                            "--path, or unplug USB / disable MSC in boot.py for "
+                            "Wi-Fi installs."
+                        )
+
+                # --- 3. Fallback: stage on host, serial put / MSC ---
+                self._ensure_cp_writable(t)
+                stage = tempfile.mkdtemp(prefix="mpftp-circup-")
+                try:
+                    boot = Path(stage) / "boot_out.txt"
+                    boot.write_text(
+                        circup_boot_out_text(cpy_version=cpy_version, board_id=board_id),
+                        encoding="utf-8",
+                    )
+                    (Path(stage) / "lib").mkdir(exist_ok=True)
+                    stage_for_circup = stage
+                    if sys.platform == "win32" or (
+                        os.name == "nt"
+                        or (
+                            os.environ.get("WSL_DISTRO_NAME")
+                            and str(circup_exe).lower().endswith(".exe")
+                        )
+                    ):
+                        try:
+                            win = subprocess.check_output(
+                                ["wslpath", "-w", stage], text=True
+                            ).strip()
+                            if win:
+                                stage_for_circup = win
+                        except Exception:
+                            pass
+
+                    if use_module:
+                        argv = [
+                            circup_exe,
+                            "-c",
+                            (
+                                "import sys; from circup import main; "
+                                "sys.argv=['circup']+sys.argv[1:]; raise SystemExit(main())"
+                            ),
+                            "--path",
+                            stage_for_circup,
+                            "--board-id",
+                            board_id,
+                            "--cpy-version",
+                            cpy_version,
+                            "install",
+                        ]
+                        if py:
+                            argv.append("--py")
+                        argv.extend(packages)
+                    else:
+                        argv = build_circup_argv(
+                            circup_exe=circup_exe,
+                            stage_path=stage_for_circup,
+                            packages=packages,
+                            cpy_version=cpy_version,
+                            board_id=board_id,
+                            py=py,
+                        )
+                    out_text = self._run_circup(argv, use_module=use_module)
+
+                    lib_src = Path(stage) / "lib"
+                    if not lib_src.is_dir():
+                        raise RuntimeError("circup did not create a lib/ staging directory")
+                    dest_root = target if target.startswith("/") else "/" + target
+                    copied: list[str] = []
+                    transport = "serial"
+                    serial_err: Optional[BaseException] = None
+                    try:
+                        self._ensure_cp_writable(t)
+                        try:
+                            t.fs_mkdir(dest_root if dest_root != "/" else "/lib")
+                        except Exception:
+                            pass
+                        for child in sorted(lib_src.iterdir(), key=lambda p: p.name.lower()):
+                            remote = dest_root.rstrip("/") + "/" + child.name
+                            self._cp_local_to_remote(
+                                t,
+                                str(child),
+                                remote,
+                                verify=False,
+                                copied=copied,
+                                verified=[],
+                            )
+                        self._sync_remote_fs(t)
+                    except Exception as e:
+                        serial_err = e
+                        err_s = str(e).lower()
+                        if (
+                            "read-only" not in err_s
+                            and "errno 30" not in err_s
+                            and "erofs" not in err_s
+                        ):
+                            raise
+                        roots = self._find_circuitpy_host_roots()
+                        if not roots:
+                            hint = ""
+                            if web_fallback_err is not None:
+                                hint = f" ({web_fallback_err})"
+                            raise RuntimeError(
+                                "circup staged libraries, but the CircuitPython filesystem "
+                                "is read-only over serial and no CIRCUITPY drive is mounted."
+                                + hint
+                                + f" Serial error: {e}"
+                            ) from e
+                        host_lib = Path(roots[0]) / "lib"
+                        host_root = roots[0]
+                        if host_root.startswith("/mnt/") and len(host_root) >= 6:
+                            letter = host_root[5].upper()
+                            win_lib = Path(f"{letter}:/lib")
+                            try:
+                                win_lib.mkdir(parents=True, exist_ok=True)
+                                host_lib = win_lib
+                            except Exception:
+                                pass
+                        copied = self._push_lib_tree_host(lib_src, host_lib)
+                        transport = "circuitpy-msc"
+                    result = {
+                        "output": out_text,
+                        "packages": list(packages),
+                        "target": dest_root,
+                        "cpy_version": cpy_version,
+                        "board_id": board_id,
+                        "py": py,
+                        "files": len(copied),
+                        "transport": transport,
+                        "serial_error": str(serial_err) if serial_err else None,
+                    }
+                    if web_fallback_err is not None:
+                        result["web_workflow_error"] = str(web_fallback_err)
+                    return result
+                finally:
+                    shutil.rmtree(stage, ignore_errors=True)
+            finally:
+                if self._repl_mode:
+                    try:
+                        if self.transport and self.transport.in_raw_repl:
+                            self.transport.exit_raw_repl()
+                    except Exception:
+                        pass
+                    self._start_repl_reader()
+
+    def _cp_version_and_board(self, t: Any) -> tuple[str, str]:
+        """Best-effort CircuitPython version + board id for circup."""
+        code = r"""
+import sys
+_ver = '.'.join(str(x) for x in sys.implementation.version[:3])
+_bid = 'unknown'
+try:
+ _t = open('/boot_out.txt').read()
+ for _line in _t.split('\n'):
+  if _line.startswith('Board ID:'):
+   _bid = _line.split(':',1)[1].strip() or _bid
+   break
+except Exception:
+ pass
+if _bid == 'unknown':
+ try:
+  import os as _os
+  _u = _os.uname()
+  _bid = getattr(_u, 'machine', 'unknown') or 'unknown'
+ except Exception:
+  pass
+print(repr((_ver, _bid)))
+"""
+        out = t.exec(code)
+        text = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
+        line = text.strip().splitlines()[-1] if text.strip() else "('9.0.0', 'unknown')"
+        import ast
+
+        ver, bid = ast.literal_eval(line)
+        return str(ver), str(bid)
+
+    def df(self) -> dict[str, Any]:
+        # Prefer vfs.mount enrichment (MicroPython); fall back to os.statvfs only.
+        code = r"""
+import os
+rows=[]
+_ms=[]
+try:
+ import vfs
+ _ms=list(vfs.mount())
+except Exception:
  _ms=[]
- for _m in ['']+os.listdir('/'):
-  _m='/'+_m if _m else '/'
-  try:
-   _s=os.stat(_m)
-  except:
-   continue
-  if _s[0]&(1<<14):
-   _ms.append(('<unknown>',_m))
+if not _ms:
+ try:
+  _ms=[('<root>', '/')]
+ except Exception:
+  _ms=[]
 for _v,_p in _ms:
- _s=os.statvfs(_p)
+ try:
+  _s=os.statvfs(_p)
+ except Exception:
+  continue
  _sz=_s[0]*_s[2]
  _av=_s[0]*_s[3]
  rows.append({'fs':str(_v),'size':_sz,'used':_sz-_av,'avail':_av,'mounted':_p})
+if not rows:
+ try:
+  _s=os.statvfs('/')
+  _sz=_s[0]*_s[2]
+  _av=_s[0]*_s[3]
+  rows.append({'fs':'/','size':_sz,'used':_sz-_av,'avail':_av,'mounted':'/'})
+ except Exception:
+  pass
 print(repr(rows))
 """
 
         def op(t):
             out = t.exec(code)
             text = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
-            # last line should be repr(rows)
             line = text.strip().splitlines()[-1] if text.strip() else "[]"
             import ast
 
@@ -1172,6 +2016,7 @@ print(repr(rows))
         return self.with_raw(op)
 
     def mount(self, path: str, unsafe_links: bool = False) -> dict[str, Any]:
+        self._require_micropython("mount")
         with self._lock:
             t = self._require()
             self._stop_repl_reader()
@@ -1182,6 +2027,7 @@ print(repr(rows))
             return {"path": path, "mount": getattr(t, "fs_hook_mount", "/remote")}
 
     def umount(self) -> dict[str, Any]:
+        self._require_micropython("umount")
         with self._lock:
             t = self._require()
             self._stop_repl_reader()
@@ -1212,6 +2058,7 @@ print(repr(rows))
         return _State(t)
 
     def romfs_query(self) -> dict[str, Any]:
+        self._require_micropython("romfs")
         from mpremote import commands as mp_cmd
 
         with self._lock:
@@ -1232,6 +2079,7 @@ print(repr(rows))
     def romfs_build(
         self, path: str, output: Optional[str] = None, mpy: bool = True
     ) -> dict[str, Any]:
+        self._require_micropython("romfs")
         from mpremote import commands as mp_cmd
 
         args = argparse.Namespace(path=path, output=output, mpy=mpy)
@@ -1245,6 +2093,7 @@ print(repr(rows))
     def romfs_deploy(
         self, path: str, partition: int = 0, mpy: bool = True
     ) -> dict[str, Any]:
+        self._require_micropython("romfs")
         from mpremote import commands as mp_cmd
 
         with self._lock:
@@ -1277,6 +2126,7 @@ print(repr(rows))
 
         def op(t):
             nonlocal copied, verified
+            self._ensure_cp_writable(t)
             if src_remote and dest_remote:
                 self._cp_remote_to_remote(t, src_path, dest_path, verify, copied, verified)
             elif not src_remote and dest_remote:
@@ -1373,7 +2223,7 @@ print(repr(rows))
             root.mkdir(parents=True, exist_ok=True)
 
             def walk(remote: str, local: Path) -> None:
-                for e in t.fs_listdir(remote if remote != "/" else ""):
+                for e in self._board_listdir(t, remote if remote != "/" else ""):
                     name = e.name
                     if name.startswith(".") or name == "__pycache__" or name.endswith((".pyc", ".pyo")):
                         continue
@@ -1419,7 +2269,7 @@ print(repr(rows))
                 pass
 
             def walk(remote: str, dest_dir: str) -> None:
-                for e in t.fs_listdir(remote if remote != "/" else ""):
+                for e in self._board_listdir(t, remote if remote != "/" else ""):
                     name = e.name
                     rpath = (remote.rstrip("/") + "/" + name) if remote != "/" else "/" + name
                     dpath = dest_dir.rstrip("/") + "/" + name
@@ -1574,6 +2424,14 @@ METHODS = {
         p.get("target"),
         bool(p.get("mpy", True)),
         p.get("index"),
+    ),
+    "circup_install": lambda p: SESSION.circup_install(
+        list(p.get("packages") or []),
+        py=bool(p.get("py", False)),
+        target=str(p.get("target") or "/lib"),
+        host=p.get("host"),
+        password=p.get("password"),
+        prefer_web=bool(p.get("prefer_web", True)),
     ),
     "df": lambda _p: SESSION.df(),
     "mount": lambda p: SESSION.mount(p["path"], bool(p.get("unsafe_links", False))),

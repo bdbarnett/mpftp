@@ -768,6 +768,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
       connected,
       device: this.bridge.connectedDevice || "",
       deviceInfo: connected ? this.deviceInfo : "",
+      runtime: connected ? this.bridge.runtime || "" : "",
       localPath: this.localPath,
       // Hide board path while disconnected; keep this.remotePath for reconnect.
       remotePath: connected ? this.remotePath : "",
@@ -1105,7 +1106,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
       <button id="btnInterrupt" class="secondary icon-btn tool-btn" disabled title="Interrupt (Ctrl+C)" aria-label="Interrupt">
         <i class="codicon codicon-debug-stop"></i>
       </button>
-      <button id="btnSoftReset" class="secondary icon-btn tool-btn" disabled title="Soft Reset (skip main.py)" aria-label="Soft Reset">
+      <button id="btnSoftReset" class="secondary icon-btn tool-btn" disabled title="Soft Reset" aria-label="Soft Reset">
         <i class="codicon codicon-debug-rerun"></i>
       </button>
       <button id="btnHardReset" class="secondary icon-btn tool-btn" disabled title="Hard Reset" aria-label="Hard Reset">

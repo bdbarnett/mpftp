@@ -1,16 +1,20 @@
 ---
 name: mpftp
 description: >-
-  Drive MicroPython boards via mpftp (mpremote-backed): connect, filesystem,
-  REPL, resets, mip, romfs, and watch live activity. Use when working with mpftp,
-  MicroPython serial boards, COM ports on WSL, or board file transfer/REPL.
+  Drive MicroPython and CircuitPython boards via mpftp (mpremote-backed):
+  connect, filesystem, REPL, resets, mip/circup, romfs (MP-only), and watch live
+  activity. Use when working with mpftp, MicroPython/CircuitPython serial boards,
+  COM ports on WSL, or board file transfer/REPL.
 ---
 
 # mpftp — agent guide
 
-mpftp is a Cursor/VS Code extension plus CLI for MicroPython over USB serial.
-Prefer the **CLI through the extension TCP RPC** (`127.0.0.1:7429`) so you share
-the UI session and do not fight over the serial port.
+mpftp is a Cursor/VS Code extension plus CLI for MicroPython and CircuitPython
+over USB serial. Prefer the **CLI through the extension TCP RPC**
+(`127.0.0.1:7429`) so you share the UI session and do not fight over the serial
+port.
+
+**Firmware** download/build/flash is MicroPython-only.
 
 ## Paths (always available)
 
@@ -32,6 +36,11 @@ ln -sf "$(pwd)/scripts/mpftp" ~/bin/mpftp
 ```
 
 On WSL, the CLI uses Windows `python.exe` + mpremote for COM ports (same as the UI).
+For CircuitPython packages also install circup on that interpreter:
+
+```bash
+python.exe -m pip install mpremote circup
+```
 
 ## Watch activity
 
@@ -45,8 +54,9 @@ tail -f ~/.mpftp/activity.log
 
 ```bash
 ./scripts/mpftp ports
-./scripts/mpftp connect COM4       # interrupt + raw soft-reset (skip main.py) + RTC
+./scripts/mpftp connect COM4       # interrupt + runtime-aware clean + RTC
 ./scripts/mpftp resume             # reconnect last device
+./scripts/mpftp status             # includes runtime when connected
 ./scripts/mpftp ls /
 ./scripts/mpftp tree /
 ./scripts/mpftp put ./main.py /main.py --verify
@@ -64,20 +74,29 @@ tail -f ~/.mpftp/activity.log
 ./scripts/mpftp exec 'print(42)'
 ./scripts/mpftp run ./script.py
 ./scripts/mpftp interrupt              # Ctrl-C; no reset
-./scripts/mpftp soft-reset             # raw soft-reset; does not run main.py
+./scripts/mpftp soft-reset             # MP: skip main.py; CP: friendly↔raw
 ./scripts/mpftp hard-reset
 ./scripts/mpftp bootloader
 ./scripts/mpftp rtc
 ./scripts/mpftp rtc --set
 ./scripts/mpftp df
-./scripts/mpftp mip github:org/repo   # host-side mip (downloads on PC)
-./scripts/mpftp mount /some/local/path
+./scripts/mpftp mip github:org/repo            # MicroPython only
+./scripts/mpftp circup adafruit_display_text   # CircuitPython only → /lib
+./scripts/mpftp mount /some/local/path         # MicroPython only
 ./scripts/mpftp umount
-./scripts/mpftp romfs query
+./scripts/mpftp romfs query                    # MicroPython only
 ./scripts/mpftp romfs build ./romdir -o ./out.romfs
 ./scripts/mpftp romfs deploy ./out.romfs --partition 0
 ./scripts/mpftp disconnect
 ```
+
+### Runtime notes
+
+| | MicroPython | CircuitPython |
+|---|---|---|
+| Soft reset | Raw soft-reset (no `main.py`) | Friendly↔raw (no Ctrl-D / `code.py`) |
+| Packages | `mip` | `circup` (host stage + serial put) |
+| mount / romfs | yes | no |
 
 Raw RPC:
 
@@ -90,14 +109,15 @@ Standalone (no extension): pass `-d/--device` after the subcommand.
 
 ## Firmware builder (host-side build & flash)
 
-Builds MicroPython from a local checkout (no `build_mp.sh`). User C modules
-(`micropython.cmake` / `*/micropython.mk`) and a frozen `manifest.py` are
-auto-discovered from the checkout's **parent** workspace. mpftp aggregates
-**every** workspace module for **every** port and never gates by compatibility;
-each module opts in/out (and owns its deps, e.g. SDL2 for `usdl2`) via its own
-`micropython.mk` / `micropython.cmake`. Runs as its own process (native Linux
-python on WSL for `make`), so it never blocks the serial session. All MP ports
-build; flash is supported for `esp32`, `rp2`, `samd`.
+Builds **MicroPython** from a local checkout (no private CircuitPython firmware
+tooling in mpftp). User C modules (`micropython.cmake` / `*/micropython.mk`) and
+a frozen `manifest.py` are auto-discovered from the checkout's **parent**
+workspace. mpftp aggregates **every** workspace module for **every** port and
+never gates by compatibility; each module opts in/out (and owns its deps, e.g.
+SDL2 for `usdl2`) via its own `micropython.mk` / `micropython.cmake`. Runs as its
+own process (native Linux python on WSL for `make`), so it never blocks the
+serial session. All MP ports build; flash is supported for `esp32`, `rp2`,
+`samd`.
 
 ```bash
 ./scripts/mpftp firmware discover                 # resolved MP tree + workspace + host
@@ -161,6 +181,6 @@ build; flash is supported for `esp32`, `rp2`, `samd`.
 ## Rules
 
 - Prefer the TCP RPC session over spawning a second sidecar while the UI is connected.
-- Connect fails clearly if the port is bootloader/UF2-only (no MicroPython raw REPL).
+- Connect fails clearly if the port is bootloader/UF2-only (no MicroPython/CircuitPython raw REPL).
 - Dotfiles / `__pycache__` / `*.pyc` are skipped by the FTP UI upload; CLI `put` of a single file does what you ask.
 - Do not commit secrets into activity logs; they may contain paths and script snippets.

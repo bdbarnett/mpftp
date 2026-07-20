@@ -643,6 +643,26 @@ def cmd_mip(ns: argparse.Namespace) -> None:
             client.close()
 
 
+def cmd_circup(ns: argparse.Namespace) -> None:
+    client, mode = get_client()
+    try:
+        ensure_device(client, ns.device, ns.baud)
+        params: dict[str, Any] = {
+            "packages": ns.packages,
+            "target": ns.target or "/lib",
+            "py": bool(ns.py),
+            "prefer_web": not bool(ns.no_web),
+        }
+        if ns.host:
+            params["host"] = ns.host
+        if ns.password:
+            params["password"] = ns.password
+        out(client.call("circup_install", params))
+    finally:
+        if mode.startswith("sidecar"):
+            client.close()
+
+
 def cmd_mount(ns: argparse.Namespace) -> None:
     client, mode = get_client()
     try:
@@ -993,7 +1013,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "soft-reset",
         parents=[device_opts],
-        help="Soft reset via raw REPL (fresh heap; does not run main.py)",
+        help="Soft reset (MP: skip main.py; CP: friendly↔raw, does not run code.py)",
     ).set_defaults(func=cmd_soft_reset)
     sub.add_parser("hard-reset", parents=[device_opts], help="Hard reset").set_defaults(func=cmd_hard_reset)
     sub.add_parser("bootloader", parents=[device_opts], help="Enter bootloader").set_defaults(
@@ -1006,19 +1026,43 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("df", parents=[device_opts], help="Disk free").set_defaults(func=cmd_df)
 
-    mip = sub.add_parser("mip", parents=[device_opts], help="mip install package(s)")
+    mip = sub.add_parser("mip", parents=[device_opts], help="mip install package(s) (MicroPython)")
     mip.add_argument("packages", nargs="+")
     mip.add_argument("--target")
     mip.add_argument("--no-mpy", action="store_true")
     mip.set_defaults(func=cmd_mip)
 
-    mnt = sub.add_parser("mount", parents=[device_opts], help="Mount local path on board")
+    circ = sub.add_parser(
+        "circup",
+        parents=[device_opts],
+        help="circup install package(s) (prefers Web Workflow when Wi-Fi is up)",
+    )
+    circ.add_argument("packages", nargs="+")
+    circ.add_argument("--target", default="/lib")
+    circ.add_argument(
+        "--py",
+        action="store_true",
+        help="Install .py sources instead of .mpy",
+    )
+    circ.add_argument("--host", help="Web Workflow host/IP (default: probe board Wi-Fi)")
+    circ.add_argument(
+        "--password",
+        help="Web Workflow password (default: CIRCUITPY_WEB_API_PASSWORD / env)",
+    )
+    circ.add_argument(
+        "--no-web",
+        action="store_true",
+        help="Skip Web Workflow; use USB staging/serial/MSC only",
+    )
+    circ.set_defaults(func=cmd_circup)
+
+    mnt = sub.add_parser("mount", parents=[device_opts], help="Mount local path on board (MicroPython)")
     mnt.add_argument("path")
     mnt.add_argument("--unsafe-links", action="store_true")
     mnt.set_defaults(func=cmd_mount)
-    sub.add_parser("umount", parents=[device_opts], help="Umount local mount").set_defaults(func=cmd_umount)
+    sub.add_parser("umount", parents=[device_opts], help="Umount local mount (MicroPython)").set_defaults(func=cmd_umount)
 
-    rom = sub.add_parser("romfs", parents=[device_opts], help="ROMFS query/build/deploy")
+    rom = sub.add_parser("romfs", parents=[device_opts], help="ROMFS query/build/deploy (MicroPython)")
     rom.add_argument("romfs_cmd", choices=["query", "build", "deploy"])
     rom.add_argument("path", nargs="?", help="Source dir or .romfs image (build/deploy)")
     rom.add_argument("-o", "--output", help="Output file for build")

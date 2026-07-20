@@ -32,7 +32,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
   statusBar.command = "mpftp.connect";
   statusBar.text = "$(plug) mpftp";
-  statusBar.tooltip = "Connect to MicroPython board";
+      statusBar.tooltip = "Connect to MicroPython or CircuitPython board";
   statusBar.show();
 
   const ensureConnected = async (): Promise<boolean> => {
@@ -218,8 +218,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!(await ensureConnected())) {
         return;
       }
-      await bridge.request("soft_reset");
-      void vscode.window.showInformationMessage("Soft reset sent (main.py not run)");
+      const res = await bridge.request<{ runtime?: string; main_skipped?: boolean }>("soft_reset");
+      const runtime = res.runtime || bridge.runtime || "micropython";
+      if (runtime === "circuitpython") {
+        void vscode.window.showInformationMessage(
+          "Soft reset sent (CircuitPython: friendly↔raw; code.py not auto-run)"
+        );
+      } else {
+        void vscode.window.showInformationMessage("Soft reset sent (main.py not run)");
+      }
     }),
     vscode.commands.registerCommand("mpftp.hardReset", async () => {
       if (!(await ensureConnected())) {
@@ -334,6 +341,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const res = await bridge.request<{ datetime: number[] }>("rtc_set");
       void vscode.window.showInformationMessage(`RTC set: ${JSON.stringify(res.datetime)}`);
     }),
+    vscode.commands.registerCommand("mpftp.installPackage", async () => {
+      if (!(await ensureConnected())) {
+        return;
+      }
+      const runtime = bridge.runtime || "micropython";
+      if (runtime === "circuitpython") {
+        await vscode.commands.executeCommand("mpftp.circupInstall");
+      } else {
+        await vscode.commands.executeCommand("mpftp.mipInstall");
+      }
+    }),
     vscode.commands.registerCommand("mpftp.mipInstall", async () => {
       if (!(await ensureConnected())) {
         return;
@@ -355,6 +373,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       log.show(true);
       void vscode.window.showInformationMessage(`mip installed ${pkg}`);
+    }),
+    vscode.commands.registerCommand("mpftp.circupInstall", async () => {
+      if (!(await ensureConnected())) {
+        return;
+      }
+      const pkg = await vscode.window.showInputBox({
+        prompt: "Package to install via circup (host downloads, serial write to /lib)",
+        placeHolder: "adafruit_display_text",
+      });
+      if (!pkg) {
+        return;
+      }
+      const res = await bridge.request<{ output: string; target?: string }>("circup_install", {
+        packages: [pkg],
+        py: false,
+      });
+      log.appendLine(res.output || "");
+      if (res.target) {
+        log.appendLine(`target: ${res.target}`);
+      }
+      log.show(true);
+      void vscode.window.showInformationMessage(`circup installed ${pkg}`);
     }),
     vscode.commands.registerCommand("mpftp.df", async () => {
       if (!(await ensureConnected())) {
@@ -507,11 +547,12 @@ function showPortQuickPick(
 
 function updateStatus(): void {
   if (bridge.connected) {
-    statusBar.text = `$(check) mpftp: ${bridge.connectedDevice}`;
-    statusBar.tooltip = "mpftp connected — click for actions";
+    const rt = bridge.runtime === "circuitpython" ? "CP" : "MP";
+    statusBar.text = `$(check) mpftp: ${bridge.connectedDevice} (${rt})`;
+    statusBar.tooltip = `mpftp connected (${bridge.runtime || "micropython"}) — click for actions`;
   } else {
     statusBar.text = "$(plug) mpftp";
-    statusBar.tooltip = "Connect to MicroPython board";
+    statusBar.tooltip = "Connect to MicroPython or CircuitPython board";
   }
 }
 
