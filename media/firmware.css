@@ -732,6 +732,10 @@ body {
   margin: 10px 0 0;
 }
 
+.hint.warn {
+  color: var(--vscode-editorWarning-foreground, #d7ba7d);
+}
+
 .sm {
   font-size: 11.5px;
 }

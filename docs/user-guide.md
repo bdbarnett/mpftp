@@ -53,7 +53,7 @@ Official **Download** mode needs no local checkout.
 
 Optional in that workspace:
 
-- `micropython.cmake` / `manifest.py` — user C modules and frozen Python (Create stubs… if missing)
+- `micropython.cmake` / `manifest.py` — aggregators for user modules and frozen Python (Create stubs… if missing); see [aggregator.md](aggregator.md)
 - Any **port dependency** trees you need (for example `esp-idf`, `emsdk`) as directories or symlinks
 
 Dependencies that are not in the workspace must be provided via their environment variables (for example `IDF_PATH`, `EMSDK`) or the Locate… prompt when you build.
@@ -68,6 +68,29 @@ Discovery order for MicroPython: settings → `MP_DIR` → `~/micropython` → e
 | **Build** | You have a MicroPython tree and want a custom firmware (user modules, partitions, …) |
 
 **Detect** uses esptool first (works on a bare board), then optionally enriches from a live MicroPython session.
+
+User modules / aggregators: **[aggregator.md](aggregator.md)**.
+
+### ESP32 partition autosize
+
+esp32 builds can fail when the firmware image is larger than the app (`factory`)
+partition in the board’s partition table. mpftp handles that automatically:
+
+1. Parse the ESP-IDF error (`app partition is too small … (overflow …)`).
+2. Grow the app partition (aligned) and reflow following partitions.
+3. Write the override to **`<firmware-workspace>/esp32_partitions/<board>.csv`**
+   (or `<board>-<variant>.csv`). The MicroPython checkout is **not** modified.
+4. Point the build-dir `sdkconfig` at that CSV (path relative to `ports/esp32`:
+   `../../../esp32_partitions/…`) and rebuild **once**.
+
+There is no manual partition slider in the Firmware UI. Scripted overrides remain
+available via `./scripts/mpftp firmware partitions …`. Pass `--no-autosize` on
+the build engine/CLI to disable the automatic grow-and-retry.
+
+If the on-device partition layout differs from the artifact at flash time, mpftp
+**stops and warns** instead of erasing automatically. Enable **Erase flash before
+writing** and click **Flash** again. A full erase wipes the filesystem
+(**vfs** / storage) partition — all files on the board will be lost.
 
 ## Settings (high level)
 
@@ -87,6 +110,7 @@ Discovery order for MicroPython: settings → `MP_DIR` → `~/micropython` → e
 - **WSL cannot see COM ports:** ensure Windows Python + `mpremote` are installed; mpftp should not need `usbipd`.
 - **Build missing a tree:** set the env var, symlink the repo under the firmware workspace, or use Locate….
 - **ESP-IDF version mismatch:** Install instructions follow the version recommended in `ports/esp32/README.md` for your checkout.
+- **App partition too small:** autosize grows `esp32_partitions/<board>.csv` and rebuilds once (see [Autosize](#esp32-partition-autosize)); use `--no-autosize` only if you are managing the table yourself.
 
 ## More
 

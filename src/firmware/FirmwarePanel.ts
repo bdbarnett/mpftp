@@ -1449,6 +1449,23 @@ export class FirmwarePanel {
         data: { ...this.selection, device },
       });
       this.post({ type: "flashed", device });
+    } else if (result.needEraseConfirm) {
+      const detail = String(
+        (result.needEraseConfirm as { message?: string }).message ||
+          result.error ||
+          "Partition layout changed — erase required."
+      );
+      this.flashStatus("failed", "Erase required — enable Erase, then Flash again");
+      this.log(`[mpftp] ${detail}`);
+      this.activity.event("firmware_flash_need_erase", {
+        data: { ...this.selection, device },
+      });
+      this.post({ type: "needEraseConfirm", message: detail });
+      void vscode.window.showWarningMessage(
+        "Partition layout changed. Enable “Erase flash before writing” and click Flash again. " +
+          "Erase wipes the filesystem (vfs/storage) partition — all board files will be lost.",
+        "OK"
+      );
     } else {
       this.flashStatus("failed", String(result.error || "Flash failed"));
       this.activity.event("firmware_flash_fail", {

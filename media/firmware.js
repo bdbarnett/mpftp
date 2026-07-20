@@ -31,6 +31,7 @@
     flashBefore: "default-reset",
     flashAfter: "hard-reset",
     flashErase: false,
+    flashEraseHint: false,
     flashStatus: null,
     flashing: false,
     phase: "idle",
@@ -574,10 +575,10 @@
       let msg;
       if (needAggregator) {
         msg =
-          "No micropython.cmake aggregator in the workspace. Create stubs to enable USER_C_MODULES, then add sibling modules with their own micropython.cmake / micropython.mk.";
+          "No micropython.cmake aggregator in the workspace. Create stubs to enable USER_C_MODULES, then add sibling modules with micropython.cmake / micropython.mk and/or manifest.py.";
       } else {
         msg =
-          "Aggregator present — no sibling C modules discovered yet. Add folders with micropython.cmake / micropython.mk beside the MicroPython checkout.";
+          "Aggregator present — no sibling modules yet. Add folders with micropython.cmake / micropython.mk and/or manifest.py beside the MicroPython checkout.";
       }
       card.appendChild(el("p", "muted", msg));
     } else {
@@ -586,7 +587,10 @@
         const chip = el("span", "chip mod");
         chip.appendChild(el("i", "codicon codicon-package"));
         chip.appendChild(el("span", null, c.name));
-        chip.title = c.path + (c.hasManifest ? " (with manifest)" : "");
+        const bits = [];
+        if (c.kind) bits.push(c.kind);
+        if (c.hasManifest && c.kind !== "manifest") bits.push("manifest");
+        chip.title = c.path + (bits.length ? " (" + bits.join(", ") + ")" : "");
         chips.appendChild(chip);
       }
       card.appendChild(chips);
@@ -934,13 +938,25 @@
           model.flashErase,
           (v) => {
             model.flashErase = v;
+            if (v) {
+              model.flashEraseHint = false;
+            }
           },
           {
             title:
-              "Full chip erase before flashing (guarantees a clean filesystem). A layout change auto-erases regardless.",
+              "Full chip erase before flashing. Required when the partition table changes — wipes the filesystem (vfs/storage) partition and all board files.",
           }
         )
       );
+      if (model.flashEraseHint) {
+        const warn = el(
+          "p",
+          "hint warn",
+          "Partition table differs from this firmware. Enable Erase and click Flash again — " +
+            "this wipes the filesystem (vfs/storage) partition; all board files will be lost."
+        );
+        card.appendChild(warn);
+      }
     }
 
     const actions = el("div", "actions");
@@ -1237,6 +1253,16 @@
         break;
       case "flashed":
         appendLog("[mpftp] ✓ flashed " + (msg.device || ""));
+        model.flashEraseHint = false;
+        break;
+      case "needEraseConfirm":
+        appendLog(
+          "[mpftp] ⚠ " +
+            (msg.message ||
+              "Partition layout changed — enable Erase, then Flash again.")
+        );
+        model.flashEraseHint = true;
+        render();
         break;
       default:
         break;

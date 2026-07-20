@@ -12,7 +12,8 @@
 | `media/` | Webview HTML/JS/CSS |
 | `resources/templates/` | Workspace stub `micropython.cmake` / `manifest.py` |
 | `docs/` | User and developer documentation |
-| `AGENTS.md` | Agent/CLI playbook: boards, flash recovery, usermod aggregator contract |
+| `docs/aggregator.md` | Workspace aggregators and user-module contract |
+| `AGENTS.md` | Agent/CLI playbook: boards, flash recovery; links to aggregator.md |
 
 Extension id: **`pydevices.mpftp`**.
 

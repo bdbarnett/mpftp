@@ -104,6 +104,8 @@ symlink) or the folder *is* the tree (`ports/` + `py/`). Port SDKs
 (`esp-idf`, `emsdk`, …) must be **in that workspace (or symlinked)** or set via
 env vars — same contract for every dependency, no special home-path hunts.
 
+User modules and aggregators: see **[docs/aggregator.md](docs/aggregator.md)**.
+
 ```bash
 ./scripts/mpftp firmware discover
 ./scripts/mpftp firmware list
@@ -123,83 +125,15 @@ Flash without rebuild to the next board:
 
 Supported flashers: `esp32` (esptool), `rp2` / `samd` (UF2; BOOTSEL first).
 
----
+### ESP32 partition autosize
 
-## User C modules and the workspace aggregator
+If an esp32 build fails because the app image is larger than the `factory` (or
+other app) partition, mpftp **parses the overflow**, writes a grown table to
+`<workspace>/esp32_partitions/<board>.csv` (sibling of `micropython/` — the
+MicroPython tree is never edited), patches the build-dir `sdkconfig`, and
+**rebuilds once**. Disable with `--no-autosize`.
 
-### Layout
-
-```
-<firmware-workspace>/
-  micropython/                 # or symlink
-  micropython.cmake            # AGGREGATOR (required for USER_C_MODULES)
-  manifest.py                  # AGGREGATOR for frozen Python (optional but usual)
-  graphics/                    # example user module
-    micropython.cmake          # and/or micropython.mk
-    manifest.py                # optional frozen Python for this module
-  usdl2/
-    micropython.cmake
-    ...
-  esp-idf -> ...               # optional SDK symlink
-  emsdk -> ...
-```
-
-Create missing aggregators from the Firmware UI (**Create stubs…**) or copy
-`resources/templates/micropython.cmake` and `resources/templates/manifest.py`.
-
-### Aggregator contract (`micropython.cmake`)
-
-When mpftp builds with `USER_C_MODULES=<firmware-workspace>`, MicroPython’s
-CMake includes the **workspace-root** `micropython.cmake`. That file is an
-**aggregator only**: it does not define modules itself. It finds every
-`*/micropython.cmake` under the workspace (following symlinks) and `include()`s
-them.
-
-mpftp discovers modules the same way:
-
-- A **user module** is a **direct child directory** of the firmware workspace
-  that has **`micropython.cmake` and/or `micropython.mk` in its root**.
-- Optional: **`manifest.py` in that same module root** for frozen Python.
-- The workspace-root aggregator / root `manifest.py` are **not** modules.
-- Hidden directories (`.git`, …) are skipped.
-- mpftp passes **every** discovered module into the build for **every** port;
-  it does **not** gate by board compatibility. Each module’s own
-  `micropython.cmake` / `micropython.mk` must opt in/out and resolve its own
-  dependencies (for example SDL2 for a desktop usermod).
-
-### Module root contract (what you put in each repo)
-
-| File | Role |
-|------|------|
-| `micropython.cmake` | CMake usermod registration for esp32 and other CMake ports |
-| `micropython.mk` | Make-based usermod registration for Make ports |
-| `manifest.py` | Optional frozen Python for this module (`freeze(...)`, `package(...)`, …) |
-
-At least one of `micropython.cmake` or `micropython.mk` must sit in the
-**module root** (not only nested deeper) for mpftp’s discovery and for the
-usual aggregator `find`/`include` pattern.
-
-### Frozen Python aggregator (`manifest.py`)
-
-The workspace-root `manifest.py`:
-
-1. Optionally includes `my-manifest.py` (local overrides).
-2. Includes each child `*/manifest.py`.
-3. Includes upstream via `FROZEN_MANIFEST_UPSTREAM` (mpftp sets this to the
-   port/board/variant manifest MicroPython would have used).
-
-Without a root `manifest.py`, the build is still valid but will not freeze
-workspace Python packages unless you set `FROZEN_MANIFEST` yourself.
-
-### Agent checklist when changing a usermod
-
-1. Confirm the module directory is a **sibling of `micropython/`** (or symlinked
-   there) and has `micropython.cmake` and/or `micropython.mk` at its root.
-2. `./scripts/mpftp firmware cmods` — module name should appear.
-3. Rebuild the target port/board/variant; flash; connect; exercise the binding
-   from the REPL (`exec` / `eval`).
-4. Pure Python changes that are **not** frozen can be `put` to the board
-   without a firmware rebuild; **native / frozen** changes need Build + Flash.
+Details: [user guide — Autosize](docs/user-guide.md#esp32-partition-autosize).
 
 ---
 
@@ -212,7 +146,7 @@ workspace Python packages unless you set `FROZEN_MANIFEST` yourself.
 | Wrong board / no Wi-Fi on P4 | Detect + MicroPython hints; pick `C5_WIFI` / `C6_WIFI` explicitly if needed |
 | Build: required tree not found | Symlink under firmware workspace or set env (`IDF_PATH`, `EMSDK`, …); Locate… in UI |
 | App partition too small | Let autosize rebuild once, or adjust `esp32_partitions/<board>.csv` |
-| Module missing from firmware | Check aggregator + module-root `micropython.cmake`/`micropython.mk`; `firmware cmods` |
+| Module missing from firmware | See [aggregator.md](docs/aggregator.md); `firmware cmods` |
 
 ---
 
@@ -224,6 +158,7 @@ workspace Python packages unless you set `FROZEN_MANIFEST` yourself.
 # Firmware methods are also exposed over the same agent RPC when the extension runs.
 ```
 
-See [docs/user-guide.md](docs/user-guide.md) and
-[docs/developers-guide.md](docs/developers-guide.md) for product and packaging
-detail. Keep this file aligned when CLI or discovery contracts change.
+See [docs/user-guide.md](docs/user-guide.md),
+[docs/aggregator.md](docs/aggregator.md), and
+[docs/developers-guide.md](docs/developers-guide.md). Keep this file aligned when
+CLI or discovery contracts change.

@@ -664,7 +664,12 @@ def workspace_of(mp: Path) -> Path:
 
 
 def discover_cmods(workspace: Path) -> dict:
-    """Find user C modules (micropython.cmake / */micropython.mk) + manifest."""
+    """Find workspace modules: cmake/mk usermods and/or frozen manifest.py roots.
+
+    A sibling directory counts if it has any of:
+    ``micropython.cmake``, ``micropython.mk``, or ``manifest.py`` in its root.
+    Make/cmake and manifest are independent — either alone is enough.
+    """
     modules: list[dict] = []
     seen: set[str] = set()
     try:
@@ -673,18 +678,28 @@ def discover_cmods(workspace: Path) -> dict:
                 continue
             has_cmake = (child / "micropython.cmake").is_file()
             has_mk = (child / "micropython.mk").is_file()
-            if has_cmake or has_mk:
-                if child.name in seen:
-                    continue
-                seen.add(child.name)
-                modules.append(
-                    {
-                        "name": child.name,
-                        "path": str(child),
-                        "hasManifest": (child / "manifest.py").is_file(),
-                        "kind": "cmake" if has_cmake else "make",
-                    }
-                )
+            has_manifest = (child / "manifest.py").is_file()
+            if not (has_cmake or has_mk or has_manifest):
+                continue
+            if child.name in seen:
+                continue
+            seen.add(child.name)
+            if has_cmake:
+                kind = "cmake"
+            elif has_mk:
+                kind = "make"
+            else:
+                kind = "manifest"
+            modules.append(
+                {
+                    "name": child.name,
+                    "path": str(child),
+                    "hasManifest": has_manifest,
+                    "hasCmake": has_cmake,
+                    "hasMk": has_mk,
+                    "kind": kind,
+                }
+            )
     except Exception:
         pass
     aggregator = (workspace / "micropython.cmake").is_file()
@@ -875,16 +890,17 @@ def do_build(ns: argparse.Namespace) -> None:
     discovery = discover_cmods(workspace)
     modules = discovery["modules"]
     use_user_modules = discovery["hasAggregator"] or any(
-        m["kind"] == "make" for m in modules
+        m.get("hasCmake") or m.get("hasMk") or m["kind"] in ("cmake", "make")
+        for m in modules
     )
     if use_user_modules:
         make_args.append(f"USER_C_MODULES={workspace}")
         emit_log(f"[mpftp] USER_C_MODULES={workspace}")
-        if modules:
-            names = ", ".join(m["name"] for m in modules)
-            emit_log(f"[mpftp] user C modules: {names}")
-    else:
-        emit_log("[mpftp] no workspace user C modules found; building vanilla")
+    if modules:
+        names = ", ".join(m["name"] for m in modules)
+        emit_log(f"[mpftp] workspace modules: {names}")
+    elif not use_user_modules:
+        emit_log("[mpftp] no workspace modules found; building vanilla")
 
     if discovery["hasManifest"]:
         make_args.append(f"FROZEN_MANIFEST={workspace / 'manifest.py'}")
@@ -892,6 +908,11 @@ def do_build(ns: argparse.Namespace) -> None:
         if upstream:
             env["FROZEN_MANIFEST_UPSTREAM"] = str(upstream)
             emit_log(f"[mpftp] FROZEN_MANIFEST_UPSTREAM={upstream}")
+    elif modules and any(m.get("hasManifest") for m in modules):
+        emit_log(
+            "[mpftp] workspace has module manifest.py files but no root "
+            "manifest.py aggregator — frozen packages will not be included"
+        )
 
     if kind == "boards":
         if board:
@@ -1327,8 +1348,9 @@ def _read_device_partition_table(base: list[str], nbytes: int) -> Optional[bytes
 def _esp32_layout_changed(base: list[str], artifact: Path) -> Optional[bool]:
     """Does the device's partition table differ from the one we're about to flash?
 
-    Returns True if it changed (erase needed to avoid a stale filesystem at the
-    moved vfs offset), False if identical, or None if it couldn't be determined.
+    Returns True if it changed (user must confirm a full erase — a moved
+    vfs/storage offset otherwise leaves a stale filesystem), False if identical,
+    or None if it couldn't be determined.
     """
     new_pt = artifact.parent / "partition_table" / "partition-table.bin"
     if not new_pt.is_file():
@@ -1358,14 +1380,37 @@ def flash_esp32(ns: argparse.Namespace, mp: Optional[Path], artifact: Path) -> N
 
     erase = getattr(ns, "erase", False)
     if not erase:
-        # Auto-erase when the partition layout changed since the last flash: a
-        # moved vfs/storage offset leaves a stale filesystem that boots corrupt.
+        # A moved vfs/storage offset leaves a stale filesystem that boots corrupt.
+        # Never auto-erase: warn and require an explicit erase + second Flash.
         changed = _esp32_layout_changed(base, artifact)
         if changed:
-            emit_log("[mpftp] partition layout changed on device — erasing flash first")
-            erase = True
-        elif changed is None:
-            emit_log("[mpftp] could not read on-device partition table; skipping pre-erase")
+            emit_log(
+                "[mpftp] partition layout on the device differs from this firmware"
+            )
+            emit_result(
+                False,
+                error=(
+                    "Partition table on the device differs from this build. "
+                    "Enable “Erase flash before writing” and click Flash again. "
+                    "A full erase wipes the filesystem (vfs/storage) partition — "
+                    "all board files will be lost."
+                ),
+                needEraseConfirm={
+                    "reason": "partition_layout_changed",
+                    "message": (
+                        "The on-device partition table does not match this firmware. "
+                        "Re-flashing with erase will apply the new table but wipe the "
+                        "filesystem (vfs/storage) partition — all files on the board "
+                        "will be lost."
+                    ),
+                },
+            )
+            return
+        if changed is None:
+            emit_log(
+                "[mpftp] could not read on-device partition table; "
+                "skipping layout check (enable Erase if the board misbehaves)"
+            )
 
     if erase:
         emit_log("[mpftp] erasing flash…")
