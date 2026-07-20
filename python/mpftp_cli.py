@@ -789,9 +789,42 @@ def cmd_firmware(ns: argparse.Namespace) -> None:
             extra += ["--device", ns.device]
         if getattr(ns, "artifact", None):
             extra += ["--artifact", ns.artifact]
+        if getattr(ns, "family", None):
+            extra += ["--family", ns.family]
         if getattr(ns, "erase", False):
             extra.append("--erase")
         res = _engine_stream("flash", extra)
+        out(res)
+        if not res.get("ok"):
+            raise SystemExit(1)
+        return
+    if sub == "download-tree":
+        extra = []
+        if getattr(ns, "force", False):
+            extra.append("--force")
+        out(_engine_json("download-tree", extra))
+        return
+    if sub == "download-list":
+        extra = ["--board", ns.board]
+        if getattr(ns, "variant", None):
+            extra += ["--variant", ns.variant]
+        if getattr(ns, "preview", False):
+            extra.append("--preview")
+        if getattr(ns, "force", False):
+            extra.append("--force")
+        out(_engine_json("download-list", extra))
+        return
+    if sub == "download":
+        extra = ["--board", ns.board]
+        if getattr(ns, "variant", None):
+            extra += ["--variant", ns.variant]
+        if getattr(ns, "version", None):
+            extra += ["--version", ns.version]
+        if getattr(ns, "preview", False):
+            extra.append("--preview")
+        if getattr(ns, "force", False):
+            extra.append("--force")
+        res = _engine_stream("download", extra)
         out(res)
         if not res.get("ok"):
             raise SystemExit(1)
@@ -1028,10 +1061,40 @@ def build_parser() -> argparse.ArgumentParser:
         func=cmd_firmware
     )
 
-    fwf = fwsub.add_parser("flash", parents=[fw_sel, device_opts], help="Flash a built artifact")
+    fwf = fwsub.add_parser("flash", parents=[fw_sel, device_opts], help="Flash a built or downloaded artifact")
     fwf.add_argument("--artifact", help="Explicit firmware file (else last build)")
+    fwf.add_argument("--family", default="", help="MCU family for flash offset (download mode)")
     fwf.add_argument("--erase", action="store_true", help="esp32: erase flash first")
     fwf.set_defaults(func=cmd_firmware)
+
+    fwdt = fwsub.add_parser(
+        "download-tree", help="Official firmware catalog (Thonny JSON → micropython.org)"
+    )
+    fwdt.add_argument("--force", action="store_true", help="Refresh catalog cache")
+    fwdt.set_defaults(func=cmd_firmware)
+
+    fwdlist = fwsub.add_parser("download-list", help="List downloadable versions for a board")
+    fwdlist.add_argument("--board", required=True)
+    fwdlist.add_argument(
+        "--variant",
+        default="",
+        help="MP board variant (e.g. C6_WIFI)",
+    )
+    fwdlist.add_argument("--preview", action="store_true", help="Probe board page for latest preview")
+    fwdlist.add_argument("--force", action="store_true")
+    fwdlist.set_defaults(func=cmd_firmware)
+
+    fwdd = fwsub.add_parser("download", help="Download official firmware for a board")
+    fwdd.add_argument("--board", required=True)
+    fwdd.add_argument(
+        "--variant",
+        default="",
+        help="MP board variant (e.g. C6_WIFI)",
+    )
+    fwdd.add_argument("--version", default="", help="Release version (e.g. 1.28.0)")
+    fwdd.add_argument("--preview", action="store_true", help="Latest preview build")
+    fwdd.add_argument("--force", action="store_true", help="Refresh catalog cache")
+    fwdd.set_defaults(func=cmd_firmware)
 
     fwd = fwsub.add_parser("detect", parents=[fw_sel, device_opts],
                            help="esptool-first chip/flash/security probe")

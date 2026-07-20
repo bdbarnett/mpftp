@@ -65,16 +65,6 @@ body {
   background: var(--vscode-sideBarSectionHeader-background, transparent);
 }
 
-.toolbar .status {
-  flex: 1;
-  min-width: 120px;
-  color: var(--muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-}
-
 /* Cursor-style view "…" control: ellipsis vertically centered in the hit target */
 .toolbar .more-btn {
   width: 24px;

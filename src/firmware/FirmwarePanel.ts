@@ -4,7 +4,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { ActivityLog } from "../activityLog";
 import { SidecarBridge } from "../bridge/SidecarBridge";
-import { detectHost, getConfig } from "../platform";
+import { detectHost, filterAndSortPorts, getConfig } from "../platform";
 import { FirmwareEngine, StreamHandle } from "./engine";
 
 interface Selection {
@@ -17,6 +17,11 @@ interface Prefs {
   reconnectAfterFlash: boolean;
   alsoFlashAfterBuild: boolean;
   device: string;
+  /** Explicit source — never inferred from MicroPython checkout presence. */
+  firmwareSource: "build" | "download";
+  /** Empty = latest stable release from catalog. */
+  downloadVersion: string;
+  downloadPreview: boolean;
 }
 
 /** Structured "toolchain missing" payload emitted by the build engine. */
@@ -41,10 +46,22 @@ export class FirmwarePanel {
   private readonly engine: FirmwareEngine;
   private discovery: Record<string, unknown> = {};
   private tree: any[] = [];
+  private downloadTree: any[] = [];
   private cmods: Record<string, unknown> = {};
   private flashers: Record<string, string> = {};
   private selection: Selection = { port: "", board: "", variant: "" };
-  private prefs: Prefs = { reconnectAfterFlash: false, alsoFlashAfterBuild: false, device: "" };
+  /** MCU family from download catalog (for flash offset). */
+  private downloadFamily = "";
+  private downloadVersions: Array<{ version: string; channel: string; url: string }> = [];
+  private downloadedArtifact: Record<string, unknown> | undefined;
+  private prefs: Prefs = {
+    reconnectAfterFlash: false,
+    alsoFlashAfterBuild: false,
+    device: "",
+    firmwareSource: "build",
+    downloadVersion: "",
+    downloadPreview: false,
+  };
   private activeStream: StreamHandle | undefined;
   private busy = false;
   private lastDetect: Record<string, unknown> | undefined;
@@ -105,6 +122,15 @@ export class FirmwarePanel {
       if (typeof s.alsoFlashAfterBuild === "boolean") {
         this.prefs.alsoFlashAfterBuild = s.alsoFlashAfterBuild;
       }
+      if (s.firmwareSource === "build" || s.firmwareSource === "download") {
+        this.prefs.firmwareSource = s.firmwareSource;
+      }
+      if (typeof s.downloadVersion === "string") {
+        this.prefs.downloadVersion = s.downloadVersion;
+      }
+      if (typeof s.downloadPreview === "boolean") {
+        this.prefs.downloadPreview = s.downloadPreview;
+      }
     } catch {
       /* first run */
     }
@@ -121,6 +147,9 @@ export class FirmwarePanel {
     s.lastDevice = this.prefs.device;
     s.reconnectAfterFlash = this.prefs.reconnectAfterFlash;
     s.alsoFlashAfterBuild = this.prefs.alsoFlashAfterBuild;
+    s.firmwareSource = this.prefs.firmwareSource;
+    s.downloadVersion = this.prefs.downloadVersion;
+    s.downloadPreview = this.prefs.downloadPreview;
     try {
       fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
       fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2), "utf8");
@@ -204,7 +233,12 @@ export class FirmwarePanel {
           board: msg.board || "",
           variant: msg.variant || "",
         };
+        this.downloadedArtifact = undefined;
         this.savePrefs();
+        if (this.prefs.firmwareSource === "download") {
+          await this.refreshDownloadList();
+          this.pushState();
+        }
         await this.refreshArtifact();
         break;
       case "build":
@@ -240,12 +274,36 @@ export class FirmwarePanel {
           this.prefs.reconnectAfterFlash = !!msg.value;
         } else if (msg.key === "alsoFlashAfterBuild") {
           this.prefs.alsoFlashAfterBuild = !!msg.value;
+        } else if (msg.key === "downloadVersion") {
+          this.prefs.downloadVersion = String(msg.value || "");
+          this.prefs.downloadPreview = false;
+        } else if (msg.key === "downloadPreview") {
+          this.prefs.downloadPreview = !!msg.value;
+          if (this.prefs.downloadPreview) {
+            this.prefs.downloadVersion = "";
+          }
         }
         this.savePrefs();
+        break;
+      case "setSource":
+        await this.setSource(msg.source === "download" ? "download" : "build");
+        break;
+      case "download":
+        await this.doDownload();
+        break;
+      case "browseArtifact":
+        await this.browseArtifact();
         break;
       default:
         break;
     }
+  }
+
+  private async setSource(source: "build" | "download"): Promise<void> {
+    this.prefs.firmwareSource = source;
+    this.downloadedArtifact = undefined;
+    this.savePrefs();
+    await this.refreshAll();
   }
 
   // ---------------------------------------------------------------------- //
@@ -258,32 +316,107 @@ export class FirmwarePanel {
     } catch (e: any) {
       this.log(`[mpftp] discover failed: ${e?.message || e}`);
     }
-    if (!this.mpDir()) {
-      this.pushState();
-      return;
-    }
-    try {
-      const t = await this.engine.run<{ ports: any[] }>("tree", this.pathArgs());
-      this.tree = t.ports || [];
-    } catch (e: any) {
-      this.log(`[mpftp] tree failed: ${e?.message || e}`);
-    }
-    try {
-      this.cmods = await this.engine.run("cmods", this.pathArgs());
-    } catch {
-      /* ignore */
-    }
     try {
       const f = await this.engine.run<{ flashers: Record<string, string> }>("flashers");
       this.flashers = f.flashers || {};
     } catch {
       /* ignore */
     }
-    // Auto-select from a connected device if we have no selection yet.
-    await this.autoSelectFromDevice();
+
+    if (this.prefs.firmwareSource === "download") {
+      try {
+        const t = await this.engine.run<{ ports: any[] }>("download-tree");
+        this.downloadTree = t.ports || [];
+        this.tree = this.downloadTree;
+      } catch (e: any) {
+        this.log(`[mpftp] download-tree failed: ${e?.message || e}`);
+        this.downloadTree = [];
+        this.tree = [];
+      }
+      this.cmods = {};
+      await this.refreshDownloadList();
+    } else {
+      if (!this.mpDir()) {
+        this.tree = [];
+        this.pushState();
+        await this.pushDevices();
+        return;
+      }
+      try {
+        const t = await this.engine.run<{ ports: any[] }>("tree", this.pathArgs());
+        this.tree = t.ports || [];
+      } catch (e: any) {
+        this.log(`[mpftp] tree failed: ${e?.message || e}`);
+      }
+      try {
+        this.cmods = await this.engine.run("cmods", this.pathArgs());
+      } catch {
+        /* ignore */
+      }
+      await this.autoSelectFromDevice();
+    }
+
     this.pushState();
     await this.refreshArtifact();
     await this.pushDevices();
+  }
+
+  private async refreshDownloadList(): Promise<void> {
+    this.downloadVersions = [];
+    this.downloadFamily = "";
+    if (!this.selection.board) {
+      return;
+    }
+    // Resolve family from tree entry.
+    for (const p of this.downloadTree) {
+      const b = (p.boards || []).find((x: any) => x.board === this.selection.board);
+      if (b) {
+        this.downloadFamily = b.family || "";
+        this.selection.port = p.port || this.selection.port;
+        break;
+      }
+    }
+    try {
+      const info = await this.engine.run<{
+        downloads?: Array<{ version: string; channel: string; url: string }>;
+        variants?: string[];
+        family?: string;
+        port?: string;
+        flashOffset?: string;
+      }>("download-list", {
+        board: this.selection.board,
+        variant: this.selection.variant || undefined,
+        preview: this.prefs.downloadPreview ? true : undefined,
+      });
+      this.downloadVersions = info.downloads || [];
+      if (info.family) {
+        this.downloadFamily = info.family;
+      }
+      if (info.port) {
+        this.selection.port = info.port;
+      }
+      // Attach scraped MP variants (C6_WIFI, …) so Target can expand them.
+      if (Array.isArray(info.variants)) {
+        for (const p of this.downloadTree) {
+          const b = (p.boards || []).find(
+            (x: any) => x.board === this.selection.board
+          );
+          if (b) {
+            b.variants = info.variants;
+            break;
+          }
+        }
+      }
+      // Prefill Flash offset from upstream board.json (e.g. P4 → 0x2000).
+      if (typeof info.flashOffset === "string" && info.flashOffset) {
+        this.post({
+          type: "flashOffsetDefault",
+          flashOffset: info.flashOffset,
+        });
+      }
+    } catch (e: any) {
+      this.log(`[mpftp] download-list failed: ${e?.message || e}`);
+    }
   }
 
   // ---------------------------------------------------------------------- //
@@ -367,6 +500,10 @@ export class FirmwarePanel {
       this.detectStatus("failed", "Detect failed");
     }
 
+    // esptool hard-resets the chip; give USB-UART boards time to finish boot
+    // before Connect's raw-REPL handshake (P4 + CH343 needs ~1.5–2s).
+    await new Promise((r) => setTimeout(r, 1800));
+
     if (wasConnected) {
       try {
         await this.bridge.connect(device, undefined, { silent: true });
@@ -383,6 +520,9 @@ export class FirmwarePanel {
     }
 
     this.post({ type: "detect", detect: this.lastDetect || null });
+    if (this.prefs.firmwareSource === "download") {
+      await this.refreshDownloadList();
+    }
     this.pushState();
     await this.refreshArtifact();
     await this.pushDevices();
@@ -505,11 +645,23 @@ export class FirmwarePanel {
       return;
     }
     if (conf === "matched" || conf === "family-only") {
-      this.selection = {
-        port,
-        board: String(m.board || ""),
-        variant: String(m.variant || ""),
-      };
+      let board = String(m.board || "");
+      const variant = String(m.variant || "");
+      if (this.prefs.firmwareSource === "download" && board) {
+        const inCatalog = this.downloadTree.some((p: any) =>
+          (p.boards || []).some((b: any) => b.board === board)
+        );
+        if (!inCatalog) {
+          this.log(
+            `[mpftp] detected board ${board} not in download catalog — pick Target or Browse local`
+          );
+          // Keep port; prefer a GENERIC board on that port if available.
+          const node = this.downloadTree.find((p: any) => p.port === port);
+          const generic = node?.boards?.find((x: any) => /GENERIC/.test(x.board));
+          board = generic?.board || "";
+        }
+      }
+      this.selection = { port, board, variant };
       this.savePrefs();
     }
   }
@@ -566,6 +718,19 @@ export class FirmwarePanel {
   }
 
   private async refreshArtifact(): Promise<void> {
+    if (this.prefs.firmwareSource === "download") {
+      const artVar = String(this.downloadedArtifact?.variant || "");
+      if (
+        this.downloadedArtifact?.ready &&
+        this.downloadedArtifact.board === this.selection.board &&
+        artVar === (this.selection.variant || "")
+      ) {
+        this.post({ type: "artifact", artifact: this.downloadedArtifact });
+      } else {
+        this.post({ type: "artifact", artifact: { ready: false } });
+      }
+      return;
+    }
     if (!this.selection.port || !this.mpDir()) {
       this.post({ type: "artifact", artifact: { ready: false } });
       return;
@@ -617,6 +782,8 @@ export class FirmwarePanel {
       flashers: this.flashers,
       selection: this.selection,
       prefs: this.prefs,
+      downloadVersions: this.downloadVersions,
+      downloadFamily: this.downloadFamily,
       connectedDevice: this.bridge.connectedDevice || "",
       detect: this.lastDetect || null,
       busy: this.busy,
@@ -816,6 +983,90 @@ export class FirmwarePanel {
   // Flash
   // ---------------------------------------------------------------------- //
 
+  private async doDownload(): Promise<void> {
+    if (this.busy) {
+      return;
+    }
+    if (!this.selection.board) {
+      void vscode.window.showWarningMessage("Select a board in Target first.");
+      return;
+    }
+    this.busy = true;
+    this.phase("building", "Downloading…");
+    this.post({ type: "clearLog" });
+    const handle = this.engine.stream(
+      "download",
+      {
+        board: this.selection.board,
+        variant: this.selection.variant || undefined,
+        version: this.prefs.downloadPreview
+          ? undefined
+          : this.prefs.downloadVersion || undefined,
+        preview: this.prefs.downloadPreview ? true : undefined,
+      },
+      (line) => this.log(line)
+    );
+    this.activeStream = handle;
+    const result = await handle.done;
+    this.activeStream = undefined;
+    this.busy = false;
+    if (result.ok && result.artifact) {
+      this.downloadedArtifact = { ...result, ready: true };
+      if (typeof result.family === "string") {
+        this.downloadFamily = result.family;
+      }
+      if (typeof result.port === "string") {
+        this.selection.port = result.port;
+      }
+      this.phase("ready", "Downloaded");
+      this.post({ type: "artifact", artifact: this.downloadedArtifact });
+      if (typeof result.flashOffset === "string" && result.flashOffset) {
+        this.post({
+          type: "flashOffsetDefault",
+          flashOffset: result.flashOffset,
+        });
+      }
+      this.pushState();
+    } else {
+      this.downloadedArtifact = undefined;
+      this.phase("failed", String(result.error || "Download failed"));
+      this.post({ type: "artifact", artifact: { ready: false } });
+    }
+  }
+
+  private async browseArtifact(): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: false,
+      openLabel: "Use firmware file",
+      title: "Select a .bin or .uf2 firmware file",
+      filters: { Firmware: ["bin", "uf2", "hex"] },
+    });
+    if (!uris?.[0]) {
+      return;
+    }
+    const p = uris[0].fsPath;
+    let size = 0;
+    try {
+      size = fs.statSync(p).size;
+    } catch {
+      /* ignore */
+    }
+    this.downloadedArtifact = {
+      ready: true,
+      artifact: p,
+      size,
+      mtime: Date.now() / 1000,
+      source: "local",
+      board: this.selection.board,
+      family: this.downloadFamily,
+      port: this.selection.port,
+    };
+    this.post({ type: "artifact", artifact: this.downloadedArtifact });
+    this.log(`[mpftp] using local firmware ${p}`);
+  }
+
   private async doFlash(
     offset = "",
     baud = "",
@@ -823,11 +1074,20 @@ export class FirmwarePanel {
     after = "",
     erase = false
   ): Promise<void> {
-    if (this.busy || !this.guardMp()) {
+    const downloadMode = this.prefs.firmwareSource === "download";
+    if (this.busy || (!downloadMode && !this.guardMp())) {
+      return;
+    }
+    if (downloadMode && !this.downloadedArtifact?.ready) {
+      void vscode.window.showWarningMessage("Download firmware first (or Browse local…).");
       return;
     }
     const port = this.selection.port;
-    if (!this.flashers[port]) {
+    if (!this.flashers[port] && !downloadMode) {
+      void vscode.window.showWarningMessage(`Flashing is not supported for '${port}'.`);
+      return;
+    }
+    if (downloadMode && !["esp32", "rp2", "samd"].includes(port)) {
       void vscode.window.showWarningMessage(`Flashing is not supported for '${port}'.`);
       return;
     }
@@ -890,13 +1150,21 @@ export class FirmwarePanel {
     }
 
     const esptool = this.engine.esptoolCommand();
+    const artifactPath =
+      downloadMode && typeof this.downloadedArtifact?.artifact === "string"
+        ? String(this.downloadedArtifact.artifact)
+        : undefined;
     const handle = this.engine.stream(
       "flash",
       {
-        ...this.pathArgs(),
+        ...(downloadMode ? {} : this.pathArgs()),
+        // Download mode still passes mp if known (better offset from board.json).
+        ...(downloadMode && this.mpDir() ? { mp: this.mpDir() } : {}),
         port,
         board: this.selection.board,
         variant: this.selection.variant,
+        family: downloadMode ? this.downloadFamily || undefined : undefined,
+        artifact: artifactPath,
         device: flashDevice,
         esptool: esptool || undefined,
         offset: port === "esp32" ? offset || undefined : undefined,
@@ -986,10 +1254,15 @@ export class FirmwarePanel {
     }
     try {
       await this.bridge.ensureStarted();
-      const ports = await this.bridge.listPorts();
+      const ports = filterAndSortPorts(await this.bridge.listPorts(), {
+        lastDevice: this.bridge.lastDevice || this.prefs.device || undefined,
+        lastVidPid: this.bridge.rememberedVidPid,
+      });
       const items = ports.map((p) => ({
         label: p.device,
-        description: p.product || p.description || "",
+        description: [p.product || p.description || "", p.interface || ""]
+          .filter(Boolean)
+          .join(" · "),
       }));
       const manual = { label: "$(edit) Enter manually…", description: "" };
       const pick = await vscode.window.showQuickPick([...items, manual], {

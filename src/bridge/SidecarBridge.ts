@@ -3,7 +3,14 @@ import * as path from "path";
 import { EventEmitter } from "events";
 import * as vscode from "vscode";
 import { ActivityLog, summarizeParams } from "../activityLog";
-import { getConfig, pathForPythonProcess, resolvePython } from "../platform";
+import {
+  GS_LAST_DEVICE,
+  GS_LAST_VIDPID,
+  getConfig,
+  pathForPythonProcess,
+  portVidPidKey,
+  resolvePython,
+} from "../platform";
 
 export type PortInfo = {
   device: string;
@@ -13,6 +20,10 @@ export type PortInfo = {
   manufacturer?: string | null;
   product?: string | null;
   description?: string | null;
+  interface?: string | null;
+  hwid?: string | null;
+  /** false for CircuitPython CDC2 (data) interfaces — not for REPL connect. */
+  repl?: boolean;
 };
 
 export type DirEntry = {
@@ -42,7 +53,8 @@ export class SidecarBridge extends EventEmitter {
   constructor(
     private readonly extensionPath: string,
     private readonly log: vscode.OutputChannel,
-    private readonly activity?: ActivityLog
+    private readonly activity?: ActivityLog,
+    private readonly globalState?: vscode.Memento
   ) {
     super();
   }
@@ -57,6 +69,35 @@ export class SidecarBridge extends EventEmitter {
 
   get connected(): boolean {
     return !!this._connectedDevice;
+  }
+
+  /** Seed in-memory last device from globalState (after window reload). */
+  seedLastDeviceFromGlobalState(): void {
+    const saved = this.globalState?.get<string>(GS_LAST_DEVICE);
+    if (saved && !this._lastDevice) {
+      this._lastDevice = saved;
+    }
+  }
+
+  get rememberedVidPid(): string | undefined {
+    return this.globalState?.get<string>(GS_LAST_VIDPID);
+  }
+
+  private async persistLastDevice(device: string): Promise<void> {
+    if (!this.globalState) {
+      return;
+    }
+    await this.globalState.update(GS_LAST_DEVICE, device);
+    try {
+      const ports = await this.listPorts();
+      const match = ports.find((p) => p.device === device);
+      const key = match ? portVidPidKey(match) : undefined;
+      if (key) {
+        await this.globalState.update(GS_LAST_VIDPID, key);
+      }
+    } catch {
+      /* port list optional for persistence */
+    }
   }
 
   async ensureStarted(): Promise<void> {
@@ -233,6 +274,7 @@ export class SidecarBridge extends EventEmitter {
     await this.request("connect", { device, baud: baud ?? cfg.defaultBaud });
     this._connectedDevice = device;
     this._lastDevice = device;
+    await this.persistLastDevice(device);
     await vscode.commands.executeCommand("setContext", "mpftp.connected", true);
     this.activity?.event("connected", { message: device, data: { device } });
     // `silent` reconnects (e.g. after detect/flash) restore the link without
@@ -240,8 +282,14 @@ export class SidecarBridge extends EventEmitter {
     this.emit("connected", device, { silent: !!opts?.silent });
   }
 
-  /** Reconnect to the last device (after hard-reset / port flicker). */
+  /** Reconnect to the last device (after hard-reset / port flicker / reload). */
   async resume(baud?: number): Promise<void> {
+    // After a window reload the sidecar is fresh (no last_device); use
+    // in-memory / globalState last device and connect directly.
+    if (!this._connectedDevice && this._lastDevice) {
+      await this.connect(this._lastDevice, baud);
+      return;
+    }
     const cfg = getConfig();
     const res = await this.request<{ device: string }>("resume", {
       baud: baud ?? cfg.defaultBaud,
@@ -252,6 +300,7 @@ export class SidecarBridge extends EventEmitter {
     }
     this._connectedDevice = device;
     this._lastDevice = device;
+    await this.persistLastDevice(device);
     await vscode.commands.executeCommand("setContext", "mpftp.connected", true);
     this.activity?.event("connected", { message: `resume ${device}`, data: { device } });
     this.emit("connected", device);

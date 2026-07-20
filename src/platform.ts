@@ -252,3 +252,53 @@ export function getConfig() {
     esptoolCommand: cfg.get<string>("esptoolCommand") || "",
   };
 }
+
+/** globalState keys for last successful connect (not user settings). */
+export const GS_LAST_DEVICE = "mpftp.lastDevice";
+export const GS_LAST_VIDPID = "mpftp.lastVidPid";
+
+export type PortPickInfo = {
+  device: string;
+  vid?: number | null;
+  pid?: number | null;
+  repl?: boolean;
+  interface?: string | null;
+  description?: string | null;
+  product?: string | null;
+  manufacturer?: string | null;
+  serial_number?: string | null;
+  hwid?: string | null;
+};
+
+export function portVidPidKey(p: PortPickInfo): string | undefined {
+  if (p.vid == null || p.pid == null) {
+    return undefined;
+  }
+  return `${p.vid}:${p.pid}`;
+}
+
+/** CircuitPython CDC2 and other non-REPL interfaces are marked repl=false. */
+export function isReplPort(p: PortPickInfo): boolean {
+  return p.repl !== false;
+}
+
+/** Drop non-REPL ports and prefer last-good device / VID:PID. */
+export function filterAndSortPorts<T extends PortPickInfo>(
+  ports: T[],
+  opts: { lastDevice?: string; lastVidPid?: string } = {}
+): T[] {
+  const repl = ports.filter(isReplPort);
+  const score = (p: T): number => {
+    if (opts.lastDevice && p.device === opts.lastDevice) {
+      return 0;
+    }
+    const key = portVidPidKey(p);
+    if (opts.lastVidPid && key === opts.lastVidPid) {
+      return 1;
+    }
+    return 2;
+  };
+  return [...repl].sort(
+    (a, b) => score(a) - score(b) || (a.device || "").localeCompare(b.device || "")
+  );
+}

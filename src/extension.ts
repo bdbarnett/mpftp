@@ -6,7 +6,12 @@ import { openBoardFileInEditor, registerEditSaveHook } from "./editRemote";
 import { openRepl } from "./terminal/ReplTerminal";
 import { FtpViewProvider } from "./webview/FtpViewProvider";
 import { FirmwarePanel } from "./firmware/FirmwarePanel";
-import { detectHost, getConfig, resolvePython } from "./platform";
+import {
+  detectHost,
+  filterAndSortPorts,
+  getConfig,
+  resolvePython,
+} from "./platform";
 
 let bridge: SidecarBridge;
 let log: vscode.OutputChannel;
@@ -19,7 +24,8 @@ let statusBar: vscode.StatusBarItem;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   log = vscode.window.createOutputChannel("mpftp");
   activity = new ActivityLog();
-  bridge = new SidecarBridge(context.extensionPath, log, activity);
+  bridge = new SidecarBridge(context.extensionPath, log, activity, context.globalState);
+  bridge.seedLastDeviceFromGlobalState();
   agentRpc = new AgentRpcServer(bridge, activity, context.extensionPath);
   agentRpc.start();
 
@@ -69,7 +75,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     );
 
-    const ports = await bridge.listPorts();
+    const ports = filterAndSortPorts(await bridge.listPorts(), {
+      lastDevice: bridge.lastDevice,
+      lastVidPid: bridge.rememberedVidPid,
+    });
     const items = ports.map((p) => portQuickPick(p));
     if (!items.length) {
       const host = detectHost();
@@ -84,10 +93,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const cfg = getConfig();
     let device = cfg.autoConnectDevice;
     if (!device) {
-      const pick = await vscode.window.showQuickPick(items, {
-        title: "Select MicroPython board",
-        placeHolder: "Serial port",
-      });
+      // Last-good port is sorted first; preselect it in the quick pick.
+      const pick = await showPortQuickPick(items, "Select MicroPython board");
       if (!pick) {
         return;
       }
@@ -437,17 +444,51 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 }
 
-function portQuickPick(p: PortInfo) {
+type PortPickItem = vscode.QuickPickItem & { device: string };
+
+function portQuickPick(p: PortInfo): PortPickItem {
   const vidpid =
     p.vid != null && p.pid != null
       ? `${p.vid.toString(16).padStart(4, "0")}:${p.pid.toString(16).padStart(4, "0")}`
       : "";
+  const detailParts = [p.interface, p.serial_number || p.description].filter(Boolean);
   return {
     label: p.device,
     description: [p.product, p.manufacturer, vidpid].filter(Boolean).join(" · "),
-    detail: p.serial_number || p.description || undefined,
+    detail: detailParts.length ? detailParts.join(" · ") : undefined,
     device: p.device,
   };
+}
+
+function showPortQuickPick(
+  items: PortPickItem[],
+  title: string
+): Promise<PortPickItem | undefined> {
+  return new Promise((resolve) => {
+    const qp = vscode.window.createQuickPick<PortPickItem>();
+    let settled = false;
+    const finish = (value: PortPickItem | undefined) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      qp.dispose();
+      resolve(value);
+    };
+    qp.title = title;
+    qp.placeholder = "Serial port";
+    qp.items = items;
+    if (items.length) {
+      qp.activeItems = [items[0]];
+    }
+    qp.onDidAccept(() => {
+      finish(qp.selectedItems[0]);
+    });
+    qp.onDidHide(() => {
+      finish(undefined);
+    });
+    qp.show();
+  });
 }
 
 function updateStatus(): void {

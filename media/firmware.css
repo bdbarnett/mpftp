@@ -64,10 +64,43 @@ body {
 
 .hdr-below {
   display: flex;
-  justify-content: space-between;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.source-row {
+  display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 10px;
   flex-wrap: wrap;
+}
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.seg-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 4px 14px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.seg-btn:hover {
+  background: var(--hover);
+  color: var(--fg);
+}
+
+.seg-btn.active {
+  background: var(--accent);
+  color: var(--accent-fg);
 }
 
 .brand {
@@ -145,6 +178,10 @@ body {
   gap: 16px;
 }
 
+.grid > .step-span {
+  grid-column: 1 / -1;
+}
+
 @media (max-width: 720px) {
   .grid {
     grid-template-columns: 1fr;
@@ -172,6 +209,10 @@ body {
   align-items: center;
   gap: 10px;
   margin-bottom: 12px;
+}
+
+.step-head .step-trailing {
+  margin-left: auto;
 }
 
 .step-num {
@@ -402,7 +443,24 @@ body {
   padding: 12px;
 }
 
-/* Modules */
+/* Modules (sub-card inside Select / Build) */
+.sub-card {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius) - 2px);
+  background: color-mix(in srgb, var(--card-bg) 70%, var(--bg));
+}
+
+.sub-card-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
 .discovered-from {
   display: flex;
   align-items: baseline;
@@ -570,6 +628,30 @@ body {
   width: auto;
 }
 
+.field-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+}
+
+.field-row label {
+  font-size: 12.5px;
+  color: var(--muted);
+  min-width: 72px;
+}
+
+.field-row select {
+  flex: 1;
+  min-width: 0;
+  background: var(--input-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font: inherit;
+}
+
 .offset-row {
   display: flex;
   align-items: center;
@@ -658,7 +740,7 @@ body {
   color: var(--muted);
 }
 
-/* Device Info */
+/* Detect (step 1) — was Device Info */
 .device-card {
   margin-bottom: 16px;
 }

@@ -14,6 +14,19 @@ function joinRemote(base: string, name: string): string {
   return base.replace(/\/+$/, "") + "/" + name;
 }
 
+/** Short label for tab titles: COM4, ttyACM0 (not the full /dev path). */
+function shortDeviceName(device: string): string {
+  const s = device.trim();
+  if (!s) {
+    return s;
+  }
+  // Windows COM ports stay as-is; Unix device paths → basename.
+  if (s.includes("/") || s.includes("\\")) {
+    return path.basename(s);
+  }
+  return s;
+}
+
 /** Skip VCS/env/bytecode noise: .git, .venv, __pycache__, *.pyc, etc. */
 function shouldSkipTransferEntry(name: string): boolean {
   if (!name || name === "." || name === "..") {
@@ -148,6 +161,7 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
   ): void {
     this.view = webviewView;
     this.attachWebview(webviewView.webview);
+    this.updateTitles();
     webviewView.onDidDispose(() => {
       this.webviews.delete(webviewView.webview);
       if (this.view === webviewView) {
@@ -170,12 +184,13 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
   openInEditor(): void {
     if (this.editorPanel) {
       this.editorPanel.reveal(vscode.ViewColumn.Beside);
+      this.updateTitles();
       void this.pushState();
       return;
     }
     this.editorPanel = vscode.window.createWebviewPanel(
       "mpftp.ftpEditor",
-      "mpftp Board Files",
+      this.panelTitle(),
       vscode.ViewColumn.Beside,
       {
         enableScripts: true,
@@ -193,6 +208,22 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
     });
     this.bindBridgeEvents();
     void this.pushState();
+  }
+
+  /** Editor tab / sidebar title: `mpftp COM4` or `mpftp disconnected`. */
+  private panelTitle(): string {
+    const device = this.bridge.connectedDevice;
+    return device ? `mpftp ${shortDeviceName(device)}` : "mpftp disconnected";
+  }
+
+  private updateTitles(): void {
+    const title = this.panelTitle();
+    if (this.editorPanel) {
+      this.editorPanel.title = title;
+    }
+    if (this.view) {
+      this.view.title = title;
+    }
   }
 
   private attachWebview(webview: vscode.Webview): void {
@@ -217,10 +248,12 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
     }
     this.bridgeEventsBound = true;
     this.bridge.on("connected", () => {
+      this.updateTitles();
       void this.refreshDeviceInfo().then(() => this.pushState());
     });
     this.bridge.on("disconnected", () => {
       this.deviceInfo = "";
+      this.updateTitles();
       void this.pushState();
     });
   }
@@ -932,7 +965,6 @@ export class FtpViewProvider implements vscode.WebviewViewProvider {
       <button id="btnConnect">Connect</button>
       <button id="btnRepl" class="secondary" disabled>REPL</button>
       <button id="btnFirmware" class="secondary" title="Build & flash firmware">Firmware</button>
-      <span class="status" id="status">Not connected</span>
     </div>
     <div class="panes">
       <section class="pane" id="localPane">
