@@ -13,6 +13,8 @@ Published as **`pydevices.mpftp`** under [PyDevices](https://github.com/PyDevice
 - **[User guide](docs/user-guide.md)** — getting started, File Transfer, REPL, Firmware workspace, autosize, troubleshooting
 - **[Aggregator & user modules](docs/aggregator.md)** — workspace `micropython.cmake` / `manifest.py` contract
 - **[Developers guide](docs/developers-guide.md)** — architecture, discovery contract, packaging, contribution
+- **[Board inventory](docs/board-inventory.md)** — esptool / Detect hardware inventory
+- **[Pydisplay display boards](docs/pydisplay-display-boards.md)** — panel / `board_config` bring-up notes (sister to inventory)
 - **[AGENTS.md](AGENTS.md)** — agent/CLI workflows: board ops, flash recovery, pointers to aggregator docs
 
 ## Features

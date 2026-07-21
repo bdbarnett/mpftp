@@ -4,6 +4,10 @@ An inventory of the boards on hand, compiled from the Firmware **Detect**
 fixture campaign (2026-07-18). Raw per-board field notes are in
 [`firmware-fixtures.md`](firmware-fixtures.md).
 
+For **pydisplay panel / `board_config` bring-ups** (resolution, touch, DotClock
+vs MIPI quirks) see the sister doc
+[`pydisplay-display-boards.md`](pydisplay-display-boards.md).
+
 Data was gathered with `esptool` (authoritative for Espressif — chip, flash,
 security), `mpremote` / CircuitPython REPL (runtime freq, heap, build), and UF2
 `INFO_UF2.TXT` / `boot_out.txt` for bootloader-only boards.
