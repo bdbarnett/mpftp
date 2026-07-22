@@ -138,4 +138,3 @@ writing** and click **Flash** again. A full erase wipes the filesystem
 ## More
 
 - [Developers guide](developers-guide.md) — architecture, discovery contract, packaging
-- [Firmware fixtures](firmware-fixtures.md) — offline catalog fixtures for tests
