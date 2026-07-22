@@ -29,6 +29,8 @@ variant (`C6_WIFI` in inventory fixture #1).
 | Waveshare ESP32-S3-Touch-LCD-7 (sku 27078) | `esp32-s3-touch-lcd-7` | 800×480 | ST7262 RGB **DotClock** | GT911 @ `0x5D` | CH422G | *(not yet a Detect fixture)* |
 | LILYGO T-Embed | `busdisplay/spi/t-embed` | 170×320 | ST7789 **SPI** (`spibus`) | — (rotary) | GPIO46 power | *(not yet a Detect fixture)* |
 | LILYGO T-HMI | `busdisplay/i80/t-hmi` | 240×320 | ST7789 **I80** (`i80bus`) | XPT2046 SPI | GPIO14/10 power | *(not yet a Detect fixture)* |
+| Waveshare RP2040-Touch-LCD-1.28 | `busdisplay/spi/rp2040-touch-lcd-1.28` (+ CP `cp_rp2040-touch-lcd-1.28`) | 240×240 round | GC9A01A **SPI** (`spibus` / FourWire) | CST816 (`cst8xx` / `cst816`) | — | *(not yet a Detect fixture)* |
+| Adafruit Metro M7 + 2.8″ TFT Touch Shield (1947) | `busdisplay/spi/metro_m7_tft_touch_shield_1947` | 240×320 | ILI9341 **SPI** (`spibus` SoftSPI or SPI0) | FT6206 @ `0x38` | Onboard AirLift (NINA) | *(not yet a Detect fixture)* |
 
 ---
 
@@ -168,6 +170,91 @@ variant (`C6_WIFI` in inventory fixture #1).
   `max_transfer_bytes` vs full-frame size is a displayif hardening note if
   oneshot full-frame transfers misbehave.
 
+### Waveshare RP2040-Touch-LCD-1.28 (round GC9A01A)
+
+- **board_config titles:** `Waveshare RP2040-Touch-LCD-1.28 GC9A01 240x240`
+  (MicroPython); same board under CircuitPython
+- **Dirs:** `board_configs/busdisplay/spi/rp2040-touch-lcd-1.28` (MP);
+  `board_configs/busdisplay/spi/cp_rp2040-touch-lcd-1.28` (CP)
+- **Resolution:** 240×240 round GC9A01A, `bgr=True`,
+  `reverse_bytes_in_word=True`, `invert=True`
+- **Bus (MP):** `SPIBus(id=1, sck=10, mosi=11, dc=8, cs=9)` @ **10 MHz**
+  (60 MHz was flaky on cold boot). Reset GPIO13 (active-low), backlight
+  GPIO25.
+- **Bus (CP):** `busio.SPI(clock=LCD_CLK, MOSI=LCD_DIN)` + `FourWire` on
+  `LCD_DC` / `LCD_CS` / `LCD_RST` @ 10 MHz. Official CP board build
+  (`waveshare_rp2040_touch_lcd_1_28`) exposes `LCD_*` / `IMU_*` aliases —
+  **no** `board.SPI()` / `board.I2C()`.
+- **Panel init:** Waveshare full GC9A01A sequence in `drivers/display/gc9a01.py`
+  with **MADCTL `0x98`** and **COLMOD `0x05`**. Short Adafruit-style init +
+  BusDisplay’s post-init COLMOD **`0x55`** → backlight on, **no pixels**.
+  Reinforce `0x36`/`0x3A` after construct.
+- **Backlight:** sticky **GPIO** (not PWM). PWM/BL dies across soft-reset and
+  looks like a blank panel.
+- **Touch:** CST816 family @ `0x15` on I2C1 **SDA=6 / SCL=7** (CP:
+  `IMU_SDA`/`IMU_SCL`); RST=GP22, IRQ=GP21 (polled). MP: `cst8xx.CST8XX`;
+  CP: `drivers/touch/circuitpython/cst816.py`.
+- **Flash / USB:** RP2040 ROM UF2 bootloader (`RPI-RP2`). Example unit serial
+  `E462A052C73E4A29`. MicroPython `RPI_PICO` → CDC `VID_2E8A`/`PID_0005`;
+  CircuitPython board UF2 → `PID_1057` + **CIRCUITPY**. Adafruit TinyUF2
+  does **not** ship RP2040 builds (ROM UF2 only).
+- **displayif notes:** native `spibus` `SPI.init` must **not** re-pass
+  sck/mosi/miso on **rp2** (`extra keyword arguments given`); pin kwargs are
+  ESP-only. Same guard in Python `drivers/bus/spibus.py`.
+- **Demos:** LVGL/`lv_test_timer` is too RAM-heavy on this board. Prefer
+  `src/examples/simon.py` (MP graphics + eventsys) or
+  `src/examples/circuitpython/simon_waveshare_rp2040_touch_lcd_1_28.py`
+  (standalone CP). Soft-reset / USB attach after heavy SPI init can wedge
+  CDC — prefer cold boot / power cycle for recovery; keep `boot.py`
+  USB-settle + try/except if auto-launching Simon.
+- **Setup:** mip / `/setup` the matching `package.json`. MP notes: prefer
+  firmware-native displayif `spibus` when present; otherwise Python
+  `spibus.py` with the rp2 pin-kwargs fix.
+
+### Adafruit Metro M7 + 2.8″ TFT Touch Shield (cap, product 1947)
+
+- **board_config title:** `Metro M7 + Adafruit 2.8" TFT Touch Shield (cap) product 1947`
+- **Dir:** `board_configs/busdisplay/spi/metro_m7_tft_touch_shield_1947` (MP;
+  package `v0.2`)
+- **Resolution:** 240×320 ILI9341, `bgr=True`, `reverse_bytes_in_word=True`,
+  `rotation=0`
+- **Shield SPI jumpers (one toggle in board_config):** `USE_SOFTSPI`
+  - **`True` (default bring-up):** solder **11/SO/SI** (Arduino D11–D13),
+    **cut ICSP** → `SPIBus(soft=True, sck="D13", mosi="D11", miso="D12",
+    dc="D9", cs="D10")` @ 2 MHz. Metro **cannot** remap `machine.SPI(0)` onto
+    D11–D13 (`extra keyword arguments given`).
+  - **`False`:** solder **ICSP**, cut 11/SO/SI → `SPIBus(id=0, dc="D9",
+    cs="D10")` @ 24 MHz (LPSPI1 / ICSP = AirLift SPI bus).
+- **Pins:** CS=`D10`, DC=`D9`; hold `ESP_CS` and SD `D4` high when unused.
+  Named pins (`"D9"`) work; numeric GPIO ids often fail on mimxrt.
+- **Touch:** FT6206 @ `0x38` on `I2C(0)`; `touch_rotation_table = (6, 3, 0, 5)`.
+  `runtime = None` — OCRAM heap ~**64 KiB**; eventsys / LVGL / full `.py`
+  stacks do not fit.
+- **AirLift (onboard NINA):** MicroPython `network.WLAN` = `nina` over
+  **SPI(0)** @ 8 MHz (`ESP_CS` / `ESP_BUSY` / `ESP_RESET` / `ESP_GPIO0`).
+  Join + DNS work; **TCP sockets failed** with `fd=-1` / `OSError: 0` on
+  nina-fw **1.7.4** (ssl/mip modules present but unusable). On
+  **CircuitPython 10.2.1** the same AirLift works via frozen
+  `adafruit_esp32spi` + `adafruit_requests` (HTTP/HTTPS OK). SoftSPI display
+  on D11–D13 coexists with AirLift; HW display SPI0 **shares** the AirLift bus.
+- **Flash / USB:** TinyUF2 **`METROM7BOOT`**. Custom MP build:
+  displayif + graphics (+ optional LVGL), `bundle-networking`,
+  `MICROPY_HW_FLASH_VFS_OFFSET=0x180000` (moving VFS **wipes** `/flash` —
+  redeploy board_config / secrets). Example CDC after MP: `VID_F055`/`PID_9802`
+  (e.g. `COM12`); after CP board UF2: Adafruit `VID_239A`/`PID_80E2` +
+  **CIRCUITPY** (e.g. `COM60`).
+- **displayif notes:** native `spibus` accepts pin **int / name str / Pin** and
+  **`soft=True`** (SoftSPI; skip `init()` on each send). Firmware must include
+  that SoftSPI path (`SPIBus loaded (SoftSPI)`).
+- **CircuitPython caveats (same shield wiring):** `displaysys` **MemoryError**
+  on ~35 KiB free heap. `bitbangio.SPI.write` → `OSError: 5`; GPIO SoftSPI
+  paint works but is very slow. Prefer MP + native SoftSPI for pydisplay;
+  CP is fine for AirLift networking.
+- **Demos:** stripes / `ili9341` over SoftSPI; Simon needs a slim path (no
+  eventsys). LVGL unlikely without frozen/slim runtime.
+- **Setup:** mip / `/setup` `metro_m7_tft_touch_shield_1947` after WiFi is up
+  (or `mpftp put` over serial if NINA sockets are still broken).
+
 ---
 
 ## DotClock knobs (cross-cutting)
@@ -186,6 +273,7 @@ already sets `refresh_cb=display_drv.show`.
 ---
 
 *Seeded 2026-07-20 from the pydisplay + displayif bring-up chat; T-Embed /
-T-HMI busdisplay notes expanded 2026-07-21. Add a row when a new display board
-is verified; link inventory fixture numbers when Detect has captured the
-silicon.*
+T-HMI busdisplay notes expanded 2026-07-21; Waveshare RP2040-Touch-LCD-1.28
+added 2026-07-21; Adafruit Metro M7 + TFT Touch Shield 1947 added 2026-07-21.
+Add a row when a new display board is verified; link inventory fixture numbers
+when Detect has captured the silicon.*
