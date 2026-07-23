@@ -13,6 +13,9 @@
     remoteEntries: [],
     localSelected: new Set(),
     remoteSelected: new Set(),
+    /** Anchor entry name for Shift+Click range select (per pane). */
+    localAnchor: null,
+    remoteAnchor: null,
     focus: "local",
   };
 
@@ -148,12 +151,53 @@
 
   function selectOnContext(which, name) {
     const selected = which === "local" ? state.localSelected : state.remoteSelected;
+    const anchorKey = which === "local" ? "localAnchor" : "remoteAnchor";
     state.focus = which;
     if (!selected.has(name)) {
       selected.clear();
       selected.add(name);
+      state[anchorKey] = name;
       renderList(which);
     }
+  }
+
+  /** Plain / Ctrl / Shift click selection (explorer-style). */
+  function applyRowClick(which, name, ev) {
+    const selected = which === "local" ? state.localSelected : state.remoteSelected;
+    const entries = which === "local" ? state.localEntries : state.remoteEntries;
+    const anchorKey = which === "local" ? "localAnchor" : "remoteAnchor";
+    state.focus = which;
+    const idx = entries.findIndex((e) => e.name === name);
+    if (idx < 0) {
+      return;
+    }
+
+    if (ev.shiftKey && state[anchorKey] != null) {
+      let anchorIdx = entries.findIndex((e) => e.name === state[anchorKey]);
+      if (anchorIdx < 0) {
+        anchorIdx = idx;
+      }
+      const from = Math.min(anchorIdx, idx);
+      const to = Math.max(anchorIdx, idx);
+      if (!ev.ctrlKey && !ev.metaKey) {
+        selected.clear();
+      }
+      for (let i = from; i <= to; i++) {
+        selected.add(entries[i].name);
+      }
+    } else if (ev.ctrlKey || ev.metaKey) {
+      if (selected.has(name)) {
+        selected.delete(name);
+      } else {
+        selected.add(name);
+      }
+      state[anchorKey] = name;
+    } else {
+      selected.clear();
+      selected.add(name);
+      state[anchorKey] = name;
+    }
+    renderList(which);
   }
 
   function doUpload() {
@@ -388,16 +432,7 @@
       row.querySelector(".size").textContent = fmtSize(e.size || 0, e.isDir);
 
       row.addEventListener("click", (ev) => {
-        state.focus = which;
-        if (!ev.ctrlKey && !ev.metaKey) {
-          selected.clear();
-        }
-        if (selected.has(e.name)) {
-          selected.delete(e.name);
-        } else {
-          selected.add(e.name);
-        }
-        renderList(which);
+        applyRowClick(which, e.name, ev);
       });
 
       row.addEventListener("dblclick", () => {
@@ -426,6 +461,11 @@
         if (!selected.has(e.name)) {
           selected.clear();
           selected.add(e.name);
+          if (which === "local") {
+            state.localAnchor = e.name;
+          } else {
+            state.remoteAnchor = e.name;
+          }
           renderList(which);
         }
         const paths =
@@ -803,9 +843,11 @@
         if (msg.localEntries) {
           state.localEntries = msg.localEntries;
           state.localSelected.clear();
+          state.localAnchor = null;
         }
         state.remoteEntries = Array.isArray(msg.remoteEntries) ? msg.remoteEntries : [];
         state.remoteSelected.clear();
+        state.remoteAnchor = null;
         updateChrome();
         renderList("local");
         renderList("remote");

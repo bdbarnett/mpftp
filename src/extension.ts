@@ -467,6 +467,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     updateStatus();
     if (getConfig().openEditorOnConnect && !meta?.silent) {
       ftpProvider.openInEditor();
+      openRepl(bridge, activity);
     }
   });
   bridge.on("disconnected", updateStatus);

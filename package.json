@@ -225,7 +225,7 @@
         "mpftp.openEditorOnConnect": {
           "type": "boolean",
           "default": true,
-          "description": "When a board connects, open File Transfer as an editor tab (instead of only focusing the panel view)."
+          "description": "When a board connects, open File Transfer as an editor tab and the REPL terminal (skipped for silent reconnects)."
         },
         "mpftp.workspacePath": {
           "type": "string",
