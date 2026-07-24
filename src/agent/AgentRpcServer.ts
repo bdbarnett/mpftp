@@ -140,6 +140,7 @@ export class AgentRpcServer {
         device: this.bridge.connectedDevice || null,
         runtime: this.bridge.runtime || null,
         rpc: this.path,
+        session_id: this.bridge.sessionId,
         activityLog: this.activity.activityPath,
         replLog: this.activity.replPath,
       };
@@ -147,6 +148,7 @@ export class AgentRpcServer {
     if (method === "agent_paths") {
       return {
         rpc: this.path,
+        session_id: this.bridge.sessionId,
         activityLog: this.activity.activityPath,
         replLog: this.activity.replPath,
         home: this.activity.dir,

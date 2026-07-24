@@ -15,15 +15,20 @@ download/build/flash stays MicroPython-only.
 | `<workspace>/.mpftp/rpc.port` | **Preferred** — RPC for the Cursor window that has this workspace open |
 | `~/.mpftp/rpc.port` | Fallback when cwd has no workspace `.mpftp/rpc.port` |
 | `MPFTP_RPC` env | Override (`127.0.0.1:7430`) if multiple windows compete |
+| `~/.mpftp/sessions/<id>.pid` | Per-window sidecar claim (`MPFTP_SESSION_ID`); windows do not kill each other |
 | `~/.mpftp/activity.log` | NDJSON of connects, transfers, RPC, errors |
 | `~/.mpftp/repl.log` | REPL I/O when a REPL is open |
 | `<workspace>/.mpftp/activity.log` | Same activity mirrored into the open workspace |
 
 The Cursor/VS Code window must have **mpftp loaded** for the socket to exist.
-With **two Cursor windows**, each has its own Agent RPC; CLI/`./scripts/mpftp`
-prefer the workspace `.mpftp/rpc.port` under your cwd so File Transfer + REPL
-open in **that** window. Only one window can own a given COM port — the other
-status bar should stay disconnected (not a shared session).
+
+**Concurrent two boards (two windows):** each window runs its own sidecar
+(`MPFTP_SESSION_ID` / `~/.mpftp/sessions/<id>.pid`) and Agent RPC. Agents should
+use a cwd inside the matching workspace so CLI hits `<workspace>/.mpftp/rpc.port`.
+Connect each window to a **different** COM port. The same COM remains exclusive
+(second connect gets port busy). Reloading one window must not kill the other’s
+sidecar.
+
 On WSL, serial and esp32 flash use **Windows Python** so `COM` ports work.
 Install host packages on that interpreter: `mpremote`, and **`circup`** for
 CircuitPython library installs (`python.exe -m pip install mpremote circup`).
@@ -198,7 +203,8 @@ Details: [user guide — Autosize](docs/user-guide.md#esp32-partition-autosize).
 
 | Symptom | Agent action |
 |---------|----------------|
-| Port busy / exclusive lock | Disconnect UI tools; `./scripts/mpftp disconnect`; kill stale `sidecar.py` / `python.exe` holding the COM port |
+| Port busy / exclusive lock | Another mpftp window may own that COM — disconnect there, or pick the other board. Also close Thonny/serial monitors. Do not expect two windows on one COM |
+| Two windows / two boards | Use distinct COM ports; run CLI from each workspace cwd (workspace `rpc.port`). Check `mpftp status` → distinct `rpc` + `session_id` |
 | `Access is denied` / `transport_dead` after hung `exec`/`run` | Sidecar should release the COM handle automatically; `disconnect` then `resume`/`connect`. If still busy: reload extension window, then replug USB only as last resort ([mpftp#3](https://github.com/bdbarnett/mpftp/issues/3)) |
 | `timeout waiting for first EOF` | Board still running (UI loop). Use `run` without `--follow` / `exec --no-follow`, then `interrupt` or `soft-reset` |
 | Soft-reset left UI dead after deploy | Expected: soft-reset skips `main.py`. Use `soft-reboot` or `hard-reset` to run startup |

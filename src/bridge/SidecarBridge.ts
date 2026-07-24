@@ -52,14 +52,18 @@ export class SidecarBridge extends EventEmitter {
   private _connectedDevice: string | undefined;
   private _lastDevice: string | undefined;
   private _runtime: "micropython" | "circuitpython" | undefined;
+  /** Cursor/VS Code window session — scopes sidecar pid claim so windows coexist. */
+  readonly sessionId: string;
 
   constructor(
     private readonly extensionPath: string,
     private readonly log: vscode.OutputChannel,
     private readonly activity?: ActivityLog,
-    private readonly globalState?: vscode.Memento
+    private readonly globalState?: vscode.Memento,
+    sessionId?: string
   ) {
     super();
+    this.sessionId = (sessionId || vscode.env.sessionId || `mpftp-${Date.now()}`).trim();
   }
 
   get connectedDevice(): string | undefined {
@@ -122,8 +126,8 @@ export class SidecarBridge extends EventEmitter {
   }
 
   private async start(): Promise<void> {
-    // Drop any prior child handle before spawn. The new sidecar.py claims
-    // ~/.mpftp/sidecar.pid and force-kills orphans that still hold COM ports.
+    // Drop only this window's prior child. Sidecar claims
+    // ~/.mpftp/sessions/<sessionId>.pid and does not kill other windows.
     if (this.proc && !this.proc.killed) {
       await this.killSidecarProcess(this.proc.pid);
       this.proc = undefined;
@@ -133,15 +137,21 @@ export class SidecarBridge extends EventEmitter {
     const python = resolvePython(this.extensionPath, cfg.pythonPath);
     const scriptLinux = path.join(this.extensionPath, "python", "sidecar.py");
     const script = pathForPythonProcess(python, scriptLinux);
-    this.log.appendLine(`[mpftp] starting sidecar: ${python} ${script}`);
+    this.log.appendLine(
+      `[mpftp] starting sidecar session=${this.sessionId}: ${python} ${script}`
+    );
     this.activity?.event("sidecar_start", {
       message: `${python} ${script}`,
-      data: { python, script },
+      data: { python, script, sessionId: this.sessionId },
     });
 
     this.proc = spawn(python, [script], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: "1",
+        MPFTP_SESSION_ID: this.sessionId,
+      },
       windowsHide: true,
     });
 

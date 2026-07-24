@@ -228,8 +228,34 @@ def _mpftp_dir() -> Path:
     return d
 
 
-def _sidecar_pid_path() -> Path:
+def sanitize_session_id(raw: str) -> str:
+    """Filesystem-safe session id for ``~/.mpftp/sessions/<id>.pid``."""
+    s = "".join(c if c.isalnum() or c in "._-" else "_" for c in (raw or "").strip())
+    s = s.strip("._-") or "session"
+    return s[:120]
+
+
+def resolve_session_id() -> str:
+    """Session id from env (extension) or a standalone one-shot id."""
+    env = (os.environ.get("MPFTP_SESSION_ID") or "").strip()
+    if env:
+        return sanitize_session_id(env)
+    return sanitize_session_id(f"standalone-{os.getpid()}")
+
+
+def _sessions_dir() -> Path:
+    d = _mpftp_dir() / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _legacy_sidecar_pid_path() -> Path:
     return _mpftp_dir() / "sidecar.pid"
+
+
+def session_pid_path(session_id: Optional[str] = None) -> Path:
+    sid = sanitize_session_id(session_id or resolve_session_id())
+    return _sessions_dir() / f"{sid}.pid"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -270,93 +296,83 @@ def _force_kill_pid(pid: int) -> None:
         pass
 
 
-def _iter_sidecar_pids_win() -> list[int]:
-    """Find other Windows python processes running this sidecar script."""
-    import subprocess
-
-    script_marker = "sidecar.py"
-    my_pid = os.getpid()
+def _read_pid_file(path: Path) -> int:
     try:
-        out = subprocess.check_output(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-Command",
-                "Get-CimInstance Win32_Process | "
-                "Where-Object { $_.CommandLine -like '*sidecar.py*' "
-                "-and $_.CommandLine -like '*mpftp*' } | "
-                "Select-Object -ExpandProperty ProcessId",
-            ],
-            stderr=subprocess.DEVNULL,
-            timeout=8,
-        ).decode("utf-8", "replace")
+        return int(path.read_text(encoding="utf-8").strip())
     except Exception:
-        return []
-    pids: list[int] = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line.isdigit():
+        return 0
+
+
+def reap_dead_session_pid_files() -> list[str]:
+    """Unlink ``sessions/*.pid`` whose process is gone (never kill live peers)."""
+    removed: list[str] = []
+    try:
+        entries = list(_sessions_dir().glob("*.pid"))
+    except OSError:
+        return removed
+    for path in entries:
+        pid = _read_pid_file(path)
+        if pid and _pid_alive(pid):
             continue
-        pid = int(line)
-        if pid != my_pid:
-            pids.append(pid)
-    # Prefer marker match even if mpftp not in command line (WSL path forms).
-    if not pids:
         try:
-            out = subprocess.check_output(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-Command",
-                    f"Get-CimInstance Win32_Process | "
-                    f"Where-Object {{ $_.CommandLine -like '*{script_marker}*' "
-                    f"-and $_.Name -match 'python' }} | "
-                    f"Select-Object -ExpandProperty ProcessId",
-                ],
-                stderr=subprocess.DEVNULL,
-                timeout=8,
-            ).decode("utf-8", "replace")
-            for line in out.splitlines():
-                line = line.strip()
-                if line.isdigit() and int(line) != my_pid:
-                    pids.append(int(line))
-        except Exception:
+            path.unlink()
+            removed.append(path.name)
+        except OSError:
             pass
-    return pids
+    return removed
 
 
-def cleanup_stale_sidecars() -> list[int]:
-    """Kill orphaned sidecar processes that would keep COM ports locked."""
+def migrate_legacy_sidecar_pid() -> list[int]:
+    """One-shot: kill legacy ``~/.mpftp/sidecar.pid`` if still live, then delete it."""
     killed: list[int] = []
-    pid_path = _sidecar_pid_path()
-    try:
-        prev = int(pid_path.read_text(encoding="utf-8").strip())
-    except Exception:
-        prev = 0
+    path = _legacy_sidecar_pid_path()
+    if not path.exists():
+        return killed
+    prev = _read_pid_file(path)
     if prev and prev != os.getpid() and _pid_alive(prev):
         _force_kill_pid(prev)
         killed.append(prev)
-    if sys.platform == "win32":
-        for pid in _iter_sidecar_pids_win():
-            if pid not in killed:
-                _force_kill_pid(pid)
-                killed.append(pid)
     try:
-        if pid_path.exists():
-            pid_path.unlink()
+        path.unlink()
     except OSError:
         pass
     return killed
 
 
-def claim_sidecar_pid() -> None:
-    _sidecar_pid_path().write_text(f"{os.getpid()}\n", encoding="utf-8")
+def cleanup_stale_sidecars(session_id: Optional[str] = None) -> list[int]:
+    """Kill only this session's prior sidecar; never mass-kill other windows.
 
-
-def release_sidecar_pid() -> None:
-    path = _sidecar_pid_path()
+    1. Same-session pid file → kill live orphan (window reload).
+    2. Reap dead ``sessions/*.pid`` entries (no kill of live foreign sessions).
+    3. Migrate legacy global ``sidecar.pid`` once.
+    """
+    killed: list[int] = []
+    sid = sanitize_session_id(session_id or resolve_session_id())
+    pid_path = session_pid_path(sid)
+    prev = _read_pid_file(pid_path)
+    if prev and prev != os.getpid() and _pid_alive(prev):
+        _force_kill_pid(prev)
+        killed.append(prev)
     try:
-        cur = int(path.read_text(encoding="utf-8").strip())
+        if pid_path.exists():
+            pid_path.unlink()
+    except OSError:
+        pass
+    reap_dead_session_pid_files()
+    killed.extend(migrate_legacy_sidecar_pid())
+    return killed
+
+
+def claim_sidecar_pid(session_id: Optional[str] = None) -> Path:
+    path = session_pid_path(session_id)
+    path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    return path
+
+
+def release_sidecar_pid(session_id: Optional[str] = None) -> None:
+    path = session_pid_path(session_id)
+    try:
+        cur = _read_pid_file(path)
     except Exception:
         return
     if cur == os.getpid():
@@ -909,8 +925,9 @@ class Session:
         if locked:
             return (
                 f"failed to open {device}: port is busy or locked. "
-                f"Close Thonny, a serial monitor, another mpftp session, or any tool "
-                f"holding the port, then try again. ({raw})"
+                f"Another Cursor/mpftp window may already own this COM port "
+                f"(one board per session), or Thonny/a serial monitor is holding it. "
+                f"Disconnect there, then try again. ({raw})"
             )
         return f"failed to access {device}: {raw}"
 
@@ -2908,7 +2925,12 @@ print(repr(rows))
 SESSION = Session()
 
 METHODS = {
-    "ping": lambda _p: {"pong": True, "pid": os.getpid(), "platform": sys.platform},
+    "ping": lambda _p: {
+        "pong": True,
+        "pid": os.getpid(),
+        "platform": sys.platform,
+        "session_id": resolve_session_id(),
+    },
     "list_ports": lambda _p: SESSION.list_ports(),
     "connect": lambda p: SESSION.connect(p["device"], int(p.get("baud", 115200))),
     "disconnect": lambda _p: (SESSION.disconnect() or {"ok": True}),
@@ -2978,10 +3000,16 @@ METHODS = {
 def main() -> None:
     import atexit
 
-    killed = cleanup_stale_sidecars()
-    claim_sidecar_pid()
-    atexit.register(release_sidecar_pid)
-    ready: dict[str, Any] = {"version": 1, "pid": os.getpid()}
+    session_id = resolve_session_id()
+    os.environ["MPFTP_SESSION_ID"] = session_id
+    killed = cleanup_stale_sidecars(session_id)
+    claim_sidecar_pid(session_id)
+    atexit.register(lambda: release_sidecar_pid(session_id))
+    ready: dict[str, Any] = {
+        "version": 1,
+        "pid": os.getpid(),
+        "session_id": session_id,
+    }
     if killed:
         ready["killed_stale"] = killed
     _notify("ready", ready)

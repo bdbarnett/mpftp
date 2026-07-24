@@ -24,7 +24,13 @@ let statusBar: vscode.StatusBarItem;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   log = vscode.window.createOutputChannel("mpftp");
   activity = new ActivityLog();
-  bridge = new SidecarBridge(context.extensionPath, log, activity, context.globalState);
+  bridge = new SidecarBridge(
+    context.extensionPath,
+    log,
+    activity,
+    context.globalState,
+    vscode.env.sessionId
+  );
   bridge.seedLastDeviceFromGlobalState();
   agentRpc = new AgentRpcServer(bridge, activity, context.extensionPath);
   agentRpc.start();
@@ -491,12 +497,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const host = detectHost();
   const py = resolvePython(context.extensionPath, getConfig().pythonPath);
   log.appendLine(`[mpftp] host=${host} python=${py}`);
+  log.appendLine(`[mpftp] session: ${bridge.sessionId}`);
   log.appendLine(`[mpftp] agent RPC: ${agentRpc.path}`);
   log.appendLine(`[mpftp] activity log: ${activity.activityPath}`);
   log.appendLine(`[mpftp] repl log: ${activity.replPath}`);
   activity.event("activate", {
     message: "extension activated",
-    data: { host, python: py, rpc: agentRpc.path },
+    data: {
+      host,
+      python: py,
+      rpc: agentRpc.path,
+      sessionId: bridge.sessionId,
+    },
   });
   updateStatus();
 
@@ -563,18 +575,19 @@ function showPortQuickPick(
 }
 
 function updateStatus(): void {
+  const session = bridge?.sessionId ? `session ${bridge.sessionId.slice(0, 8)}…` : "";
   if (bridge.connected) {
     const rt = bridge.runtime === "circuitpython" ? "CP" : "MP";
     statusBar.text = `$(check) mpftp: ${bridge.connectedDevice} (${rt})`;
     statusBar.tooltip =
       `mpftp connected in this window (${bridge.runtime || "micropython"}) — ` +
-      `RPC ${agentRpc?.path || "?"}. Other Cursor windows should stay disconnected ` +
-      `(one COM session). Click for actions.`;
+      `RPC ${agentRpc?.path || "?"} · ${session}. ` +
+      `Other windows may own a different board concurrently; the same COM is exclusive.`;
   } else {
     statusBar.text = "$(plug) mpftp";
     statusBar.tooltip =
-      "Connect to MicroPython or CircuitPython board (this window). " +
-      "Not connected here — another window may own the port.";
+      `Connect to a board in this window (RPC ${agentRpc?.path || "?"} · ${session}). ` +
+      `Not connected here — another window may own a different COM port.`;
   }
 }
 
