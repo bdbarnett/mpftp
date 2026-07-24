@@ -228,6 +228,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void vscode.window.showInformationMessage("Soft reset sent (main.py not run)");
       }
     }),
+    vscode.commands.registerCommand("mpftp.softReboot", async () => {
+      if (!(await ensureConnected())) {
+        return;
+      }
+      const res = await bridge.request<{ runtime?: string; note?: string }>("soft_reboot");
+      const runtime = res.runtime || bridge.runtime || "micropython";
+      void vscode.window.showInformationMessage(
+        runtime === "circuitpython"
+          ? "Soft reboot sent (Ctrl-D; code.py will run)"
+          : "Soft reboot sent (Ctrl-D; main.py will run)"
+      );
+    }),
     vscode.commands.registerCommand("mpftp.hardReset", async () => {
       if (!(await ensureConnected())) {
         return;
@@ -466,6 +478,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   bridge.on("connected", (_device?: string, meta?: { silent?: boolean }) => {
     updateStatus();
     if (getConfig().openEditorOnConnect && !meta?.silent) {
+      // Open UI only in this extension host / window — the one whose Agent RPC
+      // handled the connect. Agents should hit <workspace>/.mpftp/rpc.port so
+      // File Transfer + REPL appear beside the chat that issued connect, not
+      // in a different Cursor window that merely holds ~/.mpftp/rpc.port.
       ftpProvider.openInEditor();
       openRepl(bridge, activity);
     }
@@ -550,10 +566,15 @@ function updateStatus(): void {
   if (bridge.connected) {
     const rt = bridge.runtime === "circuitpython" ? "CP" : "MP";
     statusBar.text = `$(check) mpftp: ${bridge.connectedDevice} (${rt})`;
-    statusBar.tooltip = `mpftp connected (${bridge.runtime || "micropython"}) — click for actions`;
+    statusBar.tooltip =
+      `mpftp connected in this window (${bridge.runtime || "micropython"}) — ` +
+      `RPC ${agentRpc?.path || "?"}. Other Cursor windows should stay disconnected ` +
+      `(one COM session). Click for actions.`;
   } else {
     statusBar.text = "$(plug) mpftp";
-    statusBar.tooltip = "Connect to MicroPython or CircuitPython board";
+    statusBar.tooltip =
+      "Connect to MicroPython or CircuitPython board (this window). " +
+      "Not connected here — another window may own the port.";
   }
 }
 

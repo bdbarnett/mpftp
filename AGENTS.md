@@ -12,12 +12,18 @@ download/build/flash stays MicroPython-only.
 
 | Path | Purpose |
 |------|---------|
-| `~/.mpftp/rpc.port` | Usually `127.0.0.1:7429` — JSON-line RPC to the live extension |
+| `<workspace>/.mpftp/rpc.port` | **Preferred** — RPC for the Cursor window that has this workspace open |
+| `~/.mpftp/rpc.port` | Fallback when cwd has no workspace `.mpftp/rpc.port` |
+| `MPFTP_RPC` env | Override (`127.0.0.1:7430`) if multiple windows compete |
 | `~/.mpftp/activity.log` | NDJSON of connects, transfers, RPC, errors |
 | `~/.mpftp/repl.log` | REPL I/O when a REPL is open |
 | `<workspace>/.mpftp/activity.log` | Same activity mirrored into the open workspace |
 
 The Cursor/VS Code window must have **mpftp loaded** for the socket to exist.
+With **two Cursor windows**, each has its own Agent RPC; CLI/`./scripts/mpftp`
+prefer the workspace `.mpftp/rpc.port` under your cwd so File Transfer + REPL
+open in **that** window. Only one window can own a given COM port — the other
+status bar should stay disconnected (not a shared session).
 On WSL, serial and esp32 flash use **Windows Python** so `COM` ports work.
 Install host packages on that interpreter: `mpremote`, and **`circup`** for
 CircuitPython library installs (`python.exe -m pip install mpremote circup`).
@@ -47,10 +53,10 @@ Connect **interrupts** any running program and enters raw REPL. Runtime is
 detected from `sys.implementation.name` and returned as `runtime`
 (`micropython` | `circuitpython`).
 
-| Runtime | Clean / Soft Reset |
-|---------|-------------------|
-| MicroPython | Raw soft-reset — skips `main.py` |
-| CircuitPython | Friendly↔raw toggle — **does not** Ctrl-D (that would run `code.py`) |
+| Runtime | `soft-reset` | `soft-reboot` |
+|---------|---------------|--------------|
+| MicroPython | Raw soft-reset — skips `main.py` | Friendly Ctrl-D — runs `main.py` |
+| CircuitPython | Friendly↔raw toggle — **does not** Ctrl-D | Ctrl-D — runs `code.py` |
 
 CircuitPython may show “Press any key to enter the REPL…”; mpftp sends a key
 before raw. Prefer CDC REPL ports (CDC2 data interfaces are filtered).
@@ -72,12 +78,15 @@ that must land intact. Startup script is usually `main.py` (MP) or `code.py` (CP
 ./scripts/mpftp mkdir /lib
 ./scripts/mpftp rm /junk.py
 ./scripts/mpftp eval '1+1'
-./scripts/mpftp exec 'import main'
-./scripts/mpftp run ./script.py             # local file via exec
+./scripts/mpftp exec 'print(1)'             # waits for EOF; use --no-follow for loops
+./scripts/mpftp run ./app.py                # default --no-follow (UI-safe)
+./scripts/mpftp run ./short.py --follow     # wait for script to finish
 ./scripts/mpftp interrupt                   # Ctrl-C; no reset
-./scripts/mpftp soft-reset                  # see table above
+./scripts/mpftp soft-reset                  # MP: skip main.py (see table)
+./scripts/mpftp soft-reboot                 # Ctrl-D; runs main.py / code.py
 ./scripts/mpftp hard-reset
-./scripts/mpftp mip github:org/repo         # MicroPython only
+./scripts/mpftp debug-tee COM50             # second port read-only (native USB CDC)
+./scripts/mpftp mip github:org/repo         # MicroPython only (default target /lib)
 ./scripts/mpftp circup adafruit_display_text  # CircuitPython only → /lib over serial
 ```
 
@@ -190,6 +199,10 @@ Details: [user guide — Autosize](docs/user-guide.md#esp32-partition-autosize).
 | Symptom | Agent action |
 |---------|----------------|
 | Port busy / exclusive lock | Disconnect UI tools; `./scripts/mpftp disconnect`; kill stale `sidecar.py` / `python.exe` holding the COM port |
+| `Access is denied` / `transport_dead` after hung `exec`/`run` | Sidecar should release the COM handle automatically; `disconnect` then `resume`/`connect`. If still busy: reload extension window, then replug USB only as last resort ([mpftp#3](https://github.com/bdbarnett/mpftp/issues/3)) |
+| `timeout waiting for first EOF` | Board still running (UI loop). Use `run` without `--follow` / `exec --no-follow`, then `interrupt` or `soft-reset` |
+| Soft-reset left UI dead after deploy | Expected: soft-reset skips `main.py`. Use `soft-reboot` or `hard-reset` to run startup |
+| Dual USB (UART + native CDC) | `mpftp ports` shows `role` (`repl` vs `cdc_debug`); control on UART, `debug-tee` on CDC |
 | `could not enter raw repl` after flash | Detect; erase + reflash MicroPython; corrupt FS boot loops block soft-reset |
 | Wrong board / no Wi-Fi on P4 | Detect + MicroPython hints; pick `C5_WIFI` / `C6_WIFI` explicitly if needed |
 | Build: required tree not found | Symlink under firmware workspace or set env (`IDF_PATH`, `EMSDK`, …); Locate… in UI |

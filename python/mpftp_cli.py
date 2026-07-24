@@ -16,7 +16,10 @@ Examples:
   mpftp eval '1+1'
   mpftp exec 'print(42)'
   mpftp interrupt
-  mpftp soft-reset
+  mpftp soft-reset     # MP: skip main.py
+  mpftp soft-reboot    # Ctrl-D; runs main.py / code.py
+  mpftp run script.py  # default --no-follow (UI-safe)
+  mpftp debug-tee COM50
   mpftp watch          # tail activity log
 """
 
@@ -57,15 +60,49 @@ def _linux_home() -> Path:
 HOME_MPFTP = _linux_home() / ".mpftp"
 # Also check Windows-side mirror when needed
 WIN_MPFTP = Path.home() / ".mpftp"
-RPC_PORT_FILES = [
-    HOME_MPFTP / "rpc.port",
-    HOME_MPFTP / "rpc.path",
-    Path.cwd() / ".mpftp" / "rpc.port",
-    WIN_MPFTP / "rpc.port",
-    WIN_MPFTP / "rpc.path",
-]
 ACTIVITY_LOG = HOME_MPFTP / "activity.log"
 REPL_LOG = HOME_MPFTP / "repl.log"
+
+
+def _parse_rpc_addr(text: str) -> Optional[tuple[str, int]]:
+    text = (text or "").strip()
+    if not text:
+        return None
+    # "127.0.0.1:7429" or legacy socket path
+    if ":" in text and not text.startswith("/"):
+        host, _, port_s = text.rpartition(":")
+        try:
+            return host.strip() or "127.0.0.1", int(port_s)
+        except ValueError:
+            return None
+    return None
+
+
+def _read_rpc_port_file(path: Path) -> Optional[tuple[str, int]]:
+    try:
+        if not path.is_file():
+            return None
+        return _parse_rpc_addr(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _workspace_rpc_port_files(start: Optional[Path] = None) -> list[Path]:
+    """``.mpftp/rpc.port`` from cwd upward (per-window / per-workspace RPC)."""
+    found: list[Path] = []
+    cur = (start or Path.cwd()).resolve()
+    seen: set[Path] = set()
+    for _ in range(24):
+        if cur in seen:
+            break
+        seen.add(cur)
+        cand = cur / ".mpftp" / "rpc.port"
+        if cand.is_file():
+            found.append(cand)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return found
 
 HERE = Path(__file__).resolve().parent
 SIDECAR = HERE / "sidecar.py"
@@ -78,20 +115,36 @@ def _die(msg: str, code: int = 1) -> None:
 
 
 def find_rpc_addr() -> Optional[tuple[str, int]]:
-    """Return (host, port) for the extension AgentRpcServer, if running."""
-    for f in RPC_PORT_FILES:
-        try:
-            if not f.is_file():
-                continue
-            text = f.read_text(encoding="utf-8").strip()
-            if not text:
-                continue
-            # "127.0.0.1:7429" or legacy socket path
-            if ":" in text and not text.startswith("/"):
-                host, _, port_s = text.rpartition(":")
-                return host.strip() or "127.0.0.1", int(port_s)
-        except Exception:
-            continue
+    """Return (host, port) for the extension AgentRpcServer, if running.
+
+    Preference order (so multi-window Cursor does not steal the wrong UI):
+
+    1. ``MPFTP_RPC`` env (``127.0.0.1:7429``)
+    2. ``<cwd>/.../.mpftp/rpc.port`` walking parents (workspace that owns the agent)
+    3. ``~/.mpftp/rpc.port`` home fallback (last writer among empty/global windows)
+    4. Probe default port 7429
+    """
+    env = (os.environ.get("MPFTP_RPC") or "").strip()
+    if env:
+        parsed = _parse_rpc_addr(env)
+        if parsed:
+            return parsed
+
+    for f in _workspace_rpc_port_files():
+        parsed = _read_rpc_port_file(f)
+        if parsed:
+            return parsed
+
+    for f in (
+        HOME_MPFTP / "rpc.port",
+        HOME_MPFTP / "rpc.path",
+        WIN_MPFTP / "rpc.port",
+        WIN_MPFTP / "rpc.path",
+    ):
+        parsed = _read_rpc_port_file(f)
+        if parsed:
+            return parsed
+
     # Probe default port
     try:
         with socket.create_connection(("127.0.0.1", 7429), timeout=0.3):
@@ -240,8 +293,11 @@ def out(obj: Any) -> None:
 
 def cmd_status(_: argparse.Namespace) -> None:
     addr = find_rpc_addr()
+    ws_ports = [str(p) for p in _workspace_rpc_port_files()]
     info = {
         "rpc": f"{addr[0]}:{addr[1]}" if addr else None,
+        "rpc_preference": "MPFTP_RPC > <cwd>/.mpftp/rpc.port > ~/.mpftp/rpc.port",
+        "workspace_rpc_port_files": ws_ports,
         "activity_log": str(ACTIVITY_LOG),
         "repl_log": str(REPL_LOG),
         "extension_running": bool(addr),
@@ -548,7 +604,8 @@ def cmd_exec(ns: argparse.Namespace) -> None:
     client, mode = get_client()
     try:
         ensure_device(client, ns.device, ns.baud)
-        out(client.call("exec", {"code": ns.code, "follow": True}))
+        follow = not bool(getattr(ns, "no_follow", False))
+        out(client.call("exec", {"code": ns.code, "follow": follow}))
     finally:
         if mode.startswith("sidecar"):
             client.close()
@@ -559,7 +616,9 @@ def cmd_run(ns: argparse.Namespace) -> None:
     client, mode = get_client()
     try:
         ensure_device(client, ns.device, ns.baud)
-        out(client.call("run_script", {"source": source, "follow": True}))
+        # Default no-follow so UI apps do not wedge the COM handle (mpftp#3).
+        follow = bool(getattr(ns, "follow", False))
+        out(client.call("run_script", {"source": source, "follow": follow}))
     finally:
         if mode.startswith("sidecar"):
             client.close()
@@ -585,6 +644,16 @@ def cmd_soft_reset(ns: argparse.Namespace) -> None:
             client.close()
 
 
+def cmd_soft_reboot(ns: argparse.Namespace) -> None:
+    client, mode = get_client()
+    try:
+        ensure_device(client, ns.device, ns.baud)
+        out(client.call("soft_reboot"))
+    finally:
+        if mode.startswith("sidecar"):
+            client.close()
+
+
 def cmd_hard_reset(ns: argparse.Namespace) -> None:
     client, mode = get_client()
     try:
@@ -593,6 +662,28 @@ def cmd_hard_reset(ns: argparse.Namespace) -> None:
     finally:
         if mode.startswith("sidecar"):
             client.close()
+
+
+def cmd_debug_tee(ns: argparse.Namespace) -> None:
+    client, mode = get_client()
+    try:
+        if ns.stop:
+            out(client.call("debug_tee_stop"))
+            return
+        if not ns.device_tee:
+            raise SystemExit("debug-tee requires a device (e.g. COM50) or --stop")
+        out(
+            client.call(
+                "debug_tee_start",
+                {
+                    "device": ns.device_tee,
+                    "baud": ns.baud,
+                    "log_path": ns.log_path,
+                },
+            )
+        )
+    finally:
+        client.close()
 
 
 def cmd_bootloader(ns: argparse.Namespace) -> None:
@@ -999,10 +1090,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     ex = sub.add_parser("exec", parents=[device_opts], help="Exec code on board")
     ex.add_argument("code")
+    ex.add_argument(
+        "--no-follow",
+        action="store_true",
+        help="Do not wait for raw-REPL EOF (use for long-running / UI code)",
+    )
     ex.set_defaults(func=cmd_exec)
 
-    run = sub.add_parser("run", parents=[device_opts], help="Run local script on board")
+    run = sub.add_parser(
+        "run",
+        parents=[device_opts],
+        help="Run local script on board (default: --no-follow)",
+    )
     run.add_argument("file")
+    run.add_argument(
+        "--follow",
+        action="store_true",
+        help="Wait for the script to finish (default is no-follow for UI apps)",
+    )
     run.set_defaults(func=cmd_run)
 
     sub.add_parser(
@@ -1015,10 +1120,29 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[device_opts],
         help="Soft reset (MP: skip main.py; CP: friendly↔raw, does not run code.py)",
     ).set_defaults(func=cmd_soft_reset)
+    sub.add_parser(
+        "soft-reboot",
+        parents=[device_opts],
+        help="Friendly Ctrl-D soft-reboot (runs main.py / code.py)",
+    ).set_defaults(func=cmd_soft_reboot)
     sub.add_parser("hard-reset", parents=[device_opts], help="Hard reset").set_defaults(func=cmd_hard_reset)
     sub.add_parser("bootloader", parents=[device_opts], help="Enter bootloader").set_defaults(
         func=cmd_bootloader
     )
+
+    dtee = sub.add_parser(
+        "debug-tee",
+        help="Read-only monitor on a second COM (e.g. ESP native USB CDC)",
+    )
+    dtee.add_argument(
+        "device_tee",
+        nargs="?",
+        help="Second serial device (required unless --stop)",
+    )
+    dtee.add_argument("--baud", type=int, default=115200)
+    dtee.add_argument("--log-path", help="Append raw bytes (default ~/.mpftp/debug-tee.log)")
+    dtee.add_argument("--stop", action="store_true", help="Stop an active debug tee")
+    dtee.set_defaults(func=cmd_debug_tee)
 
     rtc = sub.add_parser("rtc", parents=[device_opts], help="Get or set RTC")
     rtc.add_argument("--set", action="store_true", help="Set RTC from host")
@@ -1028,7 +1152,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     mip = sub.add_parser("mip", parents=[device_opts], help="mip install package(s) (MicroPython)")
     mip.add_argument("packages", nargs="+")
-    mip.add_argument("--target")
+    mip.add_argument(
+        "--target",
+        default="/lib",
+        help="Board install directory (default: /lib)",
+    )
     mip.add_argument("--no-mpy", action="store_true")
     mip.set_defaults(func=cmd_mip)
 

@@ -24,6 +24,8 @@ export type PortInfo = {
   hwid?: string | null;
   /** false for CircuitPython CDC2 (data) interfaces — not for REPL connect. */
   repl?: boolean;
+  /** Suggested role: repl | cdc_debug | uart_bridge | usb_cdc | data | serial */
+  role?: string;
 };
 
 export type DirEntry = {
@@ -212,6 +214,40 @@ export class SidecarBridge extends EventEmitter {
             source: "repl",
             message: msg.params?.message,
           });
+        } else if (msg.method === "transport_dead") {
+          const device = msg.params?.device as string | undefined;
+          const message = (msg.params?.message as string | undefined) || "serial handle released";
+          this.log.appendLine(`[transport_dead] ${device || "?"}: ${message}`);
+          this.activity?.event("transport_dead", {
+            source: "sidecar",
+            message,
+            data: { device },
+          });
+          // Handle was disposed in the sidecar; drop in-memory connected state
+          // so UI/CLI do not believe the session is still live (mpftp#3).
+          if (device) {
+            this._lastDevice = device;
+          }
+          this._connectedDevice = undefined;
+          this._runtime = undefined;
+          void vscode.commands.executeCommand("setContext", "mpftp.connected", false);
+          this.emit("disconnected");
+          this.emit("transport_dead", msg.params);
+        } else if (msg.method === "mip_progress") {
+          this.activity?.event("mip_progress", {
+            source: "sidecar",
+            message: String(msg.params?.package || ""),
+            data: msg.params,
+          });
+          this.emit("mip_progress", msg.params);
+        } else if (msg.method === "debug_tee_data") {
+          this.emit("debug_tee_data", msg.params);
+        } else if (msg.method === "debug_tee_error") {
+          this.activity?.event("debug_tee_error", {
+            source: "sidecar",
+            message: msg.params?.message,
+          });
+          this.emit("debug_tee_error", msg.params);
         }
         continue;
       }

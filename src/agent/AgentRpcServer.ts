@@ -81,20 +81,27 @@ export class AgentRpcServer {
 
   private writePortFiles(port: number): void {
     const line = `${HOST}:${port}\n`;
-    try {
-      fs.writeFileSync(path.join(os.homedir(), ".mpftp", "rpc.port"), line, "utf8");
-    } catch {
-      /* ignore */
-    }
-    const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (folder) {
+    // Always publish into every open workspace folder so agents whose cwd is
+    // that tree talk to *this* Cursor window (not whichever window last
+    // overwrote ~/.mpftp/rpc.port).
+    const folders = vscode.workspace.workspaceFolders || [];
+    for (const folder of folders) {
       try {
-        const dir = path.join(folder, ".mpftp");
+        const dir = path.join(folder.uri.fsPath, ".mpftp");
         fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(path.join(dir, "rpc.port"), line, "utf8");
       } catch {
         /* ignore */
       }
+    }
+    // Home fallback for empty windows / tools with no workspace cwd.
+    // CLI prefers workspace .mpftp/rpc.port when present.
+    try {
+      const homeDir = path.join(os.homedir(), ".mpftp");
+      fs.mkdirSync(homeDir, { recursive: true });
+      fs.writeFileSync(path.join(homeDir, "rpc.port"), line, "utf8");
+    } catch {
+      /* ignore */
     }
   }
 
@@ -330,6 +337,7 @@ export class AgentRpcServer {
   }
 
   dispose(): void {
+    const our = `${HOST}:${this.port}`;
     try {
       this.server?.close();
     } catch {
@@ -337,12 +345,28 @@ export class AgentRpcServer {
     }
     this.server = undefined;
     this.activity.clearRpcPath();
+    // Only remove home rpc.port if it still points at this window — another
+    // Cursor window may have become the home fallback.
     for (const f of [
       path.join(os.homedir(), ".mpftp", "rpc.port"),
       path.join(os.homedir(), ".mpftp", "rpc.path"),
     ]) {
       try {
-        fs.unlinkSync(f);
+        const cur = fs.readFileSync(f, "utf8").trim();
+        if (cur === our || cur.startsWith(our)) {
+          fs.unlinkSync(f);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    for (const folder of vscode.workspace.workspaceFolders || []) {
+      const f = path.join(folder.uri.fsPath, ".mpftp", "rpc.port");
+      try {
+        const cur = fs.readFileSync(f, "utf8").trim();
+        if (cur === our || cur.startsWith(our)) {
+          fs.unlinkSync(f);
+        }
       } catch {
         /* ignore */
       }

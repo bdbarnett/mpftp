@@ -75,6 +75,66 @@ def data_has_enter_repl_prompt(data: bytes) -> bool:
     return any(m in data for m in _CP_ENTER_REPL_MARKERS)
 
 
+def is_dead_serial_error(exc: BaseException) -> bool:
+    """True when the Windows/pyserial handle is unusable (Access denied, etc.)."""
+    msg = str(exc).lower()
+    needles = (
+        "access is denied",
+        "permissionerror",
+        "clearcommerror",
+        "getoverlappedresult",
+        "writefile failed",
+        "failed to access",
+        "device not configured",
+        "port is closed",
+        "working outside of",  # closed handle edge cases
+    )
+    return any(n in msg for n in needles)
+
+
+def is_eof_timeout_error(exc: BaseException) -> bool:
+    """True when mpremote follow-exec timed out waiting for raw-REPL EOF."""
+    msg = str(exc).lower()
+    return "timeout waiting for first eof" in msg or (
+        "timeout waiting for" in msg and "eof" in msg
+    )
+
+
+def friendly_exec_timeout_message(detail: str) -> str:
+    return (
+        f"{detail}\n"
+        "The board is still running (no raw-REPL EOF) or the serial handle wedged. "
+        "For UI apps / loops use --no-follow (or run_path follow=false). "
+        "Then interrupt, soft-reset, or hard-reset. "
+        "mpftp released the COM handle so Connect/Resume can reclaim the port."
+    )
+
+
+def annotate_port_roles(ports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add suggested ``role`` for dual-USB boards (UART bridge vs native CDC)."""
+    has_espressif = any(p.get("vid") == 0x303A for p in ports)
+    has_wch = any(p.get("vid") == 0x1A86 for p in ports)
+    for p in ports:
+        if not p.get("repl", True):
+            p["role"] = "data"
+            continue
+        vid = p.get("vid")
+        if has_espressif and has_wch:
+            if vid == 0x303A:
+                p["role"] = "cdc_debug"
+            elif vid == 0x1A86:
+                p["role"] = "repl"
+            else:
+                p["role"] = "serial"
+        elif vid == 0x303A:
+            p["role"] = "usb_cdc"
+        elif vid == 0x1A86:
+            p["role"] = "uart_bridge"
+        else:
+            p["role"] = "serial"
+    return ports
+
+
 def circup_boot_out_text(*, cpy_version: str, board_id: str = "unknown") -> str:
     """Minimal boot_out.txt so circup --path can resolve board/version."""
     ver = (cpy_version or "9.0.0").strip()
@@ -330,6 +390,11 @@ class Session:
         # Set when connect had to skip raw soft-reset because boot loops on a
         # corrupt filesystem (soft-reset would never re-enter raw REPL).
         self.filesystem_warning: Optional[str] = None
+        # Optional read-only second COM for debug prints (UART stays control).
+        self._tee_stop = threading.Event()
+        self._tee_thread: Optional[threading.Thread] = None
+        self._tee_serial: Any = None
+        self._tee_device: Optional[str] = None
 
     def list_ports(self) -> list[dict[str, Any]]:
         import serial.tools.list_ports
@@ -353,8 +418,19 @@ class Session:
                     "repl": repl,
                 }
             )
-        # REPL-capable first, then by device name; CDC2 (repl=false) last.
-        ports.sort(key=lambda x: (0 if x.get("repl", True) else 1, x["device"] or ""))
+        annotate_port_roles(ports)
+        # Prefer suggested REPL role, then other REPL-capable, CDC2/data last.
+        def _port_key(x: dict[str, Any]) -> tuple:
+            role = x.get("role") or ""
+            if role == "repl":
+                pri = 0
+            elif x.get("repl", True) and role != "data":
+                pri = 1
+            else:
+                pri = 2
+            return (pri, x["device"] or "")
+
+        ports.sort(key=_port_key)
         return ports
 
     def connect(
@@ -575,23 +651,32 @@ class Session:
         def ctrl_c() -> None:
             try:
                 serial.write(b"\r\x03")
-            except Exception:
-                pass
+            except Exception as e:
+                if is_dead_serial_error(e):
+                    raise RuntimeError(
+                        f"serial handle dead during interrupt: {e}"
+                    ) from e
 
         def poke_enter_repl_key(data: bytes) -> None:
             # CircuitPython waits for any key before showing the friendly REPL.
             if data_has_enter_repl_prompt(data):
                 try:
                     serial.write(b"\r")
-                except Exception:
-                    pass
+                except Exception as e:
+                    if is_dead_serial_error(e):
+                        raise RuntimeError(
+                            f"serial handle dead during REPL poke: {e}"
+                        ) from e
                 time.sleep(0.15)
                 try:
                     n = serial.inWaiting()
                     if n:
                         note_bytes(serial.read(n))
-                except Exception:
-                    pass
+                except Exception as e:
+                    if is_dead_serial_error(e):
+                        raise RuntimeError(
+                            f"serial handle dead during REPL poke: {e}"
+                        ) from e
 
         def interrupt_storm() -> None:
             # Thorough interrupt (see micropython#7867 / Thonny pipkin).
@@ -607,8 +692,19 @@ class Session:
                     data = serial.read(n)
                     note_bytes(data)
                     poke_enter_repl_key(data)
-            except Exception:
-                pass
+            except Exception as e:
+                if is_dead_serial_error(e):
+                    raise RuntimeError(
+                        f"serial handle dead during interrupt storm: {e}"
+                    ) from e
+
+        # Probe the handle before investing in the handshake.
+        try:
+            serial.inWaiting()
+        except Exception as e:
+            if is_dead_serial_error(e):
+                raise RuntimeError(f"serial handle dead: {e}") from e
+            raise
 
         # If a prior esptool session left the chip in ROM download mode, reboot
         # into firmware before trying the raw-REPL handshake.
@@ -829,6 +925,13 @@ class Session:
                 f"({detail}). Erase flash and reflash firmware "
                 f"(Firmware panel > Erase for MicroPython), then Connect again."
             )
+        if is_dead_serial_error(RuntimeError(detail)) or "serial handle dead" in detail.lower():
+            return (
+                f"could not take control of the board: serial handle is dead "
+                f"({detail}). mpftp should have released the COM port — "
+                f"Disconnect, then Connect/Resume. If it still says busy, "
+                f"reload the extension window or unplug/replug USB."
+            )
         return (
             f"could not take control of the board (interrupt/raw REPL failed): {detail}\n"
             f"Device is busy or does not respond. Your options:\n"
@@ -886,27 +989,102 @@ class Session:
 
     def disconnect(self) -> None:
         with self._lock:
-            self._stop_repl_reader()
-            if not self.transport:
-                self.runtime = None
-                return
+            self.debug_tee_stop()
+            self._force_close_transport(graceful=True)
+
+    def _force_close_transport(self, *, graceful: bool = False) -> Optional[str]:
+        """Dispose the serial handle. Preserves ``last_device`` for resume.
+
+        When ``graceful`` is True, attempt exit-raw / umount first. Always close
+        the underlying pyserial port so Windows COM locks are released.
+        """
+        self._stop_repl_reader()
+        t = self.transport
+        device = self.device or self.last_device
+        if device:
+            self.last_device = device
+        self.transport = None
+        self.device = None
+        self.runtime = None
+        self._repl_mode = False
+        self.filesystem_warning = None
+        if t is None:
+            return device
+        if graceful:
             try:
-                if getattr(self.transport, "mounted", False):
-                    if not self.transport.in_raw_repl:
-                        self.transport.enter_raw_repl(soft_reset=False)
-                    self.transport.umount_local()
-                if self.transport.in_raw_repl:
-                    self.transport.exit_raw_repl()
+                if getattr(t, "mounted", False):
+                    if not t.in_raw_repl:
+                        t.enter_raw_repl(soft_reset=False)
+                    t.umount_local()
+                if t.in_raw_repl:
+                    t.exit_raw_repl()
             except Exception:
                 pass
+        serial = getattr(t, "serial", None)
+        if serial is not None:
             try:
-                self.transport.close()
+                serial.close()
             except Exception:
                 pass
-            self.transport = None
-            self.device = None
-            self.runtime = None
-            self._repl_mode = False
+        try:
+            t.close()
+        except Exception:
+            pass
+        return device
+
+    def _release_dead_transport(self, reason: str) -> Optional[str]:
+        """Close a wedged handle and notify clients (mpftp#3 recovery)."""
+        device = self.device or self.last_device
+        _notify(
+            "transport_dead",
+            {"device": device, "message": reason, "pid": os.getpid()},
+        )
+        return self._force_close_transport(graceful=False)
+
+    def _reclaim_session(self, *, clean: bool = True) -> Any:
+        """Reopen ``last_device`` and take control after a dead-handle release."""
+        import time
+
+        from mpremote.transport_serial import SerialTransport
+
+        device = self.last_device
+        if not device:
+            raise RuntimeError(
+                "serial handle released but no last device to reclaim; Connect again"
+            )
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                t = SerialTransport(device, baudrate=self.baud or 115200)
+                self.transport = t
+                self.device = device
+                self.last_device = device
+                self._take_control(t, clean=clean, timeout_overall=20.0)
+                return t
+            except Exception as e:
+                last_err = e
+                self._force_close_transport(graceful=False)
+                time.sleep(0.35 * attempt)
+        detail = str(
+            last_err.args[0] if last_err and getattr(last_err, "args", None) else last_err
+        )
+        raise RuntimeError(
+            f"failed to reclaim {device} after serial handle death: {detail}"
+        ) from last_err
+
+    def _take_control_resilient(
+        self, t: Any, *, clean: bool = True, timeout_overall: float = 20.0
+    ) -> Any:
+        """``_take_control`` with one recycle+retry when the COM handle is dead."""
+        try:
+            self._take_control(t, clean=clean, timeout_overall=timeout_overall)
+            return self._require()
+        except Exception as e:
+            if not (is_dead_serial_error(e) or "serial handle dead" in str(e).lower()):
+                raise
+            self._release_dead_transport(str(e))
+            return self._reclaim_session(clean=clean)
+
     def _require(self):
         if not self.transport:
             raise RuntimeError("not connected")
@@ -914,12 +1092,18 @@ class Session:
 
     def _enter_raw(self, soft_reset: bool = False) -> None:
         t = self._require()
-        was_repl = self._repl_mode
-        if was_repl:
+        if self._repl_mode:
             self._stop_repl_reader()
         if not t.in_raw_repl:
-            t.enter_raw_repl(soft_reset=soft_reset)
-        return  # type: ignore[return-value]
+            # Prefer full take-control (interrupt storm) over a bare enter_raw —
+            # busy UI loops otherwise fail with "could not enter raw repl".
+            if soft_reset:
+                self._take_control_resilient(t, clean=True, timeout_overall=20.0)
+            else:
+                try:
+                    t.enter_raw_repl(soft_reset=False, timeout_overall=8.0)
+                except Exception:
+                    self._take_control_resilient(t, clean=False, timeout_overall=20.0)
 
     def _leave_raw_to_repl(self) -> None:
         t = self._require()
@@ -928,20 +1112,40 @@ class Session:
         if self._repl_mode:
             self._start_repl_reader()
 
+    def _restore_repl_if_wanted(self) -> None:
+        if not self._repl_mode or not self.transport:
+            return
+        try:
+            if self.transport.in_raw_repl:
+                self.transport.exit_raw_repl()
+        except Exception:
+            pass
+        self._start_repl_reader()
+
     def with_raw(self, fn, soft_reset: bool = False):
+        """Pause friendly REPL, run ``fn`` in raw REPL, then restore REPL."""
         with self._lock:
-            self._enter_raw(soft_reset=soft_reset)
+            was_repl = self._repl_mode
             try:
+                self._enter_raw(soft_reset=soft_reset)
                 return fn(self._require())
+            except Exception as e:
+                if is_eof_timeout_error(e):
+                    self._release_dead_transport(str(e))
+                    raise RuntimeError(friendly_exec_timeout_message(str(e))) from e
+                if is_dead_serial_error(e) or "serial handle dead" in str(e).lower():
+                    self._release_dead_transport(str(e))
+                    # One reclaim + retry for filesystem / short ops.
+                    self._reclaim_session(clean=False)
+                    self._enter_raw(soft_reset=soft_reset)
+                    return fn(self._require())
+                raise
             finally:
-                # Prefer staying ready for more fs ops; exit raw only if REPL wanted
-                if self._repl_mode:
-                    try:
-                        if self.transport and self.transport.in_raw_repl:
-                            self.transport.exit_raw_repl()
-                    except Exception:
-                        pass
-                    self._start_repl_reader()
+                if self.transport and (was_repl or self._repl_mode):
+                    self._repl_mode = True
+                    self._restore_repl_if_wanted()
+                elif not self.transport:
+                    self._repl_mode = False
 
     # --- filesystem ---
 
@@ -1219,7 +1423,7 @@ print(repr(_out))
                 text = out.decode("utf-8", "replace")
             else:
                 text = str(out)
-            return {"output": text}
+            return {"output": text, "followed": bool(follow)}
 
         return self.with_raw(op, soft_reset=False)
 
@@ -1230,13 +1434,16 @@ print(repr(_out))
 
         return self.with_raw(op)
 
-    def run_script(self, source: str, follow: bool = True) -> dict[str, Any]:
-        """Run source on the board after interrupt + raw soft-reset (skip main.py)."""
+    def _run_after_clean(
+        self, source: str, *, follow: bool, path: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Interrupt + raw soft-reset (skip main), then exec source."""
         with self._lock:
+            was_repl = self._repl_mode
             t = self._require()
             self._stop_repl_reader()
-            self._take_control(t, clean=True, timeout_overall=20.0)
             try:
+                t = self._take_control_resilient(t, clean=True, timeout_overall=20.0)
                 if follow:
                     out = t.exec(source)
                     if out is None:
@@ -1245,25 +1452,37 @@ print(repr(_out))
                         text = out.decode("utf-8", "replace")
                     else:
                         text = str(out)
-                    return {"output": text}
-                t.exec_raw_no_follow(source.encode())
-                try:
-                    if t.in_raw_repl:
-                        t.exit_raw_repl()
-                except Exception:
-                    pass
-                if self._repl_mode:
-                    self._start_repl_reader()
-                return {"output": ""}
-            except Exception:
-                if self._repl_mode:
+                    result: dict[str, Any] = {"output": text, "followed": True}
+                else:
+                    t.exec_raw_no_follow(source.encode())
                     try:
-                        if self.transport and self.transport.in_raw_repl:
-                            self.transport.exit_raw_repl()
+                        if t.in_raw_repl:
+                            t.exit_raw_repl()
                     except Exception:
                         pass
-                    self._start_repl_reader()
+                    result = {"output": "", "followed": False}
+                if path is not None:
+                    result["path"] = path
+                return result
+            except Exception as e:
+                if is_eof_timeout_error(e) or is_dead_serial_error(e):
+                    self._release_dead_transport(str(e))
+                    raise RuntimeError(friendly_exec_timeout_message(str(e))) from e
                 raise
+            finally:
+                if self.transport and (was_repl or self._repl_mode):
+                    self._repl_mode = True
+                    self._restore_repl_if_wanted()
+                elif not self.transport:
+                    self._repl_mode = False
+
+    def run_script(self, source: str, follow: bool = False) -> dict[str, Any]:
+        """Run source after interrupt + raw soft-reset (skip main.py).
+
+        Default ``follow=False`` so UI apps do not block the sidecar (same as
+        ``run_path``). Pass ``follow=True`` only for short scripts that exit.
+        """
+        return self._run_after_clean(source, follow=follow)
 
     def run_path(self, path: str, follow: bool = False) -> dict[str, Any]:
         """
@@ -1281,52 +1500,31 @@ print(repr(_out))
             "exec(compile(open(_p).read(), _p, \"exec\"), "
             "{\"__name__\": \"__main__\", \"__file__\": _p})\n"
         )
-        with self._lock:
-            t = self._require()
-            self._stop_repl_reader()
-            self._take_control(t, clean=True, timeout_overall=20.0)
-            try:
-                if follow:
-                    out = t.exec(code)
-                    if out is None:
-                        text = ""
-                    elif isinstance(out, bytes):
-                        text = out.decode("utf-8", "replace")
-                    else:
-                        text = str(out)
-                    return {"output": text, "path": path, "followed": True}
-                t.exec_raw_no_follow(code.encode())
-                # Leave raw REPL so the script keeps running and prints are visible.
-                try:
-                    if t.in_raw_repl:
-                        t.exit_raw_repl()
-                except Exception:
-                    pass
-                if self._repl_mode:
-                    self._start_repl_reader()
-                return {"output": "", "path": path, "followed": False}
-            except Exception:
-                if self._repl_mode:
-                    try:
-                        if self.transport and self.transport.in_raw_repl:
-                            self.transport.exit_raw_repl()
-                    except Exception:
-                        pass
-                    self._start_repl_reader()
-                raise
+        return self._run_after_clean(code, follow=follow, path=path)
 
     def interrupt(self) -> dict[str, Any]:
         """Send Ctrl-C without resetting or entering raw REPL."""
         with self._lock:
-            t = self._require()
-            serial = getattr(t, "serial", None)
-            if serial is None:
-                raise RuntimeError("transport has no serial port")
             try:
+                t = self._require()
+                serial = getattr(t, "serial", None)
+                if serial is None:
+                    raise RuntimeError("transport has no serial port")
                 serial.write(b"\r\x03")
+                return {"ok": True}
             except Exception as e:
-                raise RuntimeError(f"interrupt failed: {e}") from e
-            return {"ok": True}
+                if not (is_dead_serial_error(e) or "serial handle dead" in str(e).lower()):
+                    raise RuntimeError(f"interrupt failed: {e}") from e
+                self._release_dead_transport(str(e))
+                t = self._reclaim_session(clean=False)
+                serial = getattr(t, "serial", None)
+                if serial is None:
+                    raise RuntimeError("interrupt failed: reclaimed transport has no serial")
+                try:
+                    serial.write(b"\r\x03")
+                except Exception as e2:
+                    raise RuntimeError(f"interrupt failed after reclaim: {e2}") from e2
+                return {"ok": True, "reclaimed": True}
 
     def soft_reset(self) -> dict[str, Any]:
         """Fresh session without running user startup scripts the MP way.
@@ -1337,19 +1535,81 @@ print(repr(_out))
         with self._lock:
             t = self._require()
             self._stop_repl_reader()
-            self._take_control(t, clean=True, timeout_overall=20.0)
+            t = self._take_control_resilient(t, clean=True, timeout_overall=20.0)
             runtime = self.runtime or "micropython"
-            if self._repl_mode:
-                try:
-                    if t.in_raw_repl:
-                        t.exit_raw_repl()
-                except Exception:
-                    pass
-                self._start_repl_reader()
+            self._restore_repl_if_wanted()
             return {
                 "ok": True,
                 "runtime": runtime,
                 "main_skipped": runtime == "micropython",
+                "runs_main": False,
+                "note": (
+                    "MicroPython soft-reset skips main.py; use soft-reboot or hard-reset "
+                    "to run main.py"
+                    if runtime == "micropython"
+                    else "CircuitPython soft-reset does not Ctrl-D (code.py not re-run)"
+                ),
+            }
+
+    def soft_reboot(self) -> dict[str, Any]:
+        """Friendly Ctrl-D soft-reboot so startup scripts run (main.py / code.py).
+
+        Leaves the session in friendly REPL (or reconnect if the port drops).
+        Opposite of soft_reset, which skips main.py on MicroPython.
+        """
+        import time
+
+        with self._lock:
+            t = self._require()
+            self._stop_repl_reader()
+            serial = getattr(t, "serial", None)
+            if serial is None:
+                raise RuntimeError("transport has no serial port")
+            try:
+                if t.in_raw_repl:
+                    t.exit_raw_repl()
+            except Exception as e:
+                if is_dead_serial_error(e):
+                    self._release_dead_transport(str(e))
+                    t = self._reclaim_session(clean=False)
+                    serial = getattr(t, "serial", None)
+                    if serial is None:
+                        raise RuntimeError("soft-reboot failed: no serial after reclaim")
+                    try:
+                        if t.in_raw_repl:
+                            t.exit_raw_repl()
+                    except Exception:
+                        pass
+            try:
+                t.in_raw_repl = False
+            except Exception:
+                pass
+            try:
+                serial.write(b"\x04")
+            except Exception as e:
+                if is_dead_serial_error(e):
+                    self._release_dead_transport(str(e))
+                    raise RuntimeError(
+                        f"soft-reboot failed (serial handle dead): {e}"
+                    ) from e
+                raise RuntimeError(f"soft-reboot failed: {e}") from e
+            time.sleep(1.2)
+            try:
+                self._serial_flush(serial)
+            except Exception:
+                pass
+            runtime = self.runtime or "micropython"
+            if self._repl_mode:
+                self._start_repl_reader()
+            return {
+                "ok": True,
+                "runtime": runtime,
+                "main_skipped": False,
+                "runs_main": True,
+                "note": (
+                    "Ctrl-D soft-reboot; MicroPython runs main.py, "
+                    "CircuitPython runs code.py"
+                ),
             }
 
     def hard_reset(self) -> dict[str, Any]:
@@ -1358,23 +1618,25 @@ print(repr(_out))
             t = self._require()
             self._stop_repl_reader()
             try:
-                self._take_control(t, clean=False, timeout_overall=15.0)
+                self._take_control_resilient(t, clean=False, timeout_overall=15.0)
             except Exception:
                 pass
+            t = self.transport
             try:
-                if not t.in_raw_repl:
-                    t.enter_raw_repl(soft_reset=False, timeout_overall=5)
-                t.exec_raw_no_follow(code.encode())
+                if t is not None:
+                    if not t.in_raw_repl:
+                        t.enter_raw_repl(soft_reset=False, timeout_overall=5)
+                    t.exec_raw_no_follow(code.encode())
             except Exception:
                 pass
-            # Board will reboot; close transport
-            try:
-                t.close()
-            except Exception:
-                pass
-            self.transport = None
-            self._repl_mode = False
-            return {"ok": True, "note": "device resetting; reconnect required"}
+            # Board will reboot; always dispose the handle (do not leave it wedged).
+            self._force_close_transport(graceful=False)
+            return {
+                "ok": True,
+                "runs_main": True,
+                "main_skipped": False,
+                "note": "device resetting; reconnect required",
+            }
 
     def bootloader(self) -> dict[str, Any]:
         code = "import time, machine; time.sleep_ms(100); machine.bootloader()"
@@ -1382,21 +1644,18 @@ print(repr(_out))
             t = self._require()
             self._stop_repl_reader()
             try:
-                self._take_control(t, clean=False, timeout_overall=15.0)
+                self._take_control_resilient(t, clean=False, timeout_overall=15.0)
             except Exception:
                 pass
+            t = self.transport
             try:
-                if not t.in_raw_repl:
-                    t.enter_raw_repl(soft_reset=False, timeout_overall=5)
-                t.exec_raw_no_follow(code.encode())
+                if t is not None:
+                    if not t.in_raw_repl:
+                        t.enter_raw_repl(soft_reset=False, timeout_overall=5)
+                    t.exec_raw_no_follow(code.encode())
             except Exception:
                 pass
-            try:
-                t.close()
-            except Exception:
-                pass
-            self.transport = None
-            self._repl_mode = False
+            self._force_close_transport(graceful=False)
             return {"ok": True}
 
     def rtc_get(self) -> dict[str, Any]:
@@ -1428,7 +1687,10 @@ print(repr(_out))
         mpy: bool = True,
         index: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Host-side mip install via mpremote (downloads on host, writes to board)."""
+        """Host-side mip install via mpremote (downloads on host, writes to board).
+
+        Defaults ``target`` to ``/lib`` so packages do not land in ``/``.
+        """
         if (self.runtime or "micropython") == "circuitpython":
             raise RuntimeError(
                 "mip is MicroPython-only; use circup_install / mpftp circup on CircuitPython"
@@ -1436,25 +1698,17 @@ print(repr(_out))
         from mpremote import mip as mp_mip
 
         with self._lock:
+            was_repl = self._repl_mode
             t = self._require()
             self._stop_repl_reader()
-            if not t.in_raw_repl:
-                t.enter_raw_repl(soft_reset=False)
             try:
+                t = self._take_control_resilient(t, clean=False, timeout_overall=20.0)
                 pkg_index = (index or mp_mip._PACKAGE_INDEX).rstrip("/")
-                resolved_target = target
-                if resolved_target is None:
-                    t.exec("import sys")
-                    lib_paths = [
-                        p
-                        for p in t.eval("sys.path")
-                        if isinstance(p, str) and not p.startswith("/rom") and p.endswith("/lib")
-                    ]
-                    if not lib_paths or not lib_paths[0]:
-                        raise RuntimeError(
-                            "Unable to find lib dir in sys.path; pass target= (e.g. /lib)"
-                        )
-                    resolved_target = lib_paths[0]
+                resolved_target = (target or "/lib").rstrip("/") or "/lib"
+                if not resolved_target.startswith("/"):
+                    raise RuntimeError(
+                        f"mip target must be an absolute board path (got {resolved_target!r})"
+                    )
 
                 logs: list[str] = []
                 installed: list[str] = []
@@ -1463,15 +1717,29 @@ print(repr(_out))
                     pkg = package
                     if "@" in pkg:
                         pkg, version = pkg.split("@", 1)
+                    _notify(
+                        "mip_progress",
+                        {"package": package, "target": resolved_target, "phase": "start"},
+                    )
                     buf = io.StringIO()
                     with contextlib.redirect_stdout(buf):
-                        print(f"Install {package}")
+                        print(f"Install {package} -> {resolved_target}")
                         mp_mip._install_package(
                             t, pkg, pkg_index, resolved_target, version, mpy
                         )
                         print("Done")
-                    logs.append(buf.getvalue().strip())
+                    text = buf.getvalue().strip()
+                    logs.append(text)
                     installed.append(package)
+                    _notify(
+                        "mip_progress",
+                        {
+                            "package": package,
+                            "target": resolved_target,
+                            "phase": "done",
+                            "log": text[-500:],
+                        },
+                    )
                 return {
                     "output": "\n".join(logs),
                     "packages": installed,
@@ -1479,14 +1747,19 @@ print(repr(_out))
                     "index": pkg_index,
                     "mpy": mpy,
                 }
+            except Exception as e:
+                if is_eof_timeout_error(e) or is_dead_serial_error(e):
+                    self._release_dead_transport(str(e))
+                    raise RuntimeError(
+                        f"mip install failed and serial handle was released: {e}"
+                    ) from e
+                raise
             finally:
-                if self._repl_mode:
-                    try:
-                        if self.transport and self.transport.in_raw_repl:
-                            self.transport.exit_raw_repl()
-                    except Exception:
-                        pass
-                    self._start_repl_reader()
+                if self.transport and (was_repl or self._repl_mode):
+                    self._repl_mode = True
+                    self._restore_repl_if_wanted()
+                elif not self.transport:
+                    self._repl_mode = False
 
     def _find_circuitpy_host_roots(self) -> list[str]:
         """Host paths for a mounted CIRCUITPY drive (Windows letters or /media)."""
@@ -2467,6 +2740,13 @@ print(repr(rows))
                 t.exit_raw_repl()
             self._repl_mode = True
             self._start_repl_reader()
+            # Nudge CR so MicroPython/CircuitPython show ">>> " (CLI + UI).
+            try:
+                t.serial.write(b"\r")
+            except Exception as e:
+                if is_dead_serial_error(e):
+                    self._release_dead_transport(str(e))
+                    raise RuntimeError(f"repl_start failed: {e}") from e
             return {"device": self.device}
 
     def repl_stop(self) -> dict[str, Any]:
@@ -2484,7 +2764,13 @@ print(repr(rows))
             if not self._repl_mode:
                 self._repl_mode = True
                 self._start_repl_reader()
-            t.serial.write(data)
+            try:
+                t.serial.write(data)
+            except Exception as e:
+                if is_dead_serial_error(e):
+                    self._release_dead_transport(str(e))
+                    raise RuntimeError(f"repl_write failed: {e}") from e
+                raise
             return {"bytes": len(data)}
 
     def _start_repl_reader(self) -> None:
@@ -2526,7 +2812,96 @@ print(repr(rows))
                 if not n:
                     self._repl_stop.wait(0.02)
             except Exception as e:
+                if is_dead_serial_error(e):
+                    self._release_dead_transport(str(e))
                 _notify("repl_error", {"message": str(e)})
+                break
+
+    def debug_tee_start(
+        self, device: str, baud: int = 115200, log_path: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Open a second COM port read-only for debug prints (does not take control)."""
+        import serial
+
+        device = (device or "").strip()
+        if not device:
+            raise RuntimeError("debug_tee_start requires device=")
+        if self.device and device == self.device:
+            raise RuntimeError(
+                f"debug tee device {device} is the control port; pick the other USB CDC"
+            )
+        with self._lock:
+            self.debug_tee_stop()
+            path = Path(log_path) if log_path else (_mpftp_dir() / "debug-tee.log")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            ser = serial.Serial()
+            ser.port = device
+            ser.baudrate = int(baud or 115200)
+            ser.timeout = 0.2
+            # Avoid DTR/RTS toggles that reset some ESP boards.
+            try:
+                ser.dtr = False
+                ser.rts = False
+            except Exception:
+                pass
+            ser.open()
+            self._tee_serial = ser
+            self._tee_device = device
+            self._tee_stop.clear()
+            self._tee_thread = threading.Thread(
+                target=self._debug_tee_loop,
+                args=(path,),
+                daemon=True,
+            )
+            self._tee_thread.start()
+            return {
+                "ok": True,
+                "device": device,
+                "log_path": str(path),
+                "baud": int(baud or 115200),
+            }
+
+    def debug_tee_stop(self) -> dict[str, Any]:
+        self._tee_stop.set()
+        th = self._tee_thread
+        if th and th.is_alive() and th is not threading.current_thread():
+            th.join(timeout=1.5)
+        self._tee_thread = None
+        ser = self._tee_serial
+        self._tee_serial = None
+        device = self._tee_device
+        self._tee_device = None
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+        return {"ok": True, "device": device}
+
+    def _debug_tee_loop(self, log_path: Path) -> None:
+        while not self._tee_stop.is_set():
+            ser = self._tee_serial
+            if ser is None:
+                break
+            try:
+                n = ser.in_waiting if hasattr(ser, "in_waiting") else ser.inWaiting()
+                data = ser.read(n or 1) if n else ser.read(1)
+                if not data:
+                    continue
+                try:
+                    with open(log_path, "ab") as f:
+                        f.write(data)
+                except Exception:
+                    pass
+                _notify(
+                    "debug_tee_data",
+                    {
+                        "device": self._tee_device,
+                        "data_b64": base64.b64encode(data).decode("ascii"),
+                    },
+                )
+            except Exception as e:
+                _notify("debug_tee_error", {"message": str(e), "device": self._tee_device})
                 break
 
 
@@ -2553,12 +2928,19 @@ METHODS = {
     "fs_cp": lambda p: SESSION.fs_cp(p["src"], p["dest"], bool(p.get("verify", False))),
     "exec": lambda p: SESSION.exec(p["code"], bool(p.get("follow", True))),
     "eval": lambda p: SESSION.eval(p["expr"]),
-    "run_script": lambda p: SESSION.run_script(p["source"], bool(p.get("follow", True))),
+    "run_script": lambda p: SESSION.run_script(
+        p["source"], bool(p.get("follow", False))
+    ),
     "run_path": lambda p: SESSION.run_path(p["path"], bool(p.get("follow", False))),
     "interrupt": lambda _p: SESSION.interrupt(),
     "soft_reset": lambda _p: SESSION.soft_reset(),
+    "soft_reboot": lambda _p: SESSION.soft_reboot(),
     "hard_reset": lambda _p: SESSION.hard_reset(),
     "bootloader": lambda _p: SESSION.bootloader(),
+    "debug_tee_start": lambda p: SESSION.debug_tee_start(
+        p["device"], int(p.get("baud", 115200)), p.get("log_path")
+    ),
+    "debug_tee_stop": lambda _p: SESSION.debug_tee_stop(),
     "rtc_get": lambda _p: SESSION.rtc_get(),
     "rtc_set": lambda _p: SESSION.rtc_set(),
     "mip_install": lambda p: SESSION.mip_install(

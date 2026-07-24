@@ -75,7 +75,11 @@
       },
       {
         "command": "mpftp.softReset",
-        "title": "mpftp: Soft Reset"
+        "title": "mpftp: Soft Reset (skip main.py)"
+      },
+      {
+        "command": "mpftp.softReboot",
+        "title": "mpftp: Soft Reboot (run main.py / code.py)"
       },
       {
         "command": "mpftp.hardReset",

@@ -43,6 +43,34 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(0 <= hour <= 23)
         self.assertEqual(sub, 0)
 
+    def test_dead_serial_and_eof_helpers(self):
+        self.assertTrue(
+            self.mod.is_dead_serial_error(PermissionError(13, "Access is denied."))
+        )
+        self.assertTrue(
+            self.mod.is_eof_timeout_error(
+                RuntimeError("timeout waiting for first EOF reception")
+            )
+        )
+        self.assertFalse(
+            self.mod.is_dead_serial_error(RuntimeError("could not enter raw repl"))
+        )
+        msg = self.mod.friendly_exec_timeout_message(
+            "timeout waiting for first EOF reception"
+        )
+        self.assertIn("--no-follow", msg)
+
+    def test_annotate_port_roles_dual_usb(self):
+        ports = [
+            {"device": "COM49", "vid": 0x1A86, "pid": 1, "repl": True},
+            {"device": "COM50", "vid": 0x303A, "pid": 1, "repl": True},
+            {"device": "COM51", "vid": 0x303A, "pid": 2, "repl": False},
+        ]
+        self.mod.annotate_port_roles(ports)
+        self.assertEqual(ports[0]["role"], "repl")
+        self.assertEqual(ports[1]["role"], "cdc_debug")
+        self.assertEqual(ports[2]["role"], "data")
+
 
 if __name__ == "__main__":
     unittest.main()

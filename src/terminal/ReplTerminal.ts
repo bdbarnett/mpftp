@@ -52,9 +52,16 @@ export class ReplTerminal implements vscode.Pseudoterminal {
     this.bridge.on("exit", this.onExit);
     this.bridge.on("disconnected", this.onExit);
 
-    void this.bridge.request("repl_start").catch((e) => {
-      this.writeEmitter.fire(`\x1b[31mFailed to start REPL: ${e}\x1b[0m\r\n`);
-    });
+    void this.bridge
+      .request("repl_start")
+      .then(() => {
+        // MicroPython / CircuitPython treat CR as Enter; nudge so ">>> " appears.
+        const b64 = Buffer.from("\r", "latin1").toString("base64");
+        return this.bridge.request("repl_write", { data_b64: b64 });
+      })
+      .catch((e) => {
+        this.writeEmitter.fire(`\x1b[31mFailed to start REPL: ${e}\x1b[0m\r\n`);
+      });
   }
 
   close(): void {
@@ -118,7 +125,52 @@ function isIdeShellInjection(data: string): boolean {
   return false;
 }
 
+let activeRepl: vscode.Terminal | undefined;
+let closeWatch: vscode.Disposable | undefined;
+
+function isMpftpRepl(term: vscode.Terminal): boolean {
+  return term.name.startsWith("mpftp:");
+}
+
+function ensureCloseWatch(): void {
+  if (closeWatch) {
+    return;
+  }
+  closeWatch = vscode.window.onDidCloseTerminal((term) => {
+    if (term === activeRepl) {
+      activeRepl = undefined;
+    }
+  });
+}
+
+/** Dispose every mpftp REPL terminal (name prefix ``mpftp:``). */
+function disposeMpftpRepls(): void {
+  activeRepl = undefined;
+  for (const term of [...vscode.window.terminals]) {
+    if (isMpftpRepl(term)) {
+      term.dispose();
+    }
+  }
+}
+
 export function openRepl(bridge: SidecarBridge, activity?: ActivityLog): vscode.Terminal {
+  ensureCloseWatch();
+
+  if (activeRepl && vscode.window.terminals.includes(activeRepl)) {
+    // Keep the same PTY session; just focus it.
+    const want = `mpftp: ${bridge.connectedDevice || "REPL"}`;
+    if (activeRepl.name !== want) {
+      // Device changed — cannot rename an existing terminal; replace it.
+      disposeMpftpRepls();
+    } else {
+      activeRepl.show();
+      return activeRepl;
+    }
+  } else {
+    // Stale ref or duplicates from earlier opens — clear before creating.
+    disposeMpftpRepls();
+  }
+
   const pty = new ReplTerminal(bridge, activity);
   const term = vscode.window.createTerminal({
     name: `mpftp: ${bridge.connectedDevice || "REPL"}`,
@@ -126,6 +178,7 @@ export function openRepl(bridge: SidecarBridge, activity?: ActivityLog): vscode.
     // Avoid treating this PTY like a host shell (reduces shell-integration hooks).
     isTransient: true,
   });
+  activeRepl = term;
   term.show();
   return term;
 }

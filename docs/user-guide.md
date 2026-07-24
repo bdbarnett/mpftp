@@ -55,10 +55,10 @@ with a single serial ownership model so the UI and agents do not fight over the 
 
 ### Soft reset and packages
 
-| Runtime | Soft Reset | Install Package |
-|---------|------------|-----------------|
-| MicroPython | Raw soft-reset (skips `main.py`) | **mip** (host download → board) |
-| CircuitPython | Friendly↔raw toggle (does **not** run `code.py`) | **circup** — CIRCUITPY `--path` when mounted, else Web Workflow if writable, else USB staging |
+| Runtime | Soft Reset | Soft Reboot | Install Package |
+|---------|------------|-------------|-----------------|
+| MicroPython | Raw soft-reset (skips `main.py`) | Ctrl-D (runs `main.py`) | **mip** → `/lib` by default |
+| CircuitPython | Friendly↔raw toggle (does **not** run `code.py`) | Ctrl-D (runs `code.py`) | **circup** — CIRCUITPY `--path` when mounted, else Web Workflow if writable, else USB staging |
 
 File `put` / `cp` on CircuitPython also prefer the mounted **CIRCUITPY** drive
 (USB MSC) when present; serial writes are used when the drive is not mounted.
@@ -67,7 +67,7 @@ Use **mpftp: Install Package** in the UI, or CLI `mpftp mip …` / `mpftp circup
 
 ### REPL
 
-**mpftp: Open REPL** opens a terminal attached to the same session (ANSI colors supported). Interrupt / soft reset / hard reset are available as commands.
+**mpftp: Open REPL** opens a terminal attached to the same session (ANSI colors supported). Interrupt / soft reset / soft reboot / hard reset are available as commands. After a hung `exec`/`run`, mpftp releases a dead COM handle (`transport_dead` in the activity log) so Connect/Resume can reclaim the port.
 
 ### Firmware workspace (Build)
 

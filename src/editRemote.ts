@@ -22,9 +22,18 @@ export async function openBoardFileInEditor(
   const data = Buffer.from(res.data_b64, "base64");
 
   const dir = path.join(os.tmpdir(), "mpftp-edit");
-  fs.mkdirSync(dir, { recursive: true });
-  const safe = remotePath.replace(/[\\/:]/g, "_");
-  const local = path.join(dir, safe);
+  // Mirror remote path under the temp dir so the editor tab shows the real
+  // basename (e.g. /main.py → …/mpftp-edit/main.py), not a flattened _main.py.
+  const parts = remotePath
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((p) => p.length > 0)
+    .map((p) => p.replace(/[:<>"|?*]/g, "_"));
+  if (!parts.length) {
+    throw new Error(`invalid remote path: ${remotePath}`);
+  }
+  const local = path.join(dir, ...parts);
+  fs.mkdirSync(path.dirname(local), { recursive: true });
   fs.writeFileSync(local, data);
 
   const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(local));
